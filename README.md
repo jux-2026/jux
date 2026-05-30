@@ -60,3 +60,13 @@ Every push runs the full local gate:
 ```sh
 make check
 ```
+
+## Minimal Run Command
+
+Create a run in the active workspace session:
+
+```sh
+cargo run -p jux-cli -- run new "Update docs" --workspace /path/to/workspace
+```
+
+The command initializes `.jux/` in the workspace when needed and prints the created run ID.
