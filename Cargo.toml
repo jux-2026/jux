@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "crates/jux-core",
+    "crates/jux-cli",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/jux-project/jux"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.39", features = ["derive"] }
+jux-core = { path = "crates/jux-core" }
