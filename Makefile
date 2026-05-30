@@ -1,4 +1,4 @@
-.PHONY: build test fmt lint check
+.PHONY: build test fmt lint quick-check check
 
 build:
 	cargo build --workspace
@@ -12,4 +12,6 @@ fmt:
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 
-check: fmt lint test
+quick-check: fmt lint
+
+check: quick-check test

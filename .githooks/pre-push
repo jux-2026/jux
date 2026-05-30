@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+echo "Running pre-push quality checks..."
+make check

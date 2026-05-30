@@ -2,4 +2,4 @@
 set -eu
 
 echo "Running pre-commit quality checks..."
-make check
+make quick-check

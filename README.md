@@ -6,7 +6,7 @@ The current Phase 1.2 scope is intentionally small: establish a Rust workspace, 
 
 ## Repository Shape
 
-`jux` is currently created as a local directory inside the private root repository. It is expected to become an independent open-source repository or submodule once the remote repository is ready.
+`jux` is an independent open-source repository. In the private root project, it is consumed as a Git submodule.
 
 ```text
 jux
@@ -26,6 +26,7 @@ make build
 make test
 make fmt
 make lint
+make quick-check
 make check
 ```
 
@@ -38,7 +39,9 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-## Pre-commit Checks
+`make quick-check` runs format and lint checks. `make check` runs the full local quality gate: format, lint, and tests.
+
+## Git Hooks
 
 Enable repository-managed Git hooks:
 
@@ -46,7 +49,13 @@ Enable repository-managed Git hooks:
 git config core.hooksPath .githooks
 ```
 
-After that, every commit runs:
+After that, every commit runs the fast local gate:
+
+```sh
+make quick-check
+```
+
+Every push runs the full local gate:
 
 ```sh
 make check
