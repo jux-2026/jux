@@ -61,12 +61,8 @@ Every push runs the full local gate:
 make check
 ```
 
-## Minimal Run Command
+## Current Runtime Scope
 
-Create a run in the active workspace session:
-
-```sh
-cargo run -p jux-cli -- run new "Update docs" --workspace /path/to/workspace
-```
-
-The command initializes `.jux/` in the workspace when needed and prints the created run ID.
+The runtime data model, persistence layer, and agent loop are intentionally unset.
+The repository currently keeps only the Rust workspace, core crate, CLI crate, and
+local quality gates so the next runtime design can be implemented cleanly.

@@ -75,6 +75,7 @@ git config core.hooksPath .githooks
 - Do not pass business data through unstructured JSON, dynamic maps, or string protocols.
 - Keep the CLI crate as an adapter over core behavior.
 - Prefer small, verifiable changes with tests.
+- Keep unit tests in a `tests.rs` file in the same directory as the code under test.
 - Keep `make quick-check` passing before committing.
 - Keep `make check` passing before pushing or merging.
 - Keep public documentation and messages in English.
