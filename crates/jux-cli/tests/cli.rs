@@ -23,7 +23,8 @@ fn cli_exposes_foundation_commands() {
             "Jux agent command line interface.",
         ))
         .stdout(predicate::str::contains("--output"))
-        .stdout(predicate::str::contains("run"));
+        .stdout(predicate::str::contains("run"))
+        .stdout(predicate::str::contains("session"));
 }
 
 #[test]
@@ -182,6 +183,51 @@ fn run_command_executes_mocked_tool_call_loop() {
     assert_eq!(requests.len(), 2);
     assert!(requests[0].contains("Use a tool"));
     assert!(requests[1].contains("Tool echo: cli tool result"));
+}
+
+#[test]
+fn session_show_outputs_active_session_state() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock(r#"{"type":"final_answer","answer":"Session answer"}"#);
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Create session state",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success();
+    let requests = mock.join();
+    assert_eq!(requests.len(), 1);
+
+    let assert = Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "--output",
+            "json",
+            "session",
+            "show",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf-8");
+    let output: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+
+    assert_eq!(output["session"]["name"], "default");
+    assert_eq!(output["runs"][0]["request"], "Create session state");
+    assert_eq!(output["runs"][0]["status"], "Completed");
+    assert!(output.get("steps").is_none());
+    assert_eq!(output["runs"][0]["steps"][0]["kind"], "UserRequest");
+    assert_eq!(output["runs"][0]["steps"][1]["kind"], "LlmCall");
+    assert_eq!(output["runs"][0]["steps"][2]["kind"], "AssistantMessage");
 }
 
 struct MockDeepseek {

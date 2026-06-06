@@ -168,6 +168,34 @@ impl SqliteWorkspaceStore {
         Ok(run)
     }
 
+    pub fn load_session_runs(&self, session_id: &SessionId) -> Result<Vec<Run>, StoreError> {
+        let connection = self.connect()?;
+        let prefix = format!("{}-%", session_id.as_str());
+        let mut statement = connection.prepare(
+            "select id, request, status, created_at, updated_at
+             from runs
+             where id like ?1
+             order by id",
+        )?;
+        let rows = statement.query_map(params![prefix], row_to_run)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_session_steps(&self, session_id: &SessionId) -> Result<Vec<Step>, StoreError> {
+        let connection = self.connect()?;
+        let prefix = format!("{}-%", session_id.as_str());
+        let mut statement = connection.prepare(
+            "select id, kind, payload_json, created_at, updated_at
+             from steps
+             where id like ?1
+             order by id",
+        )?;
+        let rows = statement.query_map(params![prefix], row_to_step)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn load_run_steps(&self, run_id: &RunId) -> Result<Vec<Step>, StoreError> {
         let connection = self.connect()?;
         let prefix = format!("{}-%", run_id.as_str());
