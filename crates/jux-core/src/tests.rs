@@ -143,6 +143,44 @@ fn run_loop_executes_echo_tool_call_and_continues_until_final_answer() {
 }
 
 #[test]
+fn run_loop_executes_lua_tool_call_and_continues_until_final_answer() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let prompt = TestPrompt::responses([
+        r#"{"type":"tool_call","tool_name":"lua","input":"return 'hello from lua'"}"#,
+        r#"{"type":"final_answer","answer":"Lua returned hello from lua"}"#,
+    ]);
+    let run_loop = RunLoop::new(store.clone(), prompt.clone());
+
+    let output = futures::executor::block_on(run_loop.run("Use the lua tool".to_owned()))
+        .expect("run loop succeeds");
+    let prompts = prompt.recorded_prompts();
+
+    assert_eq!(output.run.status, RunStatus::Completed);
+    assert_eq!(
+        output.answer.as_deref(),
+        Some("Lua returned hello from lua")
+    );
+    assert_eq!(
+        output
+            .steps
+            .iter()
+            .map(|step| step.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            StepKind::UserRequest,
+            StepKind::LlmCall,
+            StepKind::AssistantToolCall,
+            StepKind::ToolResult,
+            StepKind::LlmCall,
+            StepKind::AssistantMessage,
+        ]
+    );
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("User: Use the lua tool"));
+    assert!(prompts[1].contains("Tool lua: hello from lua"));
+}
+
+#[test]
 fn run_loop_marks_run_failed_when_llm_fails() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
     let prompt = TestPrompt::fixed_error("provider failed");

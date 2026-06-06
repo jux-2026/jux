@@ -1,5 +1,6 @@
 use crate::model::{Run, RunStatus, Session, Step, StepKind, StepPayload, Workspace};
 use crate::store::{SqliteWorkspaceStore, StoreError};
+use mlua::{Lua, Value};
 use rig::completion::{Prompt, PromptError};
 use serde::Deserialize;
 use std::error::Error;
@@ -7,6 +8,7 @@ use std::fmt::{self, Display};
 
 const MAX_LOOP_ITERATIONS: usize = 8;
 const ECHO_TOOL_NAME: &str = "echo";
+const LUA_TOOL_NAME: &str = "lua";
 
 pub struct RunLoop<P> {
     store: SqliteWorkspaceStore,
@@ -177,7 +179,8 @@ where
              {{\"type\":\"final_answer\",\"answer\":\"...\"}}\n\
              {{\"type\":\"tool_call\",\"tool_name\":\"echo\",\"input\":\"...\"}}\n\
              Available tools:\n\
-             - echo: returns the input text unchanged.\n\n\
+             - echo: returns the input text unchanged.\n\
+             - lua: executes the input as Lua code and returns the first returned value.\n\n\
              Context:\n{visible_context}"
         ))
     }
@@ -201,7 +204,28 @@ impl LlmDecision {
 fn execute_tool(tool_name: &str, input: &str) -> Result<String, String> {
     match tool_name {
         ECHO_TOOL_NAME => Ok(input.to_owned()),
+        LUA_TOOL_NAME => execute_lua(input),
         _ => Err(format!("unsupported tool call: {tool_name}")),
+    }
+}
+
+fn execute_lua(script: &str) -> Result<String, String> {
+    let lua = Lua::new();
+    let value = lua
+        .load(script)
+        .eval::<Value>()
+        .map_err(|error| format!("lua execution failed: {error}"))?;
+    lua_value_to_string(value).map_err(|error| format!("lua result conversion failed: {error}"))
+}
+
+fn lua_value_to_string(value: Value) -> mlua::Result<String> {
+    match value {
+        Value::Nil => Ok("nil".to_owned()),
+        Value::Boolean(value) => Ok(value.to_string()),
+        Value::Integer(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::String(value) => Ok(value.to_string_lossy()),
+        other => Ok(format!("{other:?}")),
     }
 }
 
