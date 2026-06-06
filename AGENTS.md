@@ -6,14 +6,17 @@ This file defines the local collaboration rules for `jux`.
 
 ## Current Scope
 
-Phase 1.2 only establishes the engineering skeleton:
+The current runtime foundation includes:
 
 - Rust workspace root.
 - `jux-core` library crate.
 - `jux-cli` binary crate.
 - Basic build, test, format, lint, and Git hook quality commands.
+- Minimal Workspace, Session, Run, and Step concepts.
+- SQLite-backed local state under the workspace `.jux` directory.
+- Minimal `jux run` command backed by Rig and the DeepSeek provider.
 
-Do not implement Workspace, Session, Run, policy, patch review, or audit behavior in this phase unless the roadmap is updated first.
+Do not add policy, patch review, tool execution, approvals, resume, MCP, Skill, TUI, or Tauri behavior until the roadmap and runtime design are updated first.
 
 ## Directory Structure
 
@@ -76,6 +79,7 @@ git config core.hooksPath .githooks
 - Keep the CLI crate as an adapter over core behavior.
 - Prefer small, verifiable changes with tests.
 - Keep unit tests in a `tests.rs` file in the same directory as the code under test.
+- Use `tracing` for diagnostics and structured logs. Initialize `tracing-subscriber` in application crates, keep logs on stderr, and keep user-facing command output on stdout.
 - Keep `make quick-check` passing before committing.
 - Keep `make check` passing before pushing or merging.
 - Keep public documentation and messages in English.

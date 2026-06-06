@@ -2,7 +2,9 @@
 
 `jux` is the open-source agent-side monorepo for Jux.
 
-The current Phase 1.2 scope is intentionally small: establish a Rust workspace, a core crate, a CLI crate, and the basic engineering commands needed for later feature work.
+The current scope provides a small local runtime foundation: a Rust workspace,
+a core crate, a CLI crate, SQLite-backed local state, and a minimal LLM-backed
+`jux run` command.
 
 ## Repository Shape
 
@@ -61,8 +63,22 @@ Every push runs the full local gate:
 make check
 ```
 
-## Current Runtime Scope
+## Minimal Run Command
 
-The runtime data model, persistence layer, and agent loop are intentionally unset.
-The repository currently keeps only the Rust workspace, core crate, CLI crate, and
-local quality gates so the next runtime design can be implemented cleanly.
+Run a request through the minimal local agent loop:
+
+```sh
+export JUX_DEEPSEEK_API_KEY="..."
+cargo run -p jux-cli -- run "Explain this project" --workspace /path/to/workspace
+```
+
+Structured output is available from the top-level `--output` option:
+
+```sh
+cargo run -p jux-cli -- --output json run "Explain this project"
+cargo run -p jux-cli -- --output yaml run "Explain this project"
+```
+
+The command initializes `.jux/state.db`, creates the active Workspace and
+Session when needed, creates a Run, records the current Step timeline, calls the
+configured LLM provider, and stores the final status.
