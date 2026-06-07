@@ -17,7 +17,6 @@ use std::fmt::{self, Display};
 use std::process::Command as ProcessCommand;
 
 const MAX_LOOP_ITERATIONS: usize = 8;
-const ECHO_TOOL_NAME: &str = "echo";
 const EXEC_TOOL_NAME: &str = "exec";
 const LUA_TOOL_NAME: &str = "lua";
 const EXEC_TOOL_DESCRIPTION: &str = "Execute one command directly without a shell. \
@@ -150,7 +149,7 @@ where
                     "executing tool call"
                 );
 
-                let output = match execute_tool(name, arguments) {
+                let content = match execute_tool(name, arguments) {
                     Ok(output) => output,
                     Err(error) => {
                         tracing::warn!(
@@ -159,7 +158,10 @@ where
                             error = %error,
                             "tool call failed"
                         );
-                        format!("Tool execution failed: {error}")
+                        json!({
+                            "success": false,
+                            "error": error,
+                        })
                     }
                 };
                 self.store.append_step(
@@ -168,7 +170,7 @@ where
                     StepPayload::ToolResult {
                         id: id.clone(),
                         call_id: call_id.clone(),
-                        content: output,
+                        content,
                     },
                 )?;
             }
@@ -301,7 +303,7 @@ fn step_to_chat_message(step: &Step) -> Option<Message> {
             content: rig::OneOrMany::one(rig::message::UserContent::ToolResult(ToolResult {
                 id: id.clone(),
                 call_id: call_id.clone(),
-                content: rig::OneOrMany::one(ToolResultContent::text(content.clone())),
+                content: rig::OneOrMany::one(ToolResultContent::text(content.to_string())),
             })),
         }),
         StepPayload::Error { .. } => None,
@@ -402,17 +404,6 @@ fn default_session_context_items() -> Vec<(SessionContextKind, SessionContextPay
 fn jux_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
-            name: ECHO_TOOL_NAME.to_owned(),
-            description: "Return the input text unchanged.".to_owned(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "input": { "type": "string" }
-                },
-                "required": ["input"]
-            }),
-        },
-        ToolDefinition {
             name: EXEC_TOOL_NAME.to_owned(),
             description: EXEC_TOOL_DESCRIPTION.to_owned(),
             parameters: json!({
@@ -441,13 +432,8 @@ fn jux_tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
-fn execute_tool(tool_name: &str, args: &serde_json::Value) -> Result<String, String> {
+fn execute_tool(tool_name: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
     match tool_name {
-        ECHO_TOOL_NAME => {
-            let args = serde_json::from_value::<EchoToolArgs>(args.clone())
-                .map_err(|error| format!("invalid echo tool arguments: {error}"))?;
-            Ok(args.input)
-        }
         EXEC_TOOL_NAME => {
             let args = serde_json::from_value::<ExecToolArgs>(args.clone())
                 .map_err(|error| format!("invalid exec tool arguments: {error}"))?;
@@ -463,11 +449,6 @@ fn execute_tool(tool_name: &str, args: &serde_json::Value) -> Result<String, Str
 }
 
 #[derive(Debug, Deserialize)]
-struct EchoToolArgs {
-    input: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct ExecToolArgs {
     program: String,
     args: Vec<String>,
@@ -478,13 +459,13 @@ struct LuaToolArgs {
     code: String,
 }
 
-fn execute_exec(args: ExecToolArgs) -> Result<String, String> {
+fn execute_exec(args: ExecToolArgs) -> Result<serde_json::Value, String> {
     let output = run_exec_command(&args.program, &args.args)?;
-    serde_json::to_string(&ExecToolOutput::from(output))
+    serde_json::to_value(ExecToolOutput::from(output))
         .map_err(|error| format!("exec output serialization failed: {error}"))
 }
 
-fn execute_lua(script: &str) -> Result<String, String> {
+fn execute_lua(script: &str) -> Result<serde_json::Value, String> {
     let lua = Lua::new_with(StdLib::NONE, LuaOptions::default())
         .map_err(|error| format!("lua initialization failed: {error}"))?;
     install_lua_command_api(&lua).map_err(|error| format!("lua api setup failed: {error}"))?;
@@ -492,17 +473,17 @@ fn execute_lua(script: &str) -> Result<String, String> {
         .load(script)
         .eval::<Value>()
         .map_err(|error| format!("lua execution failed: {error}"))?;
-    lua_value_to_string(value).map_err(|error| format!("lua result conversion failed: {error}"))
+    lua_value_to_json(value).map_err(|error| format!("lua result conversion failed: {error}"))
 }
 
-fn lua_value_to_string(value: Value) -> mlua::Result<String> {
+fn lua_value_to_json(value: Value) -> mlua::Result<serde_json::Value> {
     match value {
-        Value::Nil => Ok("nil".to_owned()),
-        Value::Boolean(value) => Ok(value.to_string()),
-        Value::Integer(value) => Ok(value.to_string()),
-        Value::Number(value) => Ok(value.to_string()),
-        Value::String(value) => Ok(value.to_string_lossy()),
-        other => Ok(format!("{other:?}")),
+        Value::Nil => Ok(json!({ "value": null })),
+        Value::Boolean(value) => Ok(json!({ "value": value })),
+        Value::Integer(value) => Ok(json!({ "value": value })),
+        Value::Number(value) => Ok(json!({ "value": value })),
+        Value::String(value) => Ok(json!({ "value": value.to_string_lossy() })),
+        other => Ok(json!({ "value": format!("{other:?}") })),
     }
 }
 

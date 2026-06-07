@@ -160,8 +160,8 @@ fn run_command_executes_mocked_tool_call_loop() {
     let mock = start_deepseek_mock_sequence([
         DeepseekMockResponse::tool_call(
             "call_1",
-            "echo",
-            serde_json::json!({ "input": "cli tool result" }),
+            "exec",
+            serde_json::json!({ "program": "printf", "args": ["cli tool result"] }),
         ),
         DeepseekMockResponse::text("Final answer after tool"),
     ]);
@@ -239,18 +239,12 @@ fn session_show_outputs_active_session_state() {
     assert_eq!(output["session_context"][1]["kind"], "ToolDefinition");
     assert_eq!(
         output["session_context"][1]["payload"]["ToolDefinition"]["name"],
-        "echo"
+        "exec"
     );
     assert_eq!(output["session_context"][2]["sequence"], 3);
     assert_eq!(output["session_context"][2]["kind"], "ToolDefinition");
     assert_eq!(
         output["session_context"][2]["payload"]["ToolDefinition"]["name"],
-        "exec"
-    );
-    assert_eq!(output["session_context"][3]["sequence"], 4);
-    assert_eq!(output["session_context"][3]["kind"], "ToolDefinition");
-    assert_eq!(
-        output["session_context"][3]["payload"]["ToolDefinition"]["name"],
         "lua"
     );
     assert_eq!(output["runs"][0]["request"], "Create session state");
@@ -258,6 +252,45 @@ fn session_show_outputs_active_session_state() {
     assert!(output.get("steps").is_none());
     assert_eq!(output["runs"][0]["steps"][0]["kind"], "UserMessage");
     assert_eq!(output["runs"][0]["steps"][1]["kind"], "AssistantResponse");
+}
+
+#[test]
+fn session_show_yaml_uses_block_style_for_multiline_text() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock("First line\nSecond line");
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Create multiline session state",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success();
+    let requests = mock.join();
+    assert_eq!(requests.len(), 1);
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "--output",
+            "yaml",
+            "session",
+            "show",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("content: |"))
+        .stdout(predicate::str::contains("First line"))
+        .stdout(predicate::str::contains("Second line"))
+        .stdout(predicate::str::contains("First line\\nSecond line").not());
 }
 
 struct MockDeepseek {

@@ -151,8 +151,8 @@ fn sqlite_store_appends_missing_default_session_context_items() {
                 (
                     SessionContextKind::ToolDefinition,
                     SessionContextPayload::ToolDefinition {
-                        name: "echo".to_owned(),
-                        description: "echo".to_owned(),
+                        name: "exec".to_owned(),
+                        description: "exec".to_owned(),
                         parameters: serde_json::json!({ "type": "object" }),
                     },
                 ),
@@ -172,16 +172,16 @@ fn sqlite_store_appends_missing_default_session_context_items() {
                 (
                     SessionContextKind::ToolDefinition,
                     SessionContextPayload::ToolDefinition {
-                        name: "echo".to_owned(),
-                        description: "new echo ignored".to_owned(),
+                        name: "exec".to_owned(),
+                        description: "new exec ignored".to_owned(),
                         parameters: serde_json::json!({ "type": "object" }),
                     },
                 ),
                 (
                     SessionContextKind::ToolDefinition,
                     SessionContextPayload::ToolDefinition {
-                        name: "exec".to_owned(),
-                        description: "exec".to_owned(),
+                        name: "lua".to_owned(),
+                        description: "lua".to_owned(),
                         parameters: serde_json::json!({ "type": "object" }),
                     },
                 ),
@@ -193,9 +193,9 @@ fn sqlite_store_appends_missing_default_session_context_items() {
     assert_eq!(updated[0].sequence, 1);
     assert_eq!(updated[0].payload.to_system_prompt(), Some("system"));
     assert_eq!(updated[1].sequence, 2);
-    assert_eq!(updated[1].payload.to_tool_name(), Some("echo"));
+    assert_eq!(updated[1].payload.to_tool_name(), Some("exec"));
     assert_eq!(updated[2].sequence, 3);
-    assert_eq!(updated[2].payload.to_tool_name(), Some("exec"));
+    assert_eq!(updated[2].payload.to_tool_name(), Some("lua"));
 }
 
 #[test]
@@ -227,7 +227,7 @@ fn run_loop_records_successful_llm_run_steps() {
     let context_items = store
         .load_session_context_items(&output.session.id)
         .expect("session context loads");
-    assert_eq!(context_items.len(), 4);
+    assert_eq!(context_items.len(), 3);
     assert_eq!(context_items[0].sequence, 1);
     assert_eq!(context_items[0].kind, SessionContextKind::SystemPrompt);
     assert_eq!(
@@ -237,11 +237,9 @@ fn run_loop_records_successful_llm_run_steps() {
         }
     );
     assert_eq!(context_items[1].sequence, 2);
-    assert_eq!(context_items[1].payload.to_tool_name(), Some("echo"));
+    assert_eq!(context_items[1].payload.to_tool_name(), Some("exec"));
     assert_eq!(context_items[2].sequence, 3);
-    assert_eq!(context_items[2].payload.to_tool_name(), Some("exec"));
-    assert_eq!(context_items[3].sequence, 4);
-    assert_eq!(context_items[3].payload.to_tool_name(), Some("lua"));
+    assert_eq!(context_items[2].payload.to_tool_name(), Some("lua"));
     assert_eq!(requests.len(), 1);
     assert!(requests[0].contains("You are Jux"));
     assert!(requests[0].contains("Explain this project"));
@@ -285,7 +283,7 @@ fn run_loop_uses_session_history_when_calling_llm() {
     let context_items = store
         .load_session_context_items(&store.load_active_session().expect("session loads").id)
         .expect("session context loads");
-    assert_eq!(context_items.len(), 4);
+    assert_eq!(context_items.len(), 3);
 }
 
 #[test]
@@ -326,55 +324,6 @@ fn run_loop_records_reasoning_without_sending_it_back_to_llm() {
     assert!(requests[1].contains("Visible answer"));
     assert!(!requests[1].contains("hidden reasoning"));
 }
-
-#[test]
-fn run_loop_executes_echo_tool_call_and_continues_until_final_answer() {
-    let store = SqliteWorkspaceStore::new(temp_workspace_root());
-    let model = TestModel::responses([
-        Ok(vec![AssistantContent::ToolCall(test_tool_call(
-            "call_1",
-            "echo",
-            serde_json::json!({ "input": "hello from tool" }),
-        ))]),
-        Ok(vec![AssistantContent::text(
-            "Tool returned hello from tool",
-        )]),
-    ]);
-    let run_loop = RunLoop::new(store.clone(), model.clone());
-
-    let output = futures::executor::block_on(run_loop.run("Use the echo tool".to_owned()))
-        .expect("run loop succeeds");
-    let requests = model.recorded_requests();
-
-    assert_eq!(output.run.status, RunStatus::Completed);
-    assert_eq!(
-        output.answer.as_deref(),
-        Some("Tool returned hello from tool")
-    );
-    assert_eq!(
-        output
-            .steps
-            .iter()
-            .map(|step| step.kind.clone())
-            .collect::<Vec<_>>(),
-        vec![
-            StepKind::UserMessage,
-            StepKind::AssistantResponse,
-            StepKind::ToolResult,
-            StepKind::AssistantResponse,
-        ]
-    );
-    assert_eq!(output.steps[1].payload.to_tool_call_name(), Some("echo"));
-    assert_eq!(
-        output.steps[2].payload.to_tool_result_content(),
-        Some("hello from tool")
-    );
-    assert_eq!(requests.len(), 2);
-    assert!(requests[0].contains("You are Jux"));
-    assert!(requests[0].contains("Use the echo tool"));
-    assert!(requests[1].contains("hello from tool"));
-}
-
 #[test]
 fn run_loop_executes_exec_tool_call_and_returns_structured_output() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
@@ -391,12 +340,10 @@ fn run_loop_executes_exec_tool_call_and_returns_structured_output() {
     let output = futures::executor::block_on(run_loop.run("Use the exec tool".to_owned()))
         .expect("run loop succeeds");
     let requests = model.recorded_requests();
-    let tool_result = output.steps[2]
+    let exec_output = output.steps[2]
         .payload
         .to_tool_result_content()
         .expect("tool result exists");
-    let exec_output: serde_json::Value =
-        serde_json::from_str(tool_result).expect("exec output is JSON");
 
     assert_eq!(output.run.status, RunStatus::Completed);
     assert_eq!(exec_output["success"], true);
@@ -431,8 +378,12 @@ fn run_loop_returns_exec_shell_syntax_errors_to_llm() {
         .expect("tool result exists");
 
     assert_eq!(output.run.status, RunStatus::Completed);
-    assert!(tool_result.contains("Tool execution failed"));
-    assert!(tool_result.contains("shell syntax is not supported: >"));
+    assert_eq!(tool_result["success"], false);
+    assert!(
+        tool_result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("shell syntax is not supported: >"))
+    );
     assert!(requests[1].contains("shell syntax is not supported"));
 }
 
@@ -499,9 +450,13 @@ fn run_loop_returns_lua_system_standard_library_access_errors_to_llm() {
         .expect("tool result exists");
 
     assert_eq!(output.run.status, RunStatus::Completed);
-    assert!(tool_result.contains("Tool execution failed"));
-    assert!(tool_result.contains("lua execution failed"));
-    assert!(requests[1].contains("Tool execution failed"));
+    assert_eq!(tool_result["success"], false);
+    assert!(
+        tool_result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("lua execution failed"))
+    );
+    assert!(requests[1].contains("lua execution failed"));
 }
 
 #[test]
@@ -526,9 +481,11 @@ fn run_loop_returns_lua_print_errors_to_llm() {
         .expect("tool result exists");
 
     assert_eq!(output.run.status, RunStatus::Completed);
-    assert!(tool_result.contains("Tool execution failed"));
-    assert!(tool_result.contains("print is disabled in the Jux Lua runtime"));
-    assert!(tool_result.contains("use return to send a tool result"));
+    assert_eq!(tool_result["success"], false);
+    assert!(tool_result["error"].as_str().is_some_and(|error| {
+        error.contains("print is disabled in the Jux Lua runtime")
+            && error.contains("use return to send a tool result")
+    }));
     assert!(requests[1].contains("print is disabled"));
 }
 
@@ -623,9 +580,12 @@ fn run_loop_returns_lua_shell_style_command_errors_to_llm() {
         .payload
         .to_tool_result_content()
         .expect("first tool result exists");
-    assert!(first_tool_result.contains("Tool execution failed"));
-    assert!(first_tool_result.contains("shell syntax is not supported: >"));
-    assert!(requests[1].contains("Tool execution failed"));
+    assert_eq!(first_tool_result["success"], false);
+    assert!(
+        first_tool_result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("shell syntax is not supported: >"))
+    );
     assert!(requests[1].contains("shell syntax is not supported"));
     assert!(requests[2].contains("hello"));
 }
@@ -655,8 +615,7 @@ trait StepPayloadTestExt {
     fn to_assistant_text(&self) -> Option<&str>;
     fn to_assistant_reasoning(&self) -> Option<&str>;
     fn to_assistant_usage(&self) -> Option<&LlmUsage>;
-    fn to_tool_call_name(&self) -> Option<&str>;
-    fn to_tool_result_content(&self) -> Option<&str>;
+    fn to_tool_result_content(&self) -> Option<&serde_json::Value>;
 }
 
 impl StepPayloadTestExt for StepPayload {
@@ -691,19 +650,7 @@ impl StepPayloadTestExt for StepPayload {
         }
     }
 
-    fn to_tool_call_name(&self) -> Option<&str> {
-        match self {
-            StepPayload::AssistantResponse { items, .. } => {
-                items.iter().find_map(|item| match item {
-                    AssistantResponseItem::ToolCall { name, .. } => Some(name.as_str()),
-                    _ => None,
-                })
-            }
-            _ => None,
-        }
-    }
-
-    fn to_tool_result_content(&self) -> Option<&str> {
+    fn to_tool_result_content(&self) -> Option<&serde_json::Value> {
         match self {
             StepPayload::ToolResult { content, .. } => Some(content),
             _ => None,

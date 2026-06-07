@@ -187,7 +187,7 @@ pub enum StepPayload {
     ToolResult {
         id: String,
         call_id: Option<String>,
-        content: String,
+        content: serde_json::Value,
     },
     Error {
         message: String,
