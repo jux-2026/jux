@@ -1,5 +1,11 @@
 use super::*;
-use rig::completion::{Chat, Message, PromptError};
+use rig::OneOrMany;
+use rig::completion::{
+    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage, Usage,
+};
+use rig::message::{AssistantContent, ToolCall, ToolFunction};
+use rig::streaming::StreamingCompletionResponse;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 #[test]
@@ -40,9 +46,8 @@ fn sqlite_store_persists_workspace_session_run_and_ordered_steps() {
     let first_step = store
         .append_step(
             &run.id,
-            StepKind::LlmMessage,
-            StepPayload::LlmMessage {
-                role: LlmMessageRole::User,
+            StepKind::UserMessage,
+            StepPayload::UserMessage {
                 content: "Explain this project".to_owned(),
             },
         )
@@ -50,9 +55,8 @@ fn sqlite_store_persists_workspace_session_run_and_ordered_steps() {
     let second_step = store
         .append_step(
             &run.id,
-            StepKind::LlmMessage,
-            StepPayload::LlmMessage {
-                role: LlmMessageRole::Assistant,
+            StepKind::AssistantMessage,
+            StepPayload::AssistantMessage {
                 content: "Done".to_owned(),
             },
         )
@@ -81,12 +85,12 @@ fn sqlite_store_persists_workspace_session_run_and_ordered_steps() {
 #[test]
 fn run_loop_records_successful_llm_run_steps() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
-    let prompt = TestPrompt::fixed_response(r#"{"type":"final_answer","answer":"Mocked answer"}"#);
-    let run_loop = RunLoop::new(store.clone(), prompt.clone());
+    let model = TestModel::fixed_text("Mocked answer");
+    let run_loop = RunLoop::new(store.clone(), model.clone());
 
     let output = futures::executor::block_on(run_loop.run("Explain this project".to_owned()))
         .expect("run loop succeeds");
-    let prompts = prompt.recorded_prompts();
+    let requests = model.recorded_requests();
 
     assert_eq!(output.run.status, RunStatus::Completed);
     assert_eq!(output.answer.as_deref(), Some("Mocked answer"));
@@ -97,67 +101,73 @@ fn run_loop_records_successful_llm_run_steps() {
             .map(|step| step.kind.clone())
             .collect::<Vec<_>>(),
         vec![
-            StepKind::LlmMessage,
-            StepKind::LlmMessage,
-            StepKind::LlmMessage,
+            StepKind::SystemMessage,
+            StepKind::LlmToolDefinition,
+            StepKind::LlmToolDefinition,
+            StepKind::UserMessage,
+            StepKind::AssistantMessage,
         ]
     );
     assert_eq!(
         output.steps[0].payload,
-        StepPayload::LlmMessage {
-            role: LlmMessageRole::System,
+        StepPayload::SystemMessage {
             content: SYSTEM_PROMPT.to_owned(),
         }
     );
     assert_eq!(
-        output.steps[1].payload,
-        StepPayload::LlmMessage {
-            role: LlmMessageRole::User,
+        output.steps[3].payload,
+        StepPayload::UserMessage {
             content: "Explain this project".to_owned(),
         }
     );
-    assert_eq!(prompts.len(), 1);
-    assert!(prompts[0].contains("You are Jux"));
-    assert!(prompts[0].contains("Explain this project"));
+    assert_eq!(output.steps[1].payload.to_tool_name(), Some("echo"));
+    assert_eq!(output.steps[2].payload.to_tool_name(), Some("lua"));
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("You are Jux"));
+    assert!(requests[0].contains("Explain this project"));
+    assert!(requests[0].contains("\"tools\""));
 }
 
 #[test]
 fn run_loop_uses_session_history_when_calling_llm() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
-    let prompt = TestPrompt::responses([
-        r#"{"type":"final_answer","answer":"First answer"}"#,
-        r#"{"type":"final_answer","answer":"Second answer"}"#,
-    ]);
-    let run_loop = RunLoop::new(store.clone(), prompt.clone());
+    let model = TestModel::text_responses(["First answer", "Second answer"]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
 
     futures::executor::block_on(run_loop.run("First request".to_owned()))
         .expect("first run loop succeeds");
     futures::executor::block_on(run_loop.run("Second request".to_owned()))
         .expect("second run loop succeeds");
-    let prompts = prompt.recorded_prompts();
+    let requests = model.recorded_requests();
 
-    assert_eq!(prompts.len(), 2);
-    assert!(prompts[0].contains("You are Jux"));
-    assert!(prompts[0].contains("First request"));
-    assert!(!prompts[0].contains("First answer"));
-    assert!(prompts[1].contains("You are Jux"));
-    assert!(prompts[1].contains("First request"));
-    assert!(prompts[1].contains("First answer"));
-    assert!(prompts[1].contains("Second request"));
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("You are Jux"));
+    assert!(requests[0].contains("First request"));
+    assert!(!requests[0].contains("First answer"));
+    assert!(requests[1].contains("You are Jux"));
+    assert!(requests[1].contains("First request"));
+    assert!(requests[1].contains("First answer"));
+    assert!(requests[1].contains("Second request"));
 }
 
 #[test]
 fn run_loop_executes_echo_tool_call_and_continues_until_final_answer() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
-    let prompt = TestPrompt::responses([
-        r#"{"type":"tool_call","tool_name":"echo","input":"hello from tool"}"#,
-        r#"{"type":"final_answer","answer":"Tool returned hello from tool"}"#,
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "echo",
+            serde_json::json!({ "input": "hello from tool" }),
+        ))]),
+        Ok(vec![AssistantContent::text(
+            "Tool returned hello from tool",
+        )]),
     ]);
-    let run_loop = RunLoop::new(store.clone(), prompt.clone());
+    let run_loop = RunLoop::new(store.clone(), model.clone());
 
     let output = futures::executor::block_on(run_loop.run("Use the echo tool".to_owned()))
         .expect("run loop succeeds");
-    let prompts = prompt.recorded_prompts();
+    let requests = model.recorded_requests();
 
     assert_eq!(output.run.status, RunStatus::Completed);
     assert_eq!(
@@ -171,31 +181,42 @@ fn run_loop_executes_echo_tool_call_and_continues_until_final_answer() {
             .map(|step| step.kind.clone())
             .collect::<Vec<_>>(),
         vec![
-            StepKind::LlmMessage,
-            StepKind::LlmMessage,
-            StepKind::LlmMessage,
-            StepKind::LlmMessage,
-            StepKind::LlmMessage,
+            StepKind::SystemMessage,
+            StepKind::LlmToolDefinition,
+            StepKind::LlmToolDefinition,
+            StepKind::UserMessage,
+            StepKind::AssistantToolCall,
+            StepKind::ToolResult,
+            StepKind::AssistantMessage,
         ]
     );
-    assert_eq!(prompts.len(), 2);
-    assert!(prompts[0].contains("You are Jux"));
-    assert!(prompts[0].contains("Use the echo tool"));
-    assert!(prompts[1].contains("Tool echo: hello from tool"));
+    assert_eq!(output.steps[4].payload.to_tool_call_name(), Some("echo"));
+    assert_eq!(
+        output.steps[5].payload.to_tool_result_content(),
+        Some("hello from tool")
+    );
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("You are Jux"));
+    assert!(requests[0].contains("Use the echo tool"));
+    assert!(requests[1].contains("hello from tool"));
 }
 
 #[test]
 fn run_loop_executes_lua_tool_call_and_continues_until_final_answer() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
-    let prompt = TestPrompt::responses([
-        r#"{"type":"tool_call","tool_name":"lua","input":"return 'hello from lua'"}"#,
-        r#"{"type":"final_answer","answer":"Lua returned hello from lua"}"#,
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "lua",
+            serde_json::json!({ "code": "return 'hello from lua'" }),
+        ))]),
+        Ok(vec![AssistantContent::text("Lua returned hello from lua")]),
     ]);
-    let run_loop = RunLoop::new(store.clone(), prompt.clone());
+    let run_loop = RunLoop::new(store.clone(), model.clone());
 
     let output = futures::executor::block_on(run_loop.run("Use the lua tool".to_owned()))
         .expect("run loop succeeds");
-    let prompts = prompt.recorded_prompts();
+    let requests = model.recorded_requests();
 
     assert_eq!(output.run.status, RunStatus::Completed);
     assert_eq!(
@@ -209,24 +230,26 @@ fn run_loop_executes_lua_tool_call_and_continues_until_final_answer() {
             .map(|step| step.kind.clone())
             .collect::<Vec<_>>(),
         vec![
-            StepKind::LlmMessage,
-            StepKind::LlmMessage,
-            StepKind::LlmMessage,
-            StepKind::LlmMessage,
-            StepKind::LlmMessage,
+            StepKind::SystemMessage,
+            StepKind::LlmToolDefinition,
+            StepKind::LlmToolDefinition,
+            StepKind::UserMessage,
+            StepKind::AssistantToolCall,
+            StepKind::ToolResult,
+            StepKind::AssistantMessage,
         ]
     );
-    assert_eq!(prompts.len(), 2);
-    assert!(prompts[0].contains("You are Jux"));
-    assert!(prompts[0].contains("Use the lua tool"));
-    assert!(prompts[1].contains("Tool lua: hello from lua"));
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("You are Jux"));
+    assert!(requests[0].contains("Use the lua tool"));
+    assert!(requests[1].contains("hello from lua"));
 }
 
 #[test]
 fn run_loop_marks_run_failed_when_llm_fails() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
-    let prompt = TestPrompt::fixed_error("provider failed");
-    let run_loop = RunLoop::new(store.clone(), prompt);
+    let model = TestModel::fixed_error("provider failed");
+    let run_loop = RunLoop::new(store.clone(), model);
 
     let error = futures::executor::block_on(run_loop.run("Explain this project".to_owned()))
         .expect_err("run loop fails");
@@ -243,66 +266,107 @@ fn run_loop_marks_run_failed_when_llm_fails() {
     );
 }
 
-#[derive(Clone, Debug)]
-struct TestPrompt {
-    responses: Arc<Mutex<Vec<Result<String, String>>>>,
-    recorded_prompts: Arc<Mutex<Vec<String>>>,
+trait StepPayloadTestExt {
+    fn to_tool_name(&self) -> Option<&str>;
+    fn to_tool_call_name(&self) -> Option<&str>;
+    fn to_tool_result_content(&self) -> Option<&str>;
 }
 
-impl TestPrompt {
-    fn fixed_response(response: impl Into<String>) -> Self {
-        Self::responses([response.into()])
+impl StepPayloadTestExt for StepPayload {
+    fn to_tool_name(&self) -> Option<&str> {
+        match self {
+            StepPayload::LlmToolDefinition { name, .. } => Some(name),
+            _ => None,
+        }
     }
 
-    fn responses(responses: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    fn to_tool_call_name(&self) -> Option<&str> {
+        match self {
+            StepPayload::AssistantToolCall { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    fn to_tool_result_content(&self) -> Option<&str> {
+        match self {
+            StepPayload::ToolResult { content, .. } => Some(content),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TestModel {
+    responses: Arc<Mutex<TestResponses>>,
+    recorded_requests: Arc<Mutex<Vec<String>>>,
+}
+
+type TestResponses = Vec<Result<Vec<AssistantContent>, String>>;
+
+impl TestModel {
+    fn fixed_text(response: impl Into<String>) -> Self {
+        Self::text_responses([response.into()])
+    }
+
+    fn text_responses(responses: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::responses(
+            responses
+                .into_iter()
+                .map(|response| Ok(vec![AssistantContent::text(response.into())])),
+        )
+    }
+
+    fn responses(
+        responses: impl IntoIterator<Item = Result<Vec<AssistantContent>, String>>,
+    ) -> Self {
         Self {
-            responses: Arc::new(Mutex::new(
-                responses
-                    .into_iter()
-                    .map(|response| Ok(response.into()))
-                    .collect(),
-            )),
-            recorded_prompts: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+            recorded_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn fixed_error(message: impl Into<String>) -> Self {
         Self {
             responses: Arc::new(Mutex::new(vec![Err(message.into())])),
-            recorded_prompts: Arc::new(Mutex::new(Vec::new())),
+            recorded_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn recorded_prompts(&self) -> Vec<String> {
-        self.recorded_prompts
+    fn recorded_requests(&self) -> Vec<String> {
+        self.recorded_requests
             .lock()
-            .expect("recorded prompts lock is available")
+            .expect("recorded requests lock is available")
             .clone()
     }
 }
 
-impl Chat for TestPrompt {
-    #[allow(refining_impl_trait)]
-    async fn chat<I, T>(
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TestStreamingResponse;
+
+impl GetTokenUsage for TestStreamingResponse {
+    fn token_usage(&self) -> Option<Usage> {
+        None
+    }
+}
+
+impl CompletionModel for TestModel {
+    type Response = serde_json::Value;
+    type StreamingResponse = TestStreamingResponse;
+    type Client = ();
+
+    fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+        Self::fixed_text("")
+    }
+
+    async fn completion(
         &self,
-        prompt: impl Into<rig::message::Message>,
-        chat_history: I,
-    ) -> Result<String, PromptError>
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<Message>,
-    {
-        let prompt = prompt.into();
-        let history = chat_history.into_iter().map(Into::into).collect::<Vec<_>>();
-        let prompt_json = serde_json::json!({
-            "prompt": prompt,
-            "history": history,
-        })
-        .to_string();
-        self.recorded_prompts
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+        let request_json = serde_json::to_string(&request).expect("request serializes");
+        self.recorded_requests
             .lock()
-            .expect("recorded prompts lock is available")
-            .push(prompt_json);
+            .expect("recorded requests lock is available")
+            .push(request_json);
 
         let response = self
             .responses
@@ -311,13 +375,28 @@ impl Chat for TestPrompt {
             .remove(0);
 
         match response {
-            Ok(content) => Ok(content.clone()),
-            Err(message) => Err(PromptError::PromptCancelled {
-                chat_history: Vec::new(),
-                reason: message,
+            Ok(content) => Ok(CompletionResponse {
+                choice: OneOrMany::many(content).expect("test response has at least one choice"),
+                usage: Usage::new(),
+                raw_response: serde_json::Value::Null,
+                message_id: None,
             }),
+            Err(message) => Err(CompletionError::ProviderError(message)),
         }
     }
+
+    async fn stream(
+        &self,
+        _request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+        Err(CompletionError::ProviderError(
+            "test streaming is not implemented".to_owned(),
+        ))
+    }
+}
+
+fn test_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+    ToolCall::new(id.to_owned(), ToolFunction::new(name.to_owned(), arguments))
 }
 
 fn temp_workspace_root() -> std::path::PathBuf {

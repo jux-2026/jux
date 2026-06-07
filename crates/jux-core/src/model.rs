@@ -85,7 +85,7 @@ pub enum RunStatus {
     Failed,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Step {
     pub id: StepId,
     pub kind: StepKind,
@@ -110,13 +110,26 @@ impl Step {
 
     #[must_use]
     pub fn visible_to_llm(&self) -> bool {
-        matches!(self.kind, StepKind::LlmMessage)
+        matches!(
+            self.kind,
+            StepKind::SystemMessage
+                | StepKind::UserMessage
+                | StepKind::AssistantMessage
+                | StepKind::AssistantToolCall
+                | StepKind::ToolResult
+        )
     }
 
     #[must_use]
     pub fn to_llm_line(&self) -> Option<String> {
         match &self.payload {
-            StepPayload::LlmMessage { role, content } => Some(format!("{role:?}: {content}")),
+            StepPayload::SystemMessage { content } => Some(format!("System: {content}")),
+            StepPayload::UserMessage { content } => Some(format!("User: {content}")),
+            StepPayload::AssistantMessage { content } => Some(format!("Assistant: {content}")),
+            StepPayload::AssistantToolCall {
+                name, arguments, ..
+            } => Some(format!("AssistantToolCall: {name} {arguments}")),
+            StepPayload::ToolResult { content, .. } => Some(format!("ToolResult: {content}")),
             _ => None,
         }
     }
@@ -124,23 +137,41 @@ impl Step {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum StepKind {
-    LlmMessage,
+    SystemMessage,
+    UserMessage,
+    AssistantMessage,
+    AssistantToolCall,
+    ToolResult,
+    LlmToolDefinition,
     Error,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum LlmMessageRole {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum StepPayload {
-    LlmMessage {
-        role: LlmMessageRole,
+    SystemMessage {
         content: String,
+    },
+    UserMessage {
+        content: String,
+    },
+    AssistantMessage {
+        content: String,
+    },
+    AssistantToolCall {
+        id: String,
+        call_id: Option<String>,
+        name: String,
+        arguments: serde_json::Value,
+    },
+    ToolResult {
+        id: String,
+        call_id: Option<String>,
+        content: String,
+    },
+    LlmToolDefinition {
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
     },
     Error {
         message: String,

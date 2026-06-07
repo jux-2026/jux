@@ -30,7 +30,7 @@ fn cli_exposes_foundation_commands() {
 #[test]
 fn run_command_executes_mocked_llm_and_persists_state() {
     let workspace = TempDir::new().expect("temp workspace exists");
-    let mock = start_deepseek_mock(r#"{"type":"final_answer","answer":"Mocked Jux answer"}"#);
+    let mock = start_deepseek_mock("Mocked Jux answer");
 
     Command::cargo_bin("jux")
         .expect("jux binary exists")
@@ -50,7 +50,7 @@ fn run_command_executes_mocked_llm_and_persists_state() {
         .stdout(predicate::str::contains("session_id:").not())
         .stdout(predicate::str::contains("run_id:").not())
         .stdout(predicate::str::contains("status:").not())
-        .stdout(predicate::str::contains("LlmMessage").not());
+        .stdout(predicate::str::contains("SystemMessage").not());
 
     let requests = mock.join();
     let request = requests.first().expect("mock receives one request");
@@ -66,7 +66,7 @@ fn run_command_executes_mocked_llm_and_persists_state() {
 #[test]
 fn run_command_can_output_json() {
     let workspace = TempDir::new().expect("temp workspace exists");
-    let mock = start_deepseek_mock(r#"{"type":"final_answer","answer":"JSON answer"}"#);
+    let mock = start_deepseek_mock("JSON answer");
 
     let assert = Command::cargo_bin("jux")
         .expect("jux binary exists")
@@ -103,20 +103,25 @@ fn run_command_can_output_json() {
     assert!(output["run_id"].as_str().is_some_and(|id| !id.is_empty()));
     assert!(output["created_at"].as_u64().is_some());
     assert!(output["updated_at"].as_u64().is_some());
-    assert_eq!(output["steps"][0]["kind"], "LlmMessage");
-    assert_eq!(
-        output["steps"][0]["payload"]["LlmMessage"]["role"],
-        "System"
-    );
+    assert_eq!(output["steps"][0]["kind"], "SystemMessage");
     assert!(
-        output["steps"][0]["payload"]["LlmMessage"]["content"]
+        output["steps"][0]["payload"]["SystemMessage"]["content"]
             .as_str()
             .is_some_and(|content| content.contains("You are Jux"))
     );
-    assert_eq!(output["steps"][1]["kind"], "LlmMessage");
-    assert_eq!(output["steps"][1]["payload"]["LlmMessage"]["role"], "User");
+    assert_eq!(output["steps"][1]["kind"], "LlmToolDefinition");
     assert_eq!(
-        output["steps"][1]["payload"]["LlmMessage"]["content"],
+        output["steps"][1]["payload"]["LlmToolDefinition"]["name"],
+        "echo"
+    );
+    assert_eq!(output["steps"][2]["kind"], "LlmToolDefinition");
+    assert_eq!(
+        output["steps"][2]["payload"]["LlmToolDefinition"]["name"],
+        "lua"
+    );
+    assert_eq!(output["steps"][3]["kind"], "UserMessage");
+    assert_eq!(
+        output["steps"][3]["payload"]["UserMessage"]["content"],
         "Return JSON output"
     );
     assert!(output["steps"][0]["created_at"].as_u64().is_some());
@@ -130,7 +135,7 @@ fn run_command_can_output_json() {
 #[test]
 fn run_command_can_output_yaml() {
     let workspace = TempDir::new().expect("temp workspace exists");
-    let mock = start_deepseek_mock(r#"{"type":"final_answer","answer":"YAML answer"}"#);
+    let mock = start_deepseek_mock("YAML answer");
 
     Command::cargo_bin("jux")
         .expect("jux binary exists")
@@ -156,7 +161,7 @@ fn run_command_can_output_yaml() {
         .stdout(predicate::str::contains("created_at:"))
         .stdout(predicate::str::contains("updated_at:"))
         .stdout(predicate::str::contains("steps:"))
-        .stdout(predicate::str::contains("kind: LlmMessage"))
+        .stdout(predicate::str::contains("kind: SystemMessage"))
         .stdout(predicate::str::contains("payload:"));
 
     let requests = mock.join();
@@ -167,8 +172,12 @@ fn run_command_can_output_yaml() {
 fn run_command_executes_mocked_tool_call_loop() {
     let workspace = TempDir::new().expect("temp workspace exists");
     let mock = start_deepseek_mock_sequence([
-        r#"{"type":"tool_call","tool_name":"echo","input":"cli tool result"}"#,
-        r#"{"type":"final_answer","answer":"Final answer after tool"}"#,
+        DeepseekMockResponse::tool_call(
+            "call_1",
+            "echo",
+            serde_json::json!({ "input": "cli tool result" }),
+        ),
+        DeepseekMockResponse::text("Final answer after tool"),
     ]);
 
     Command::cargo_bin("jux")
@@ -186,18 +195,20 @@ fn run_command_executes_mocked_tool_call_loop() {
         .success()
         .stdout(predicate::str::contains("Final answer after tool"))
         .stdout(predicate::str::contains("status:").not())
-        .stdout(predicate::str::contains("LlmMessage").not());
+        .stdout(predicate::str::contains("SystemMessage").not());
 
     let requests = mock.join();
     assert_eq!(requests.len(), 2);
     assert!(requests[0].contains("Use a tool"));
-    assert!(requests[1].contains("Tool echo: cli tool result"));
+    assert!(requests[0].contains("\"tools\""));
+    assert!(requests[1].contains("cli tool result"));
+    assert!(requests[1].contains("\"role\":\"tool\""));
 }
 
 #[test]
 fn session_show_outputs_active_session_state() {
     let workspace = TempDir::new().expect("temp workspace exists");
-    let mock = start_deepseek_mock(r#"{"type":"final_answer","answer":"Session answer"}"#);
+    let mock = start_deepseek_mock("Session answer");
 
     Command::cargo_bin("jux")
         .expect("jux binary exists")
@@ -234,21 +245,19 @@ fn session_show_outputs_active_session_state() {
     assert_eq!(output["runs"][0]["request"], "Create session state");
     assert_eq!(output["runs"][0]["status"], "Completed");
     assert!(output.get("steps").is_none());
-    assert_eq!(output["runs"][0]["steps"][0]["kind"], "LlmMessage");
+    assert_eq!(output["runs"][0]["steps"][0]["kind"], "SystemMessage");
+    assert_eq!(output["runs"][0]["steps"][1]["kind"], "LlmToolDefinition");
     assert_eq!(
-        output["runs"][0]["steps"][0]["payload"]["LlmMessage"]["role"],
-        "System"
+        output["runs"][0]["steps"][1]["payload"]["LlmToolDefinition"]["name"],
+        "echo"
     );
-    assert_eq!(output["runs"][0]["steps"][1]["kind"], "LlmMessage");
+    assert_eq!(output["runs"][0]["steps"][2]["kind"], "LlmToolDefinition");
     assert_eq!(
-        output["runs"][0]["steps"][1]["payload"]["LlmMessage"]["role"],
-        "User"
+        output["runs"][0]["steps"][2]["payload"]["LlmToolDefinition"]["name"],
+        "lua"
     );
-    assert_eq!(output["runs"][0]["steps"][2]["kind"], "LlmMessage");
-    assert_eq!(
-        output["runs"][0]["steps"][2]["payload"]["LlmMessage"]["role"],
-        "Assistant"
-    );
+    assert_eq!(output["runs"][0]["steps"][3]["kind"], "UserMessage");
+    assert_eq!(output["runs"][0]["steps"][4]["kind"], "AssistantMessage");
 }
 
 struct MockDeepseek {
@@ -262,32 +271,52 @@ impl MockDeepseek {
     }
 }
 
-fn start_deepseek_mock(content: &str) -> MockDeepseek {
-    start_deepseek_mock_sequence([content])
+#[derive(Clone, Debug)]
+enum DeepseekMockResponse {
+    Text(String),
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
 }
 
-fn start_deepseek_mock_sequence<'a>(contents: impl IntoIterator<Item = &'a str>) -> MockDeepseek {
+impl DeepseekMockResponse {
+    fn text(content: impl Into<String>) -> Self {
+        Self::Text(content.into())
+    }
+
+    fn tool_call(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> Self {
+        Self::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+        }
+    }
+}
+
+fn start_deepseek_mock(content: &str) -> MockDeepseek {
+    start_deepseek_mock_sequence([DeepseekMockResponse::text(content)])
+}
+
+fn start_deepseek_mock_sequence(
+    contents: impl IntoIterator<Item = DeepseekMockResponse>,
+) -> MockDeepseek {
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock server binds");
     let address = listener.local_addr().expect("mock server has address");
-    let contents = contents
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
+    let contents = contents.into_iter().collect::<Vec<_>>();
     let handle = thread::spawn(move || {
         let mut requests = Vec::new();
         for content in contents {
             let (mut stream, _) = listener.accept().expect("mock server accepts request");
             requests.push(read_http_request(&mut stream));
+            let choice = deepseek_choice(content);
             let body = serde_json::json!({
-                "choices": [{
-                    "finish_reason": "stop",
-                    "index": 0,
-                    "logprobs": null,
-                    "message": {
-                        "role": "assistant",
-                        "content": content
-                    }
-                }],
+                "choices": [choice],
                 "usage": {
                     "completion_tokens": 0,
                     "prompt_tokens": 0,
@@ -312,6 +341,42 @@ fn start_deepseek_mock_sequence<'a>(contents: impl IntoIterator<Item = &'a str>)
     MockDeepseek {
         base_url: format!("http://{address}"),
         handle,
+    }
+}
+
+fn deepseek_choice(response: DeepseekMockResponse) -> serde_json::Value {
+    match response {
+        DeepseekMockResponse::Text(content) => serde_json::json!({
+            "finish_reason": "stop",
+            "index": 0,
+            "logprobs": null,
+            "message": {
+                "role": "assistant",
+                "content": content
+            }
+        }),
+        DeepseekMockResponse::ToolCall {
+            id,
+            name,
+            arguments,
+        } => serde_json::json!({
+            "finish_reason": "tool_calls",
+            "index": 0,
+            "logprobs": null,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "arguments": arguments.to_string(),
+                        "name": name
+                    },
+                    "id": id,
+                    "index": 0,
+                    "type": "function"
+                }]
+            }
+        }),
     }
 }
 

@@ -4,7 +4,7 @@ use jux_core::{
     Run, RunLoop, RunLoopOutput, Session, SessionId, SqliteWorkspaceStore, Step, StepPayload,
     Workspace,
 };
-use rig::{client::CompletionClient, completion::Chat, providers::deepseek};
+use rig::{client::CompletionClient, completion::CompletionModel, providers::deepseek};
 use serde::Serialize;
 use std::env;
 use std::path::PathBuf;
@@ -130,8 +130,8 @@ fn handle_run(args: RunArgs, output_format: OutputFormat) -> Result<()> {
 
     let output = match args.provider {
         LlmProviderName::Deepseek => {
-            let prompt = deepseek_prompt(args.deepseek_base_url, args.deepseek_model)?;
-            run_with_prompt(args.workspace, prompt, args.request)?
+            let model = deepseek_model(args.deepseek_base_url, args.deepseek_model)?;
+            run_with_model(args.workspace, model, args.request)?
         }
     };
     print_run_output(&output, output_format)?;
@@ -328,21 +328,24 @@ impl From<&Step> for RunStepOutput {
     }
 }
 
-fn run_with_prompt<P>(
+fn run_with_model<M>(
     workspace: PathBuf,
-    prompt: P,
+    model: M,
     request: String,
 ) -> Result<jux_core::RunLoopOutput>
 where
-    P: Chat,
+    M: CompletionModel,
 {
     let runtime = Builder::new_current_thread().enable_all().build()?;
     let store = SqliteWorkspaceStore::new(workspace);
-    let run_loop = RunLoop::new(store, prompt);
+    let run_loop = RunLoop::new(store, model);
     Ok(runtime.block_on(run_loop.run(request))?)
 }
 
-fn deepseek_prompt(deepseek_base_url: String, deepseek_model: String) -> Result<impl Chat> {
+fn deepseek_model(
+    deepseek_base_url: String,
+    deepseek_model: String,
+) -> Result<impl CompletionModel> {
     let api_key = env::var("JUX_DEEPSEEK_API_KEY")
         .context("JUX_DEEPSEEK_API_KEY must be set when using the deepseek provider")?;
     tracing::debug!(
@@ -355,7 +358,7 @@ fn deepseek_prompt(deepseek_base_url: String, deepseek_model: String) -> Result<
         .api_key(&api_key)
         .build()?;
 
-    Ok(client.agent(deepseek_model).build())
+    Ok(client.completion_model(deepseek_model))
 }
 
 fn init_tracing() {
