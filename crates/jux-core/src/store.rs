@@ -478,22 +478,14 @@ fn decode_run_status(status: String) -> Result<RunStatus, StoreError> {
 
 fn encode_step_kind(kind: &StepKind) -> &'static str {
     match kind {
-        StepKind::UserRequest => "user_request",
-        StepKind::LlmCall => "llm_call",
-        StepKind::AssistantToolCall => "assistant_tool_call",
-        StepKind::ToolResult => "tool_result",
-        StepKind::AssistantMessage => "assistant_message",
+        StepKind::LlmMessage => "llm_message",
         StepKind::Error => "error",
     }
 }
 
 fn decode_step_kind(kind: String) -> Result<StepKind, StoreError> {
     match kind.as_str() {
-        "user_request" => Ok(StepKind::UserRequest),
-        "llm_call" => Ok(StepKind::LlmCall),
-        "assistant_tool_call" => Ok(StepKind::AssistantToolCall),
-        "tool_result" => Ok(StepKind::ToolResult),
-        "assistant_message" => Ok(StepKind::AssistantMessage),
+        "llm_message" => Ok(StepKind::LlmMessage),
         "error" => Ok(StepKind::Error),
         _ => Err(StoreError::InvalidStepKind(kind)),
     }

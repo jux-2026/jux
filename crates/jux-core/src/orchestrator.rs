@@ -1,7 +1,10 @@
-use crate::model::{Run, RunStatus, Session, Step, StepKind, StepPayload, Workspace};
+use crate::model::{
+    LlmMessageRole, Run, RunStatus, Session, Step, StepKind, StepPayload, Workspace,
+};
 use crate::store::{SqliteWorkspaceStore, StoreError};
 use mlua::{Lua, Value};
-use rig::completion::{Prompt, PromptError};
+use rig::completion::{Chat, PromptError};
+use rig::message::{AssistantContent, Message, UserContent};
 use serde::Deserialize;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -9,19 +12,26 @@ use std::fmt::{self, Display};
 const MAX_LOOP_ITERATIONS: usize = 8;
 const ECHO_TOOL_NAME: &str = "echo";
 const LUA_TOOL_NAME: &str = "lua";
+pub const SYSTEM_PROMPT: &str = "You are Jux, a concise coding agent.\n\
+Return JSON only. Use exactly one of these shapes:\n\
+{\"type\":\"final_answer\",\"answer\":\"...\"}\n\
+{\"type\":\"tool_call\",\"tool_name\":\"echo\",\"input\":\"...\"}\n\
+Available tools:\n\
+- echo: returns the input text unchanged.\n\
+- lua: executes the input as Lua code and returns the first returned value.";
 
 pub struct RunLoop<P> {
     store: SqliteWorkspaceStore,
-    prompt: P,
+    chat: P,
 }
 
 impl<P> RunLoop<P>
 where
-    P: Prompt,
+    P: Chat,
 {
     #[must_use]
-    pub fn new(store: SqliteWorkspaceStore, prompt: P) -> Self {
-        Self { store, prompt }
+    pub fn new(store: SqliteWorkspaceStore, chat: P) -> Self {
+        Self { store, chat }
     }
 
     pub async fn run(&self, request: String) -> Result<RunLoopOutput, RunLoopError> {
@@ -29,25 +39,44 @@ where
         tracing::info!(run_id = %run.id, "created run");
         self.store.append_step(
             &run.id,
-            StepKind::UserRequest,
-            StepPayload::UserRequest { content: request },
+            StepKind::LlmMessage,
+            StepPayload::LlmMessage {
+                role: LlmMessageRole::System,
+                content: SYSTEM_PROMPT.to_owned(),
+            },
+        )?;
+        self.store.append_step(
+            &run.id,
+            StepKind::LlmMessage,
+            StepPayload::LlmMessage {
+                role: LlmMessageRole::User,
+                content: request,
+            },
         )?;
 
         for _ in 0..MAX_LOOP_ITERATIONS {
-            let llm_prompt = self.build_prompt(&run)?;
-            tracing::debug!(run_id = %run.id, "built llm prompt");
+            let llm_request = self.build_chat_request(&run)?;
+            tracing::debug!(
+                run_id = %run.id,
+                history_len = llm_request.history.len(),
+                "built llm chat request"
+            );
 
-            let response = match self.prompt.prompt(llm_prompt.clone()).await {
+            let response = match self
+                .chat
+                .chat(llm_request.prompt.clone(), llm_request.history.clone())
+                .await
+            {
                 Ok(response) => response,
-                Err(error) => return self.fail_prompt_call(run, llm_prompt, error),
+                Err(error) => return self.fail_prompt_call(run, error),
             };
 
             self.store.append_step(
                 &run.id,
-                StepKind::LlmCall,
-                StepPayload::LlmCall {
-                    prompt: llm_prompt,
-                    response: Some(response.clone()),
+                StepKind::LlmMessage,
+                StepPayload::LlmMessage {
+                    role: LlmMessageRole::Assistant,
+                    content: response.clone(),
                 },
             )?;
 
@@ -56,14 +85,6 @@ where
                     return self.complete_run(run, answer);
                 }
                 Ok(LlmDecision::ToolCall { tool_name, input }) => {
-                    self.store.append_step(
-                        &run.id,
-                        StepKind::AssistantToolCall,
-                        StepPayload::AssistantToolCall {
-                            tool_name: tool_name.clone(),
-                            input: input.clone(),
-                        },
-                    )?;
                     tracing::info!(run_id = %run.id, tool_name = %tool_name, "executing tool call");
 
                     let output = match execute_tool(&tool_name, &input) {
@@ -72,10 +93,10 @@ where
                     };
                     self.store.append_step(
                         &run.id,
-                        StepKind::ToolResult,
-                        StepPayload::ToolResult {
-                            tool_name,
-                            content: output,
+                        StepKind::LlmMessage,
+                        StepPayload::LlmMessage {
+                            role: LlmMessageRole::Tool,
+                            content: format!("Tool {tool_name}: {output}"),
                         },
                     )?;
                 }
@@ -89,18 +110,7 @@ where
         )
     }
 
-    // Finalizes a run after the LLM has produced a final answer: persist the
-    // user-visible assistant message, mark the run as complete, then reload the
-    // fact steps so the CLI can report the finished execution trace.
     fn complete_run(&self, run: Run, answer: String) -> Result<RunLoopOutput, RunLoopError> {
-        self.store.append_step(
-            &run.id,
-            StepKind::AssistantMessage,
-            StepPayload::AssistantMessage {
-                content: answer.clone(),
-            },
-        )?;
-
         let run = self
             .store
             .update_run_status(&run.id, RunStatus::Completed)?;
@@ -125,18 +135,9 @@ where
     fn fail_prompt_call(
         &self,
         run: Run,
-        prompt: String,
         error: PromptError,
     ) -> Result<RunLoopOutput, RunLoopError> {
         let message = error.to_string();
-        self.store.append_step(
-            &run.id,
-            StepKind::LlmCall,
-            StepPayload::LlmCall {
-                prompt,
-                response: None,
-            },
-        )?;
         self.store
             .append_step(&run.id, StepKind::Error, StepPayload::Error { message })?;
 
@@ -164,25 +165,46 @@ where
         Ok(())
     }
 
-    fn build_prompt(&self, run: &Run) -> Result<String, RunLoopError> {
-        let steps = self.store.load_run_steps(&run.id)?;
-        let visible_context = steps
+    fn build_chat_request(&self, run: &Run) -> Result<LlmChatRequest, RunLoopError> {
+        let steps = self.store.load_session_steps(&run.id.session_id())?;
+        let messages = steps
             .iter()
             .filter(|step| step.visible_to_llm())
-            .filter_map(Step::to_llm_line)
-            .collect::<Vec<_>>()
-            .join("\n");
+            .filter_map(step_to_chat_message)
+            .collect::<Vec<_>>();
 
-        Ok(format!(
-            "You are Jux, a concise coding agent.\n\
-             Return JSON only. Use exactly one of these shapes:\n\
-             {{\"type\":\"final_answer\",\"answer\":\"...\"}}\n\
-             {{\"type\":\"tool_call\",\"tool_name\":\"echo\",\"input\":\"...\"}}\n\
-             Available tools:\n\
-             - echo: returns the input text unchanged.\n\
-             - lua: executes the input as Lua code and returns the first returned value.\n\n\
-             Context:\n{visible_context}"
-        ))
+        let Some((prompt, history)) = messages.split_last() else {
+            return Err(RunLoopError::Runtime {
+                run: Box::new(run.clone()),
+                message: "run has no visible message for the LLM".to_owned(),
+            });
+        };
+        let history = history.to_vec();
+
+        Ok(LlmChatRequest {
+            prompt: prompt.clone(),
+            history,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LlmChatRequest {
+    prompt: Message,
+    history: Vec<Message>,
+}
+
+fn step_to_chat_message(step: &Step) -> Option<Message> {
+    match &step.payload {
+        StepPayload::LlmMessage { role, content } => match role {
+            LlmMessageRole::System => Some(Message::System {
+                content: content.clone(),
+            }),
+            LlmMessageRole::User => Some(UserContent::text(content.clone()).into()),
+            LlmMessageRole::Assistant => Some(AssistantContent::text(content.clone()).into()),
+            LlmMessageRole::Tool => Some(UserContent::text(content.clone()).into()),
+        },
+        _ => None,
     }
 }
 

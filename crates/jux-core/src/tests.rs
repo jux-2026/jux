@@ -1,5 +1,5 @@
 use super::*;
-use rig::completion::{Prompt, PromptError};
+use rig::completion::{Chat, Message, PromptError};
 use std::sync::{Arc, Mutex};
 
 #[test]
@@ -40,8 +40,9 @@ fn sqlite_store_persists_workspace_session_run_and_ordered_steps() {
     let first_step = store
         .append_step(
             &run.id,
-            StepKind::UserRequest,
-            StepPayload::UserRequest {
+            StepKind::LlmMessage,
+            StepPayload::LlmMessage {
+                role: LlmMessageRole::User,
                 content: "Explain this project".to_owned(),
             },
         )
@@ -49,8 +50,9 @@ fn sqlite_store_persists_workspace_session_run_and_ordered_steps() {
     let second_step = store
         .append_step(
             &run.id,
-            StepKind::AssistantMessage,
-            StepPayload::AssistantMessage {
+            StepKind::LlmMessage,
+            StepPayload::LlmMessage {
+                role: LlmMessageRole::Assistant,
                 content: "Done".to_owned(),
             },
         )
@@ -95,13 +97,53 @@ fn run_loop_records_successful_llm_run_steps() {
             .map(|step| step.kind.clone())
             .collect::<Vec<_>>(),
         vec![
-            StepKind::UserRequest,
-            StepKind::LlmCall,
-            StepKind::AssistantMessage,
+            StepKind::LlmMessage,
+            StepKind::LlmMessage,
+            StepKind::LlmMessage,
         ]
     );
+    assert_eq!(
+        output.steps[0].payload,
+        StepPayload::LlmMessage {
+            role: LlmMessageRole::System,
+            content: SYSTEM_PROMPT.to_owned(),
+        }
+    );
+    assert_eq!(
+        output.steps[1].payload,
+        StepPayload::LlmMessage {
+            role: LlmMessageRole::User,
+            content: "Explain this project".to_owned(),
+        }
+    );
     assert_eq!(prompts.len(), 1);
-    assert!(prompts[0].contains("User: Explain this project"));
+    assert!(prompts[0].contains("You are Jux"));
+    assert!(prompts[0].contains("Explain this project"));
+}
+
+#[test]
+fn run_loop_uses_session_history_when_calling_llm() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let prompt = TestPrompt::responses([
+        r#"{"type":"final_answer","answer":"First answer"}"#,
+        r#"{"type":"final_answer","answer":"Second answer"}"#,
+    ]);
+    let run_loop = RunLoop::new(store.clone(), prompt.clone());
+
+    futures::executor::block_on(run_loop.run("First request".to_owned()))
+        .expect("first run loop succeeds");
+    futures::executor::block_on(run_loop.run("Second request".to_owned()))
+        .expect("second run loop succeeds");
+    let prompts = prompt.recorded_prompts();
+
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("You are Jux"));
+    assert!(prompts[0].contains("First request"));
+    assert!(!prompts[0].contains("First answer"));
+    assert!(prompts[1].contains("You are Jux"));
+    assert!(prompts[1].contains("First request"));
+    assert!(prompts[1].contains("First answer"));
+    assert!(prompts[1].contains("Second request"));
 }
 
 #[test]
@@ -129,16 +171,16 @@ fn run_loop_executes_echo_tool_call_and_continues_until_final_answer() {
             .map(|step| step.kind.clone())
             .collect::<Vec<_>>(),
         vec![
-            StepKind::UserRequest,
-            StepKind::LlmCall,
-            StepKind::AssistantToolCall,
-            StepKind::ToolResult,
-            StepKind::LlmCall,
-            StepKind::AssistantMessage,
+            StepKind::LlmMessage,
+            StepKind::LlmMessage,
+            StepKind::LlmMessage,
+            StepKind::LlmMessage,
+            StepKind::LlmMessage,
         ]
     );
     assert_eq!(prompts.len(), 2);
-    assert!(prompts[0].contains("User: Use the echo tool"));
+    assert!(prompts[0].contains("You are Jux"));
+    assert!(prompts[0].contains("Use the echo tool"));
     assert!(prompts[1].contains("Tool echo: hello from tool"));
 }
 
@@ -167,16 +209,16 @@ fn run_loop_executes_lua_tool_call_and_continues_until_final_answer() {
             .map(|step| step.kind.clone())
             .collect::<Vec<_>>(),
         vec![
-            StepKind::UserRequest,
-            StepKind::LlmCall,
-            StepKind::AssistantToolCall,
-            StepKind::ToolResult,
-            StepKind::LlmCall,
-            StepKind::AssistantMessage,
+            StepKind::LlmMessage,
+            StepKind::LlmMessage,
+            StepKind::LlmMessage,
+            StepKind::LlmMessage,
+            StepKind::LlmMessage,
         ]
     );
     assert_eq!(prompts.len(), 2);
-    assert!(prompts[0].contains("User: Use the lua tool"));
+    assert!(prompts[0].contains("You are Jux"));
+    assert!(prompts[0].contains("Use the lua tool"));
     assert!(prompts[1].contains("Tool lua: hello from lua"));
 }
 
@@ -239,14 +281,24 @@ impl TestPrompt {
     }
 }
 
-impl Prompt for TestPrompt {
+impl Chat for TestPrompt {
     #[allow(refining_impl_trait)]
-    async fn prompt(
+    async fn chat<I, T>(
         &self,
         prompt: impl Into<rig::message::Message>,
-    ) -> Result<String, PromptError> {
+        chat_history: I,
+    ) -> Result<String, PromptError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<Message>,
+    {
         let prompt = prompt.into();
-        let prompt_json = serde_json::to_string(&prompt).expect("prompt is serializable");
+        let history = chat_history.into_iter().map(Into::into).collect::<Vec<_>>();
+        let prompt_json = serde_json::json!({
+            "prompt": prompt,
+            "history": history,
+        })
+        .to_string();
         self.recorded_prompts
             .lock()
             .expect("recorded prompts lock is available")

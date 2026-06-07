@@ -4,7 +4,7 @@ use jux_core::{
     Run, RunLoop, RunLoopOutput, Session, SessionId, SqliteWorkspaceStore, Step, StepPayload,
     Workspace,
 };
-use rig::{client::CompletionClient, completion::Prompt, providers::deepseek};
+use rig::{client::CompletionClient, completion::Chat, providers::deepseek};
 use serde::Serialize;
 use std::env;
 use std::path::PathBuf;
@@ -334,7 +334,7 @@ fn run_with_prompt<P>(
     request: String,
 ) -> Result<jux_core::RunLoopOutput>
 where
-    P: Prompt,
+    P: Chat,
 {
     let runtime = Builder::new_current_thread().enable_all().build()?;
     let store = SqliteWorkspaceStore::new(workspace);
@@ -342,7 +342,7 @@ where
     Ok(runtime.block_on(run_loop.run(request))?)
 }
 
-fn deepseek_prompt(deepseek_base_url: String, deepseek_model: String) -> Result<impl Prompt> {
+fn deepseek_prompt(deepseek_base_url: String, deepseek_model: String) -> Result<impl Chat> {
     let api_key = env::var("JUX_DEEPSEEK_API_KEY")
         .context("JUX_DEEPSEEK_API_KEY must be set when using the deepseek provider")?;
     tracing::debug!(

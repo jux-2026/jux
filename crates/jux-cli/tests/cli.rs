@@ -50,8 +50,7 @@ fn run_command_executes_mocked_llm_and_persists_state() {
         .stdout(predicate::str::contains("session_id:").not())
         .stdout(predicate::str::contains("run_id:").not())
         .stdout(predicate::str::contains("status:").not())
-        .stdout(predicate::str::contains("UserRequest").not())
-        .stdout(predicate::str::contains("LlmCall").not());
+        .stdout(predicate::str::contains("LlmMessage").not());
 
     let requests = mock.join();
     let request = requests.first().expect("mock receives one request");
@@ -104,9 +103,20 @@ fn run_command_can_output_json() {
     assert!(output["run_id"].as_str().is_some_and(|id| !id.is_empty()));
     assert!(output["created_at"].as_u64().is_some());
     assert!(output["updated_at"].as_u64().is_some());
-    assert_eq!(output["steps"][0]["kind"], "UserRequest");
+    assert_eq!(output["steps"][0]["kind"], "LlmMessage");
     assert_eq!(
-        output["steps"][0]["payload"]["UserRequest"]["content"],
+        output["steps"][0]["payload"]["LlmMessage"]["role"],
+        "System"
+    );
+    assert!(
+        output["steps"][0]["payload"]["LlmMessage"]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("You are Jux"))
+    );
+    assert_eq!(output["steps"][1]["kind"], "LlmMessage");
+    assert_eq!(output["steps"][1]["payload"]["LlmMessage"]["role"], "User");
+    assert_eq!(
+        output["steps"][1]["payload"]["LlmMessage"]["content"],
         "Return JSON output"
     );
     assert!(output["steps"][0]["created_at"].as_u64().is_some());
@@ -146,7 +156,7 @@ fn run_command_can_output_yaml() {
         .stdout(predicate::str::contains("created_at:"))
         .stdout(predicate::str::contains("updated_at:"))
         .stdout(predicate::str::contains("steps:"))
-        .stdout(predicate::str::contains("kind: UserRequest"))
+        .stdout(predicate::str::contains("kind: LlmMessage"))
         .stdout(predicate::str::contains("payload:"));
 
     let requests = mock.join();
@@ -176,8 +186,7 @@ fn run_command_executes_mocked_tool_call_loop() {
         .success()
         .stdout(predicate::str::contains("Final answer after tool"))
         .stdout(predicate::str::contains("status:").not())
-        .stdout(predicate::str::contains("AssistantToolCall").not())
-        .stdout(predicate::str::contains("ToolResult").not());
+        .stdout(predicate::str::contains("LlmMessage").not());
 
     let requests = mock.join();
     assert_eq!(requests.len(), 2);
@@ -225,9 +234,21 @@ fn session_show_outputs_active_session_state() {
     assert_eq!(output["runs"][0]["request"], "Create session state");
     assert_eq!(output["runs"][0]["status"], "Completed");
     assert!(output.get("steps").is_none());
-    assert_eq!(output["runs"][0]["steps"][0]["kind"], "UserRequest");
-    assert_eq!(output["runs"][0]["steps"][1]["kind"], "LlmCall");
-    assert_eq!(output["runs"][0]["steps"][2]["kind"], "AssistantMessage");
+    assert_eq!(output["runs"][0]["steps"][0]["kind"], "LlmMessage");
+    assert_eq!(
+        output["runs"][0]["steps"][0]["payload"]["LlmMessage"]["role"],
+        "System"
+    );
+    assert_eq!(output["runs"][0]["steps"][1]["kind"], "LlmMessage");
+    assert_eq!(
+        output["runs"][0]["steps"][1]["payload"]["LlmMessage"]["role"],
+        "User"
+    );
+    assert_eq!(output["runs"][0]["steps"][2]["kind"], "LlmMessage");
+    assert_eq!(
+        output["runs"][0]["steps"][2]["payload"]["LlmMessage"]["role"],
+        "Assistant"
+    );
 }
 
 struct MockDeepseek {

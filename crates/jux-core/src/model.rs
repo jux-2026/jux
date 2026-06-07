@@ -110,20 +110,13 @@ impl Step {
 
     #[must_use]
     pub fn visible_to_llm(&self) -> bool {
-        matches!(
-            self.kind,
-            StepKind::UserRequest | StepKind::AssistantMessage | StepKind::ToolResult
-        )
+        matches!(self.kind, StepKind::LlmMessage)
     }
 
     #[must_use]
     pub fn to_llm_line(&self) -> Option<String> {
         match &self.payload {
-            StepPayload::UserRequest { content } => Some(format!("User: {content}")),
-            StepPayload::AssistantMessage { content } => Some(format!("Assistant: {content}")),
-            StepPayload::ToolResult { tool_name, content } => {
-                Some(format!("Tool {tool_name}: {content}"))
-            }
+            StepPayload::LlmMessage { role, content } => Some(format!("{role:?}: {content}")),
             _ => None,
         }
     }
@@ -131,32 +124,22 @@ impl Step {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum StepKind {
-    UserRequest,
-    LlmCall,
-    AssistantToolCall,
-    ToolResult,
-    AssistantMessage,
+    LlmMessage,
     Error,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum LlmMessageRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum StepPayload {
-    UserRequest {
-        content: String,
-    },
-    LlmCall {
-        prompt: String,
-        response: Option<String>,
-    },
-    AssistantToolCall {
-        tool_name: String,
-        input: String,
-    },
-    ToolResult {
-        tool_name: String,
-        content: String,
-    },
-    AssistantMessage {
+    LlmMessage {
+        role: LlmMessageRole,
         content: String,
     },
     Error {
