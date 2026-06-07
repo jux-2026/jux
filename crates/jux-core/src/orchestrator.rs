@@ -1,10 +1,11 @@
 use crate::model::{
-    Run, RunStatus, Session, SessionContextKind, SessionContextPayload, Step, StepKind,
-    StepPayload, Workspace,
+    AssistantResponseItem, LlmUsage, Run, RunStatus, Session, SessionContextKind,
+    SessionContextPayload, Step, StepKind, StepPayload, Workspace,
 };
 use crate::store::{SqliteWorkspaceStore, StoreError};
 use mlua::{Lua, LuaOptions, StdLib, UserData, UserDataMethods, Value};
-use rig::completion::{CompletionError, CompletionModel, ToolDefinition};
+use rig::OneOrMany;
+use rig::completion::{CompletionError, CompletionModel, ToolDefinition, Usage};
 use rig::message::{
     AssistantContent, Message, ToolCall, ToolFunction, ToolResult, ToolResultContent,
 };
@@ -33,6 +34,18 @@ as &&, ||, ;, |, >, <, backticks, $(), wildcard expansion, and newlines is rejec
 io.popen handles support read('*a'), read('*l'), lines(), and close(). Return the first \
 Lua value as the tool result. Do not call print. Use return to send the result back to Jux.";
 pub const SYSTEM_PROMPT: &str = "You are Jux, a concise coding agent.";
+
+impl From<Usage> for LlmUsage {
+    fn from(usage: Usage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        }
+    }
+}
 
 pub struct RunLoop<M> {
     store: SqliteWorkspaceStore,
@@ -79,67 +92,28 @@ where
             };
 
             let mut final_answer = String::new();
-            let mut has_tool_call = false;
-            for content in response.choice {
+            let mut tool_calls = Vec::new();
+            let mut items = Vec::new();
+            for content in response.choice.into_iter() {
                 match content {
                     AssistantContent::Text(text) => {
                         final_answer.push_str(&text.text);
-                        self.store.append_step(
-                            &run.id,
-                            StepKind::AssistantMessage,
-                            StepPayload::AssistantMessage { content: text.text },
-                        )?;
+                        items.push(AssistantResponseItem::Text { content: text.text });
                     }
                     AssistantContent::ToolCall(tool_call) => {
-                        has_tool_call = true;
-                        self.store.append_step(
-                            &run.id,
-                            StepKind::AssistantToolCall,
-                            StepPayload::AssistantToolCall {
-                                id: tool_call.id.clone(),
-                                call_id: tool_call.call_id.clone(),
-                                name: tool_call.function.name.clone(),
-                                arguments: tool_call.function.arguments.clone(),
-                            },
-                        )?;
-                        let tool_name = tool_call.function.name.clone();
-                        let args = tool_call.function.arguments.clone();
-                        tracing::info!(
-                            run_id = %run.id,
-                            tool_name = %tool_name,
-                            "executing tool call"
-                        );
-
-                        let output = match execute_tool(&tool_name, &args) {
-                            Ok(output) => output,
-                            Err(error) => {
-                                tracing::warn!(
-                                    run_id = %run.id,
-                                    tool_name = %tool_name,
-                                    error = %error,
-                                    "tool call failed"
-                                );
-                                format!("Tool execution failed: {error}")
-                            }
+                        let item = AssistantResponseItem::ToolCall {
+                            id: tool_call.id.clone(),
+                            call_id: tool_call.call_id.clone(),
+                            name: tool_call.function.name.clone(),
+                            arguments: tool_call.function.arguments.clone(),
                         };
-                        self.store.append_step(
-                            &run.id,
-                            StepKind::ToolResult,
-                            StepPayload::ToolResult {
-                                id: tool_call.id,
-                                call_id: tool_call.call_id,
-                                content: output,
-                            },
-                        )?;
+                        tool_calls.push(item.clone());
+                        items.push(item);
                     }
                     AssistantContent::Reasoning(reasoning) => {
                         let text = reasoning.display_text();
                         if !text.is_empty() {
-                            self.store.append_step(
-                                &run.id,
-                                StepKind::AssistantReasoning,
-                                StepPayload::AssistantReasoning { content: text },
-                            )?;
+                            items.push(AssistantResponseItem::Reasoning { content: text });
                         }
                     }
                     AssistantContent::Image(_) => {
@@ -150,8 +124,56 @@ where
                     }
                 }
             }
+            self.store.append_step(
+                &run.id,
+                StepKind::AssistantResponse,
+                StepPayload::AssistantResponse {
+                    message_id: response.message_id,
+                    usage: LlmUsage::from(response.usage),
+                    items,
+                },
+            )?;
 
-            if !has_tool_call {
+            for tool_call in &tool_calls {
+                let AssistantResponseItem::ToolCall {
+                    id,
+                    call_id,
+                    name,
+                    arguments,
+                } = tool_call
+                else {
+                    continue;
+                };
+                tracing::info!(
+                    run_id = %run.id,
+                    tool_name = %name,
+                    "executing tool call"
+                );
+
+                let output = match execute_tool(name, arguments) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        tracing::warn!(
+                            run_id = %run.id,
+                            tool_name = %name,
+                            error = %error,
+                            "tool call failed"
+                        );
+                        format!("Tool execution failed: {error}")
+                    }
+                };
+                self.store.append_step(
+                    &run.id,
+                    StepKind::ToolResult,
+                    StepPayload::ToolResult {
+                        id: id.clone(),
+                        call_id: call_id.clone(),
+                        content: output,
+                    },
+                )?;
+            }
+
+            if tool_calls.is_empty() {
                 return self.complete_run(run, final_answer);
             }
         }
@@ -267,12 +289,46 @@ struct LlmCompletionRequest {
 
 fn step_to_chat_message(step: &Step) -> Option<Message> {
     match &step.payload {
-        StepPayload::SystemMessage { content } => Some(Message::System {
-            content: content.clone(),
-        }),
         StepPayload::UserMessage { content } => Some(Message::user(content.clone())),
-        StepPayload::AssistantMessage { content } => Some(Message::assistant(content.clone())),
-        StepPayload::AssistantToolCall {
+        StepPayload::AssistantResponse {
+            message_id, items, ..
+        } => assistant_response_to_chat_message(message_id, items),
+        StepPayload::ToolResult {
+            id,
+            call_id,
+            content,
+        } => Some(Message::User {
+            content: rig::OneOrMany::one(rig::message::UserContent::ToolResult(ToolResult {
+                id: id.clone(),
+                call_id: call_id.clone(),
+                content: rig::OneOrMany::one(ToolResultContent::text(content.clone())),
+            })),
+        }),
+        StepPayload::Error { .. } => None,
+    }
+}
+
+fn assistant_response_to_chat_message(
+    message_id: &Option<String>,
+    items: &[AssistantResponseItem],
+) -> Option<Message> {
+    let content = items
+        .iter()
+        .filter_map(assistant_response_item_to_chat_content)
+        .collect::<Vec<_>>();
+    let content = OneOrMany::many(content).ok()?;
+    Some(Message::Assistant {
+        id: message_id.clone(),
+        content,
+    })
+}
+
+fn assistant_response_item_to_chat_content(
+    item: &AssistantResponseItem,
+) -> Option<AssistantContent> {
+    match item {
+        AssistantResponseItem::Text { content } => Some(AssistantContent::text(content.clone())),
+        AssistantResponseItem::ToolCall {
             id,
             call_id,
             name,
@@ -286,22 +342,9 @@ fn step_to_chat_message(step: &Step) -> Option<Message> {
                 Some(call_id) => tool_call.with_call_id(call_id.clone()),
                 None => tool_call,
             };
-            Some(tool_call.into())
+            Some(AssistantContent::ToolCall(tool_call))
         }
-        StepPayload::ToolResult {
-            id,
-            call_id,
-            content,
-        } => Some(Message::User {
-            content: rig::OneOrMany::one(rig::message::UserContent::ToolResult(ToolResult {
-                id: id.clone(),
-                call_id: call_id.clone(),
-                content: rig::OneOrMany::one(ToolResultContent::text(content.clone())),
-            })),
-        }),
-        StepPayload::AssistantReasoning { .. }
-        | StepPayload::LlmToolDefinition { .. }
-        | StepPayload::Error { .. } => None,
+        AssistantResponseItem::Reasoning { .. } => None,
     }
 }
 

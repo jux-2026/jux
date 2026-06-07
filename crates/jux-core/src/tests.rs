@@ -55,9 +55,13 @@ fn sqlite_store_persists_workspace_session_run_and_ordered_steps() {
     let second_step = store
         .append_step(
             &run.id,
-            StepKind::AssistantMessage,
-            StepPayload::AssistantMessage {
-                content: "Done".to_owned(),
+            StepKind::AssistantResponse,
+            StepPayload::AssistantResponse {
+                message_id: None,
+                usage: LlmUsage::default(),
+                items: vec![AssistantResponseItem::Text {
+                    content: "Done".to_owned(),
+                }],
             },
         )
         .expect("second step is saved");
@@ -212,7 +216,7 @@ fn run_loop_records_successful_llm_run_steps() {
             .iter()
             .map(|step| step.kind.clone())
             .collect::<Vec<_>>(),
-        vec![StepKind::UserMessage, StepKind::AssistantMessage]
+        vec![StepKind::UserMessage, StepKind::AssistantResponse]
     );
     assert_eq!(
         output.steps[0].payload,
@@ -248,6 +252,14 @@ fn run_loop_records_successful_llm_run_steps() {
     assert!(requests[0].contains("not executed through a shell"));
     assert!(requests[0].contains("Do not call print"));
     assert!(requests[0].contains("Use return to send the result back to Jux"));
+    assert_eq!(
+        output.steps[1].payload.to_assistant_text(),
+        Some("Mocked answer")
+    );
+    assert_eq!(
+        output.steps[1].payload.to_assistant_usage(),
+        Some(&LlmUsage::default())
+    );
 }
 
 #[test]
@@ -301,11 +313,15 @@ fn run_loop_records_reasoning_without_sending_it_back_to_llm() {
             .iter()
             .map(|step| step.kind.clone())
             .collect::<Vec<_>>(),
-        vec![
-            StepKind::UserMessage,
-            StepKind::AssistantReasoning,
-            StepKind::AssistantMessage,
-        ]
+        vec![StepKind::UserMessage, StepKind::AssistantResponse]
+    );
+    assert_eq!(
+        first_output.steps[1].payload.to_assistant_reasoning(),
+        Some("hidden reasoning")
+    );
+    assert_eq!(
+        first_output.steps[1].payload.to_assistant_text(),
+        Some("Visible answer")
     );
     assert!(requests[1].contains("Visible answer"));
     assert!(!requests[1].contains("hidden reasoning"));
@@ -343,9 +359,9 @@ fn run_loop_executes_echo_tool_call_and_continues_until_final_answer() {
             .collect::<Vec<_>>(),
         vec![
             StepKind::UserMessage,
-            StepKind::AssistantToolCall,
+            StepKind::AssistantResponse,
             StepKind::ToolResult,
-            StepKind::AssistantMessage,
+            StepKind::AssistantResponse,
         ]
     );
     assert_eq!(output.steps[1].payload.to_tool_call_name(), Some("echo"));
@@ -450,9 +466,9 @@ fn run_loop_executes_lua_tool_call_and_continues_until_final_answer() {
             .collect::<Vec<_>>(),
         vec![
             StepKind::UserMessage,
-            StepKind::AssistantToolCall,
+            StepKind::AssistantResponse,
             StepKind::ToolResult,
-            StepKind::AssistantMessage,
+            StepKind::AssistantResponse,
         ]
     );
     assert_eq!(requests.len(), 2);
@@ -636,14 +652,53 @@ fn run_loop_marks_run_failed_when_llm_fails() {
 }
 
 trait StepPayloadTestExt {
+    fn to_assistant_text(&self) -> Option<&str>;
+    fn to_assistant_reasoning(&self) -> Option<&str>;
+    fn to_assistant_usage(&self) -> Option<&LlmUsage>;
     fn to_tool_call_name(&self) -> Option<&str>;
     fn to_tool_result_content(&self) -> Option<&str>;
 }
 
 impl StepPayloadTestExt for StepPayload {
+    fn to_assistant_text(&self) -> Option<&str> {
+        match self {
+            StepPayload::AssistantResponse { items, .. } => {
+                items.iter().find_map(|item| match item {
+                    AssistantResponseItem::Text { content } => Some(content.as_str()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn to_assistant_reasoning(&self) -> Option<&str> {
+        match self {
+            StepPayload::AssistantResponse { items, .. } => {
+                items.iter().find_map(|item| match item {
+                    AssistantResponseItem::Reasoning { content } => Some(content.as_str()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn to_assistant_usage(&self) -> Option<&LlmUsage> {
+        match self {
+            StepPayload::AssistantResponse { usage, .. } => Some(usage),
+            _ => None,
+        }
+    }
+
     fn to_tool_call_name(&self) -> Option<&str> {
         match self {
-            StepPayload::AssistantToolCall { name, .. } => Some(name),
+            StepPayload::AssistantResponse { items, .. } => {
+                items.iter().find_map(|item| match item {
+                    AssistantResponseItem::ToolCall { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+            }
             _ => None,
         }
     }

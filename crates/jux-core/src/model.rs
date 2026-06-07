@@ -161,72 +161,60 @@ impl Step {
     pub fn visible_to_llm(&self) -> bool {
         matches!(
             self.kind,
-            StepKind::SystemMessage
-                | StepKind::UserMessage
-                | StepKind::AssistantMessage
-                | StepKind::AssistantToolCall
-                | StepKind::ToolResult
+            StepKind::UserMessage | StepKind::AssistantResponse | StepKind::ToolResult
         )
-    }
-
-    #[must_use]
-    pub fn to_llm_line(&self) -> Option<String> {
-        match &self.payload {
-            StepPayload::SystemMessage { content } => Some(format!("System: {content}")),
-            StepPayload::UserMessage { content } => Some(format!("User: {content}")),
-            StepPayload::AssistantMessage { content } => Some(format!("Assistant: {content}")),
-            StepPayload::AssistantToolCall {
-                name, arguments, ..
-            } => Some(format!("AssistantToolCall: {name} {arguments}")),
-            StepPayload::ToolResult { content, .. } => Some(format!("ToolResult: {content}")),
-            _ => None,
-        }
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum StepKind {
-    SystemMessage,
     UserMessage,
-    AssistantMessage,
-    AssistantReasoning,
-    AssistantToolCall,
+    AssistantResponse,
     ToolResult,
-    LlmToolDefinition,
     Error,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum StepPayload {
-    SystemMessage {
-        content: String,
-    },
     UserMessage {
         content: String,
     },
-    AssistantMessage {
-        content: String,
-    },
-    AssistantReasoning {
-        content: String,
-    },
-    AssistantToolCall {
-        id: String,
-        call_id: Option<String>,
-        name: String,
-        arguments: serde_json::Value,
+    AssistantResponse {
+        message_id: Option<String>,
+        usage: LlmUsage,
+        items: Vec<AssistantResponseItem>,
     },
     ToolResult {
         id: String,
         call_id: Option<String>,
         content: String,
     },
-    LlmToolDefinition {
-        name: String,
-        description: String,
-        parameters: serde_json::Value,
-    },
     Error {
         message: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LlmUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum AssistantResponseItem {
+    Text {
+        content: String,
+    },
+    Reasoning {
+        content: String,
+    },
+    ToolCall {
+        id: String,
+        call_id: Option<String>,
+        name: String,
+        arguments: serde_json::Value,
     },
 }

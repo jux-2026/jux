@@ -109,7 +109,7 @@ fn run_command_can_output_json() {
             .as_str()
             .is_some_and(|content| content == "Return JSON output")
     );
-    assert_eq!(output["steps"][1]["kind"], "AssistantMessage");
+    assert_eq!(output["steps"][1]["kind"], "AssistantResponse");
     assert!(output["steps"][0]["created_at"].as_u64().is_some());
     assert!(output["steps"][0]["updated_at"].as_u64().is_some());
     assert!(output["steps"][0].get("status").is_none());
@@ -257,7 +257,7 @@ fn session_show_outputs_active_session_state() {
     assert_eq!(output["runs"][0]["status"], "Completed");
     assert!(output.get("steps").is_none());
     assert_eq!(output["runs"][0]["steps"][0]["kind"], "UserMessage");
-    assert_eq!(output["runs"][0]["steps"][1]["kind"], "AssistantMessage");
+    assert_eq!(output["runs"][0]["steps"][1]["kind"], "AssistantResponse");
 }
 
 struct MockDeepseek {
