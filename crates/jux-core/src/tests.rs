@@ -129,6 +129,72 @@ fn sqlite_store_persists_ordered_session_context_items_once() {
 }
 
 #[test]
+fn sqlite_store_appends_missing_default_session_context_items() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let workspace = store.init_workspace().expect("workspace initializes");
+    let session_id = workspace.active_session_id;
+
+    store
+        .ensure_session_context_items(
+            &session_id,
+            vec![
+                (
+                    SessionContextKind::SystemPrompt,
+                    SessionContextPayload::SystemPrompt {
+                        content: "system".to_owned(),
+                    },
+                ),
+                (
+                    SessionContextKind::ToolDefinition,
+                    SessionContextPayload::ToolDefinition {
+                        name: "echo".to_owned(),
+                        description: "echo".to_owned(),
+                        parameters: serde_json::json!({ "type": "object" }),
+                    },
+                ),
+            ],
+        )
+        .expect("initial session context saves");
+    let updated = store
+        .ensure_session_context_items(
+            &session_id,
+            vec![
+                (
+                    SessionContextKind::SystemPrompt,
+                    SessionContextPayload::SystemPrompt {
+                        content: "new system ignored".to_owned(),
+                    },
+                ),
+                (
+                    SessionContextKind::ToolDefinition,
+                    SessionContextPayload::ToolDefinition {
+                        name: "echo".to_owned(),
+                        description: "new echo ignored".to_owned(),
+                        parameters: serde_json::json!({ "type": "object" }),
+                    },
+                ),
+                (
+                    SessionContextKind::ToolDefinition,
+                    SessionContextPayload::ToolDefinition {
+                        name: "exec".to_owned(),
+                        description: "exec".to_owned(),
+                        parameters: serde_json::json!({ "type": "object" }),
+                    },
+                ),
+            ],
+        )
+        .expect("missing session context appends");
+
+    assert_eq!(updated.len(), 3);
+    assert_eq!(updated[0].sequence, 1);
+    assert_eq!(updated[0].payload.to_system_prompt(), Some("system"));
+    assert_eq!(updated[1].sequence, 2);
+    assert_eq!(updated[1].payload.to_tool_name(), Some("echo"));
+    assert_eq!(updated[2].sequence, 3);
+    assert_eq!(updated[2].payload.to_tool_name(), Some("exec"));
+}
+
+#[test]
 fn run_loop_records_successful_llm_run_steps() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
     let model = TestModel::fixed_text("Mocked answer");
@@ -157,7 +223,7 @@ fn run_loop_records_successful_llm_run_steps() {
     let context_items = store
         .load_session_context_items(&output.session.id)
         .expect("session context loads");
-    assert_eq!(context_items.len(), 3);
+    assert_eq!(context_items.len(), 4);
     assert_eq!(context_items[0].sequence, 1);
     assert_eq!(context_items[0].kind, SessionContextKind::SystemPrompt);
     assert_eq!(
@@ -169,7 +235,9 @@ fn run_loop_records_successful_llm_run_steps() {
     assert_eq!(context_items[1].sequence, 2);
     assert_eq!(context_items[1].payload.to_tool_name(), Some("echo"));
     assert_eq!(context_items[2].sequence, 3);
-    assert_eq!(context_items[2].payload.to_tool_name(), Some("lua"));
+    assert_eq!(context_items[2].payload.to_tool_name(), Some("exec"));
+    assert_eq!(context_items[3].sequence, 4);
+    assert_eq!(context_items[3].payload.to_tool_name(), Some("lua"));
     assert_eq!(requests.len(), 1);
     assert!(requests[0].contains("You are Jux"));
     assert!(requests[0].contains("Explain this project"));
@@ -205,7 +273,7 @@ fn run_loop_uses_session_history_when_calling_llm() {
     let context_items = store
         .load_session_context_items(&store.load_active_session().expect("session loads").id)
         .expect("session context loads");
-    assert_eq!(context_items.len(), 3);
+    assert_eq!(context_items.len(), 4);
 }
 
 #[test]
@@ -289,6 +357,67 @@ fn run_loop_executes_echo_tool_call_and_continues_until_final_answer() {
     assert!(requests[0].contains("You are Jux"));
     assert!(requests[0].contains("Use the echo tool"));
     assert!(requests[1].contains("hello from tool"));
+}
+
+#[test]
+fn run_loop_executes_exec_tool_call_and_returns_structured_output() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "exec",
+            serde_json::json!({ "program": "printf", "args": ["hello"] }),
+        ))]),
+        Ok(vec![AssistantContent::text("Exec returned hello")]),
+    ]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
+
+    let output = futures::executor::block_on(run_loop.run("Use the exec tool".to_owned()))
+        .expect("run loop succeeds");
+    let requests = model.recorded_requests();
+    let tool_result = output.steps[2]
+        .payload
+        .to_tool_result_content()
+        .expect("tool result exists");
+    let exec_output: serde_json::Value =
+        serde_json::from_str(tool_result).expect("exec output is JSON");
+
+    assert_eq!(output.run.status, RunStatus::Completed);
+    assert_eq!(exec_output["success"], true);
+    assert_eq!(exec_output["exit_code"], 0);
+    assert_eq!(exec_output["stdout"], "hello");
+    assert_eq!(exec_output["stderr"], "");
+    assert!(requests[0].contains("\"name\":\"exec\""));
+    assert!(requests[0].contains("success"));
+    assert!(requests[0].contains("exit_code"));
+    assert!(requests[1].contains("hello"));
+}
+
+#[test]
+fn run_loop_returns_exec_shell_syntax_errors_to_llm() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "exec",
+            serde_json::json!({ "program": "ls", "args": [">", "output.txt"] }),
+        ))]),
+        Ok(vec![AssistantContent::text("Exec shell syntax denied")]),
+    ]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
+
+    let output = futures::executor::block_on(run_loop.run("Use exec shell syntax".to_owned()))
+        .expect("run loop succeeds");
+    let requests = model.recorded_requests();
+    let tool_result = output.steps[2]
+        .payload
+        .to_tool_result_content()
+        .expect("tool result exists");
+
+    assert_eq!(output.run.status, RunStatus::Completed);
+    assert!(tool_result.contains("Tool execution failed"));
+    assert!(tool_result.contains("shell syntax is not supported: >"));
+    assert!(requests[1].contains("shell syntax is not supported"));
 }
 
 #[test]
@@ -528,10 +657,18 @@ impl StepPayloadTestExt for StepPayload {
 }
 
 trait SessionContextPayloadTestExt {
+    fn to_system_prompt(&self) -> Option<&str>;
     fn to_tool_name(&self) -> Option<&str>;
 }
 
 impl SessionContextPayloadTestExt for SessionContextPayload {
+    fn to_system_prompt(&self) -> Option<&str> {
+        match self {
+            SessionContextPayload::SystemPrompt { content } => Some(content),
+            SessionContextPayload::ToolDefinition { .. } => None,
+        }
+    }
+
     fn to_tool_name(&self) -> Option<&str> {
         match self {
             SessionContextPayload::ToolDefinition { name, .. } => Some(name),

@@ -9,6 +9,7 @@ use rig::message::{
     AssistantContent, Message, ToolCall, ToolFunction, ToolResult, ToolResultContent,
 };
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::json;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -16,7 +17,13 @@ use std::process::Command as ProcessCommand;
 
 const MAX_LOOP_ITERATIONS: usize = 8;
 const ECHO_TOOL_NAME: &str = "echo";
+const EXEC_TOOL_NAME: &str = "exec";
 const LUA_TOOL_NAME: &str = "lua";
+const EXEC_TOOL_DESCRIPTION: &str = "Execute one command directly without a shell. \
+Provide the executable name in program and each argument as a separate string in args. \
+Do not use shell syntax such as &&, ||, ;, |, >, <, backticks, $(), wildcard expansion, \
+or newlines. The tool returns structured execution data as JSON: success, exit_code, \
+stdout, and stderr.";
 const LUA_TOOL_DESCRIPTION: &str = "Execute Lua code in a restricted Jux Lua runtime. \
 All Lua standard libraries are disabled by default. Only these globals are available: \
 os.execute(command), which executes one non-shell command; and io.popen(command, 'r'), \
@@ -363,6 +370,21 @@ fn jux_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: EXEC_TOOL_NAME.to_owned(),
+            description: EXEC_TOOL_DESCRIPTION.to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "program": { "type": "string" },
+                    "args": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["program", "args"]
+            }),
+        },
+        ToolDefinition {
             name: LUA_TOOL_NAME.to_owned(),
             description: LUA_TOOL_DESCRIPTION.to_owned(),
             parameters: json!({
@@ -383,6 +405,11 @@ fn execute_tool(tool_name: &str, args: &serde_json::Value) -> Result<String, Str
                 .map_err(|error| format!("invalid echo tool arguments: {error}"))?;
             Ok(args.input)
         }
+        EXEC_TOOL_NAME => {
+            let args = serde_json::from_value::<ExecToolArgs>(args.clone())
+                .map_err(|error| format!("invalid exec tool arguments: {error}"))?;
+            execute_exec(args)
+        }
         LUA_TOOL_NAME => {
             let args = serde_json::from_value::<LuaToolArgs>(args.clone())
                 .map_err(|error| format!("invalid lua tool arguments: {error}"))?;
@@ -398,8 +425,20 @@ struct EchoToolArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct ExecToolArgs {
+    program: String,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct LuaToolArgs {
     code: String,
+}
+
+fn execute_exec(args: ExecToolArgs) -> Result<String, String> {
+    let output = run_exec_command(&args.program, &args.args)?;
+    serde_json::to_string(&ExecToolOutput::from(output))
+        .map_err(|error| format!("exec output serialization failed: {error}"))
 }
 
 fn execute_lua(script: &str) -> Result<String, String> {
@@ -483,6 +522,7 @@ struct CommandOutput {
     success: bool,
     status_code: Option<i32>,
     stdout: String,
+    stderr: String,
 }
 
 fn run_single_command(command: &str) -> Result<CommandOutput, String> {
@@ -491,6 +531,14 @@ fn run_single_command(command: &str) -> Result<CommandOutput, String> {
     let (program, args) = parts
         .split_first()
         .ok_or_else(|| "command cannot be empty".to_owned())?;
+    run_exec_command(program, args)
+}
+
+fn run_exec_command(program: &str, args: &[String]) -> Result<CommandOutput, String> {
+    reject_shell_token(program)?;
+    for arg in args {
+        reject_shell_token(arg)?;
+    }
 
     let output = ProcessCommand::new(program)
         .args(args)
@@ -501,20 +549,41 @@ fn run_single_command(command: &str) -> Result<CommandOutput, String> {
         success: output.status.success(),
         status_code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     })
 }
 
 fn reject_shell_command(command: &str) -> Result<(), String> {
+    reject_shell_token(command)
+}
+
+fn reject_shell_token(value: &str) -> Result<(), String> {
     const REJECTED_TOKENS: [&str; 12] = [
         "&&", "||", ";", "|", ">", "<", "`", "$(", "\n", "\r", "*", "?",
     ];
-    if let Some(token) = REJECTED_TOKENS
-        .iter()
-        .find(|token| command.contains(**token))
-    {
+    if let Some(token) = REJECTED_TOKENS.iter().find(|token| value.contains(**token)) {
         return Err(format!("shell syntax is not supported: {token}"));
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct ExecToolOutput {
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl From<CommandOutput> for ExecToolOutput {
+    fn from(output: CommandOutput) -> Self {
+        Self {
+            success: output.success,
+            exit_code: output.status_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

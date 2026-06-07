@@ -245,6 +245,12 @@ fn session_show_outputs_active_session_state() {
     assert_eq!(output["session_context"][2]["kind"], "ToolDefinition");
     assert_eq!(
         output["session_context"][2]["payload"]["ToolDefinition"]["name"],
+        "exec"
+    );
+    assert_eq!(output["session_context"][3]["sequence"], 4);
+    assert_eq!(output["session_context"][3]["kind"], "ToolDefinition");
+    assert_eq!(
+        output["session_context"][3]["payload"]["ToolDefinition"]["name"],
         "lua"
     );
     assert_eq!(output["runs"][0]["request"], "Create session state");

@@ -150,17 +150,23 @@ impl SqliteWorkspaceStore {
         defaults: Vec<(SessionContextKind, SessionContextPayload)>,
     ) -> Result<Vec<SessionContextItem>, StoreError> {
         let mut connection = self.connect()?;
-        let existing = load_session_context_items_from(&connection, session_id)?;
-        if !existing.is_empty() {
-            return Ok(existing);
+        let mut items = load_session_context_items_from(&connection, session_id)?;
+        let missing_defaults = defaults
+            .into_iter()
+            .filter(|(_, payload)| !session_context_contains(&items, payload))
+            .collect::<Vec<_>>();
+
+        if missing_defaults.is_empty() {
+            return Ok(items);
         }
 
+        let mut next_sequence = items.last().map_or(1, |item| item.sequence + 1);
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut items = Vec::with_capacity(defaults.len());
-        for (index, (kind, payload)) in defaults.into_iter().enumerate() {
-            let item = SessionContextItem::new(session_id.clone(), index as u64 + 1, kind, payload);
+        for (kind, payload) in missing_defaults {
+            let item = SessionContextItem::new(session_id.clone(), next_sequence, kind, payload);
             insert_session_context_item(&transaction, &item)?;
             items.push(item);
+            next_sequence += 1;
         }
         transaction.commit()?;
 
@@ -458,6 +464,29 @@ fn insert_step(transaction: &Transaction<'_>, step: &Step) -> Result<(), StoreEr
         ],
     )?;
     Ok(())
+}
+
+fn session_context_contains(items: &[SessionContextItem], payload: &SessionContextPayload) -> bool {
+    items
+        .iter()
+        .any(|item| session_context_payload_matches(&item.payload, payload))
+}
+
+fn session_context_payload_matches(
+    existing: &SessionContextPayload,
+    expected: &SessionContextPayload,
+) -> bool {
+    match (existing, expected) {
+        (
+            SessionContextPayload::SystemPrompt { .. },
+            SessionContextPayload::SystemPrompt { .. },
+        ) => true,
+        (
+            SessionContextPayload::ToolDefinition { name: left, .. },
+            SessionContextPayload::ToolDefinition { name: right, .. },
+        ) => left == right,
+        _ => false,
+    }
 }
 
 fn insert_session_context_item(
