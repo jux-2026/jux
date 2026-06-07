@@ -1,5 +1,8 @@
 use crate::ids::{RunId, SessionId, StepId, WorkspaceId};
-use crate::model::{Run, RunStatus, Session, Step, StepKind, StepPayload, Workspace};
+use crate::model::{
+    Run, RunStatus, Session, SessionContextItem, SessionContextKind, SessionContextPayload, Step,
+    StepKind, StepPayload, Workspace,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -141,6 +144,43 @@ impl SqliteWorkspaceStore {
         Ok(step)
     }
 
+    pub fn ensure_session_context_items(
+        &self,
+        session_id: &SessionId,
+        defaults: Vec<(SessionContextKind, SessionContextPayload)>,
+    ) -> Result<Vec<SessionContextItem>, StoreError> {
+        let mut connection = self.connect()?;
+        let existing = load_session_context_items_from(&connection, session_id)?;
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut items = Vec::with_capacity(defaults.len());
+        for (index, (kind, payload)) in defaults.into_iter().enumerate() {
+            let item = SessionContextItem::new(session_id.clone(), index as u64 + 1, kind, payload);
+            insert_session_context_item(&transaction, &item)?;
+            items.push(item);
+        }
+        transaction.commit()?;
+
+        tracing::debug!(
+            session_id = %session_id,
+            item_count = items.len(),
+            "initialized session context"
+        );
+
+        Ok(items)
+    }
+
+    pub fn load_session_context_items(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<SessionContextItem>, StoreError> {
+        let connection = self.connect()?;
+        load_session_context_items_from(&connection, session_id)
+    }
+
     pub fn load_run(&self, run_id: &RunId) -> Result<Run, StoreError> {
         let connection = self.connect()?;
         connection
@@ -244,6 +284,7 @@ pub enum StoreError {
     MissingRun(String),
     InvalidStatus(String),
     InvalidStepKind(String),
+    InvalidSessionContextKind(String),
     InvalidId(String),
 }
 
@@ -258,6 +299,9 @@ impl Display for StoreError {
             Self::MissingRun(id) => write!(formatter, "run does not exist: {id}"),
             Self::InvalidStatus(status) => write!(formatter, "invalid stored status: {status}"),
             Self::InvalidStepKind(kind) => write!(formatter, "invalid stored step kind: {kind}"),
+            Self::InvalidSessionContextKind(kind) => {
+                write!(formatter, "invalid stored session context kind: {kind}")
+            }
             Self::InvalidId(id) => write!(formatter, "invalid stored id: {id}"),
         }
     }
@@ -274,6 +318,7 @@ impl Error for StoreError {
             | Self::MissingRun(_)
             | Self::InvalidStatus(_)
             | Self::InvalidStepKind(_)
+            | Self::InvalidSessionContextKind(_)
             | Self::InvalidId(_) => None,
         }
     }
@@ -329,6 +374,16 @@ fn init_schema(connection: &Connection) -> Result<(), StoreError> {
             payload_json text not null,
             created_at text not null,
             updated_at text not null
+        );
+
+        create table if not exists session_context_items (
+            session_id text not null,
+            sequence integer not null,
+            kind text not null,
+            payload_json text not null,
+            created_at text not null,
+            updated_at text not null,
+            primary key (session_id, sequence)
         );
 
         ",
@@ -405,6 +460,41 @@ fn insert_step(transaction: &Transaction<'_>, step: &Step) -> Result<(), StoreEr
     Ok(())
 }
 
+fn insert_session_context_item(
+    transaction: &Transaction<'_>,
+    item: &SessionContextItem,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "insert into session_context_items
+         (session_id, sequence, kind, payload_json, created_at, updated_at)
+         values (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            item.session_id.as_str(),
+            item.sequence as i64,
+            encode_session_context_kind(&item.kind),
+            serde_json::to_string(&item.payload)?,
+            item.created_at.to_string(),
+            item.updated_at.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_session_context_items_from(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> Result<Vec<SessionContextItem>, StoreError> {
+    let mut statement = connection.prepare(
+        "select session_id, sequence, kind, payload_json, created_at, updated_at
+         from session_context_items
+         where session_id = ?1
+         order by sequence",
+    )?;
+    let rows = statement.query_map(params![session_id.as_str()], row_to_session_context_item)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
+}
+
 fn row_to_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
     Ok(Workspace {
         id: WorkspaceId::from(row.get::<_, String>(0)?),
@@ -449,6 +539,21 @@ fn row_to_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<Step> {
     })
 }
 
+fn row_to_session_context_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionContextItem> {
+    let kind = decode_session_context_kind(row.get::<_, String>(2)?).map_err(to_sql_error)?;
+    let payload = serde_json::from_str(&row.get::<_, String>(3)?)
+        .map_err(|error| to_sql_error(error.into()))?;
+
+    Ok(SessionContextItem {
+        session_id: SessionId::from(row.get::<_, String>(0)?),
+        sequence: row.get::<_, i64>(1)? as u64,
+        kind,
+        payload,
+        created_at: parse_timestamp(row.get::<_, String>(4)?),
+        updated_at: parse_timestamp(row.get::<_, String>(5)?),
+    })
+}
+
 fn to_sql_error(error: StoreError) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(error))
 }
@@ -481,6 +586,7 @@ fn encode_step_kind(kind: &StepKind) -> &'static str {
         StepKind::SystemMessage => "system_message",
         StepKind::UserMessage => "user_message",
         StepKind::AssistantMessage => "assistant_message",
+        StepKind::AssistantReasoning => "assistant_reasoning",
         StepKind::AssistantToolCall => "assistant_tool_call",
         StepKind::ToolResult => "tool_result",
         StepKind::LlmToolDefinition => "llm_tool_definition",
@@ -493,10 +599,26 @@ fn decode_step_kind(kind: String) -> Result<StepKind, StoreError> {
         "system_message" => Ok(StepKind::SystemMessage),
         "user_message" => Ok(StepKind::UserMessage),
         "assistant_message" => Ok(StepKind::AssistantMessage),
+        "assistant_reasoning" => Ok(StepKind::AssistantReasoning),
         "assistant_tool_call" => Ok(StepKind::AssistantToolCall),
         "tool_result" => Ok(StepKind::ToolResult),
         "llm_tool_definition" => Ok(StepKind::LlmToolDefinition),
         "error" => Ok(StepKind::Error),
         _ => Err(StoreError::InvalidStepKind(kind)),
+    }
+}
+
+fn encode_session_context_kind(kind: &SessionContextKind) -> &'static str {
+    match kind {
+        SessionContextKind::SystemPrompt => "system_prompt",
+        SessionContextKind::ToolDefinition => "tool_definition",
+    }
+}
+
+fn decode_session_context_kind(kind: String) -> Result<SessionContextKind, StoreError> {
+    match kind.as_str() {
+        "system_prompt" => Ok(SessionContextKind::SystemPrompt),
+        "tool_definition" => Ok(SessionContextKind::ToolDefinition),
+        _ => Err(StoreError::InvalidSessionContextKind(kind)),
     }
 }

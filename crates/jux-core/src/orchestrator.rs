@@ -1,6 +1,9 @@
-use crate::model::{Run, RunStatus, Session, Step, StepKind, StepPayload, Workspace};
+use crate::model::{
+    Run, RunStatus, Session, SessionContextKind, SessionContextPayload, Step, StepKind,
+    StepPayload, Workspace,
+};
 use crate::store::{SqliteWorkspaceStore, StoreError};
-use mlua::{Lua, Value};
+use mlua::{Lua, LuaOptions, StdLib, UserData, UserDataMethods, Value};
 use rig::completion::{CompletionError, CompletionModel, ToolDefinition};
 use rig::message::{
     AssistantContent, Message, ToolCall, ToolFunction, ToolResult, ToolResultContent,
@@ -9,10 +12,19 @@ use serde::Deserialize;
 use serde_json::json;
 use std::error::Error;
 use std::fmt::{self, Display};
+use std::process::Command as ProcessCommand;
 
 const MAX_LOOP_ITERATIONS: usize = 8;
 const ECHO_TOOL_NAME: &str = "echo";
 const LUA_TOOL_NAME: &str = "lua";
+const LUA_TOOL_DESCRIPTION: &str = "Execute Lua code in a restricted Jux Lua runtime. \
+All Lua standard libraries are disabled by default. Only these globals are available: \
+os.execute(command), which executes one non-shell command; and io.popen(command, 'r'), \
+which executes one non-shell command and returns a readable handle. Commands are parsed \
+into one program plus arguments and are not executed through a shell. Shell syntax such \
+as &&, ||, ;, |, >, <, backticks, $(), wildcard expansion, and newlines is rejected. \
+io.popen handles support read('*a'), read('*l'), lines(), and close(). Return the first \
+Lua value as the tool result. Do not call print. Use return to send the result back to Jux.";
 pub const SYSTEM_PROMPT: &str = "You are Jux, a concise coding agent.";
 
 pub struct RunLoop<M> {
@@ -32,14 +44,8 @@ where
     pub async fn run(&self, request: String) -> Result<RunLoopOutput, RunLoopError> {
         let run = self.store.create_run(request.clone())?;
         tracing::info!(run_id = %run.id, "created run");
-        self.store.append_step(
-            &run.id,
-            StepKind::SystemMessage,
-            StepPayload::SystemMessage {
-                content: SYSTEM_PROMPT.to_owned(),
-            },
-        )?;
-        self.record_tool_definitions(&run)?;
+        self.store
+            .ensure_session_context_items(&run.id.session_id(), default_session_context_items())?;
         self.store.append_step(
             &run.id,
             StepKind::UserMessage,
@@ -99,7 +105,15 @@ where
 
                         let output = match execute_tool(&tool_name, &args) {
                             Ok(output) => output,
-                            Err(error) => return self.fail_runtime(run, error),
+                            Err(error) => {
+                                tracing::warn!(
+                                    run_id = %run.id,
+                                    tool_name = %tool_name,
+                                    error = %error,
+                                    "tool call failed"
+                                );
+                                format!("Tool execution failed: {error}")
+                            }
                         };
                         self.store.append_step(
                             &run.id,
@@ -116,8 +130,8 @@ where
                         if !text.is_empty() {
                             self.store.append_step(
                                 &run.id,
-                                StepKind::AssistantMessage,
-                                StepPayload::AssistantMessage { content: text },
+                                StepKind::AssistantReasoning,
+                                StepPayload::AssistantReasoning { content: text },
                             )?;
                         }
                     }
@@ -196,28 +210,30 @@ where
         Ok(())
     }
 
-    fn record_tool_definitions(&self, run: &Run) -> Result<(), RunLoopError> {
-        for tool in jux_tool_definitions() {
-            self.store.append_step(
-                &run.id,
-                StepKind::LlmToolDefinition,
-                StepPayload::LlmToolDefinition {
-                    name: tool.name,
-                    description: tool.description,
-                    parameters: tool.parameters,
-                },
-            )?;
-        }
-        Ok(())
-    }
-
     fn build_completion_request(&self, run: &Run) -> Result<LlmCompletionRequest, RunLoopError> {
-        let steps = self.store.load_session_steps(&run.id.session_id())?;
-        let messages = steps
+        let context = self
+            .store
+            .load_session_context_items(&run.id.session_id())?;
+        let mut messages = context
             .iter()
-            .filter(|step| step.visible_to_llm())
-            .filter_map(step_to_chat_message)
+            .filter_map(session_context_item_to_chat_message)
             .collect::<Vec<_>>();
+        let tools = context
+            .iter()
+            .filter_map(session_context_item_to_tool_definition)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|message| RunLoopError::Runtime {
+                run: Box::new(run.clone()),
+                message,
+            })?;
+
+        let steps = self.store.load_session_steps(&run.id.session_id())?;
+        messages.extend(
+            steps
+                .iter()
+                .filter(|step| step.visible_to_llm())
+                .filter_map(step_to_chat_message),
+        );
 
         let Some((prompt, history)) = messages.split_last() else {
             return Err(RunLoopError::Runtime {
@@ -226,25 +242,12 @@ where
             });
         };
         let history = history.to_vec();
-        let tools = self.load_run_tool_definitions(run)?;
 
         Ok(LlmCompletionRequest {
             prompt: prompt.clone(),
             history,
             tools,
         })
-    }
-
-    fn load_run_tool_definitions(&self, run: &Run) -> Result<Vec<ToolDefinition>, RunLoopError> {
-        self.store
-            .load_run_steps(&run.id)?
-            .iter()
-            .filter_map(step_to_tool_definition)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|message| RunLoopError::Runtime {
-                run: Box::new(run.clone()),
-                message,
-            })
     }
 }
 
@@ -289,13 +292,28 @@ fn step_to_chat_message(step: &Step) -> Option<Message> {
                 content: rig::OneOrMany::one(ToolResultContent::text(content.clone())),
             })),
         }),
-        StepPayload::LlmToolDefinition { .. } | StepPayload::Error { .. } => None,
+        StepPayload::AssistantReasoning { .. }
+        | StepPayload::LlmToolDefinition { .. }
+        | StepPayload::Error { .. } => None,
     }
 }
 
-fn step_to_tool_definition(step: &Step) -> Option<Result<ToolDefinition, String>> {
-    match &step.payload {
-        StepPayload::LlmToolDefinition {
+fn session_context_item_to_chat_message(
+    item: &crate::model::SessionContextItem,
+) -> Option<Message> {
+    match &item.payload {
+        SessionContextPayload::SystemPrompt { content } => Some(Message::System {
+            content: content.clone(),
+        }),
+        SessionContextPayload::ToolDefinition { .. } => None,
+    }
+}
+
+fn session_context_item_to_tool_definition(
+    item: &crate::model::SessionContextItem,
+) -> Option<Result<ToolDefinition, String>> {
+    match &item.payload {
+        SessionContextPayload::ToolDefinition {
             name,
             description,
             parameters,
@@ -304,8 +322,31 @@ fn step_to_tool_definition(step: &Step) -> Option<Result<ToolDefinition, String>
             description: description.clone(),
             parameters: parameters.clone(),
         })),
-        _ => None,
+        SessionContextPayload::SystemPrompt { .. } => None,
     }
+}
+
+fn default_session_context_items() -> Vec<(SessionContextKind, SessionContextPayload)> {
+    let mut items = Vec::new();
+    items.push((
+        SessionContextKind::SystemPrompt,
+        SessionContextPayload::SystemPrompt {
+            content: SYSTEM_PROMPT.to_owned(),
+        },
+    ));
+
+    for tool in jux_tool_definitions() {
+        items.push((
+            SessionContextKind::ToolDefinition,
+            SessionContextPayload::ToolDefinition {
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.parameters,
+            },
+        ));
+    }
+
+    items
 }
 
 fn jux_tool_definitions() -> Vec<ToolDefinition> {
@@ -323,7 +364,7 @@ fn jux_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: LUA_TOOL_NAME.to_owned(),
-            description: "Execute Lua code and return the first returned value.".to_owned(),
+            description: LUA_TOOL_DESCRIPTION.to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -362,7 +403,9 @@ struct LuaToolArgs {
 }
 
 fn execute_lua(script: &str) -> Result<String, String> {
-    let lua = Lua::new();
+    let lua = Lua::new_with(StdLib::NONE, LuaOptions::default())
+        .map_err(|error| format!("lua initialization failed: {error}"))?;
+    install_lua_command_api(&lua).map_err(|error| format!("lua api setup failed: {error}"))?;
     let value = lua
         .load(script)
         .eval::<Value>()
@@ -378,6 +421,191 @@ fn lua_value_to_string(value: Value) -> mlua::Result<String> {
         Value::Number(value) => Ok(value.to_string()),
         Value::String(value) => Ok(value.to_string_lossy()),
         other => Ok(format!("{other:?}")),
+    }
+}
+
+fn install_lua_command_api(lua: &Lua) -> mlua::Result<()> {
+    let globals = lua.globals();
+    globals.set(
+        "print",
+        lua.create_function(|_, _: mlua::Variadic<Value>| {
+            Err::<(), _>(mlua::Error::external(
+                "print is disabled in the Jux Lua runtime; use return to send a tool result",
+            ))
+        })?,
+    )?;
+
+    let os = lua.create_table()?;
+    os.set(
+        "execute",
+        lua.create_function(|lua, command: String| {
+            let output = run_single_command(&command).map_err(mlua::Error::external)?;
+            let status = output.status_code.unwrap_or(1);
+            let status_text = lua.create_string("exit")?;
+            if output.success {
+                Ok((Value::Boolean(true), Value::String(status_text), status))
+            } else {
+                Ok((Value::Nil, Value::String(status_text), status))
+            }
+        })?,
+    )?;
+    globals.set("os", os)?;
+
+    let io = lua.create_table()?;
+    io.set(
+        "popen",
+        lua.create_function(|lua, (command, mode): (String, Option<String>)| {
+            let mode = mode.unwrap_or_else(|| "r".to_owned());
+            if mode != "r" {
+                return Err(mlua::Error::external(
+                    "io.popen only supports read mode: io.popen(command, 'r')",
+                ));
+            }
+
+            let output = run_single_command(&command).map_err(mlua::Error::external)?;
+            if !output.success {
+                return Err(mlua::Error::external(format!(
+                    "command exited with status {}",
+                    output.status_code.unwrap_or(1)
+                )));
+            }
+
+            lua.create_userdata(JuxProcessHandle::new(output.stdout))
+        })?,
+    )?;
+    globals.set("io", io)?;
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CommandOutput {
+    success: bool,
+    status_code: Option<i32>,
+    stdout: String,
+}
+
+fn run_single_command(command: &str) -> Result<CommandOutput, String> {
+    reject_shell_command(command)?;
+    let parts = shlex::split(command).ok_or_else(|| "invalid command syntax".to_owned())?;
+    let (program, args) = parts
+        .split_first()
+        .ok_or_else(|| "command cannot be empty".to_owned())?;
+
+    let output = ProcessCommand::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("command execution failed: {error}"))?;
+
+    Ok(CommandOutput {
+        success: output.status.success(),
+        status_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+    })
+}
+
+fn reject_shell_command(command: &str) -> Result<(), String> {
+    const REJECTED_TOKENS: [&str; 12] = [
+        "&&", "||", ";", "|", ">", "<", "`", "$(", "\n", "\r", "*", "?",
+    ];
+    if let Some(token) = REJECTED_TOKENS
+        .iter()
+        .find(|token| command.contains(**token))
+    {
+        return Err(format!("shell syntax is not supported: {token}"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct JuxProcessHandle {
+    output: String,
+    read_offset: usize,
+    closed: bool,
+}
+
+impl JuxProcessHandle {
+    fn new(output: String) -> Self {
+        Self {
+            output,
+            read_offset: 0,
+            closed: false,
+        }
+    }
+
+    fn ensure_open(&self) -> mlua::Result<()> {
+        if self.closed {
+            Err(mlua::Error::external("process handle is closed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read_all(&mut self) -> String {
+        let output = self.output[self.read_offset..].to_owned();
+        self.read_offset = self.output.len();
+        output
+    }
+
+    fn read_line(&mut self) -> Option<String> {
+        if self.read_offset >= self.output.len() {
+            return None;
+        }
+
+        let remaining = &self.output[self.read_offset..];
+        match remaining.find('\n') {
+            Some(newline_index) => {
+                let end = self.read_offset + newline_index;
+                let line = self.output[self.read_offset..end].to_owned();
+                self.read_offset = end + 1;
+                Some(line)
+            }
+            None => {
+                let line = remaining.to_owned();
+                self.read_offset = self.output.len();
+                Some(line)
+            }
+        }
+    }
+}
+
+impl UserData for JuxProcessHandle {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("read", |lua, this, mode: Option<String>| {
+            this.ensure_open()?;
+            match mode.as_deref().unwrap_or("*l") {
+                "*a" | "a" => Ok(Value::String(lua.create_string(this.read_all())?)),
+                "*l" | "l" => match this.read_line() {
+                    Some(line) => Ok(Value::String(lua.create_string(line)?)),
+                    None => Ok(Value::Nil),
+                },
+                other => Err(mlua::Error::external(format!(
+                    "unsupported io.popen read mode: {other}"
+                ))),
+            }
+        });
+
+        methods.add_method_mut("lines", |lua, this, ()| {
+            this.ensure_open()?;
+            let lines = this
+                .output
+                .lines()
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            let mut index = 0usize;
+            lua.create_function_mut(move |lua, ()| {
+                let Some(line) = lines.get(index) else {
+                    return Ok(Value::Nil);
+                };
+                index += 1;
+                Ok(Value::String(lua.create_string(line)?))
+            })
+        });
+
+        methods.add_method_mut("close", |_, this, ()| {
+            this.closed = true;
+            Ok(true)
+        });
     }
 }
 

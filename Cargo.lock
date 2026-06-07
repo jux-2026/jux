@@ -1070,6 +1070,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "shlex",
  "tracing",
  "uuid",
 ]

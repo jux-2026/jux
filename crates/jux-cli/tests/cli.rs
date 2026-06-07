@@ -103,27 +103,13 @@ fn run_command_can_output_json() {
     assert!(output["run_id"].as_str().is_some_and(|id| !id.is_empty()));
     assert!(output["created_at"].as_u64().is_some());
     assert!(output["updated_at"].as_u64().is_some());
-    assert_eq!(output["steps"][0]["kind"], "SystemMessage");
+    assert_eq!(output["steps"][0]["kind"], "UserMessage");
     assert!(
-        output["steps"][0]["payload"]["SystemMessage"]["content"]
+        output["steps"][0]["payload"]["UserMessage"]["content"]
             .as_str()
-            .is_some_and(|content| content.contains("You are Jux"))
+            .is_some_and(|content| content == "Return JSON output")
     );
-    assert_eq!(output["steps"][1]["kind"], "LlmToolDefinition");
-    assert_eq!(
-        output["steps"][1]["payload"]["LlmToolDefinition"]["name"],
-        "echo"
-    );
-    assert_eq!(output["steps"][2]["kind"], "LlmToolDefinition");
-    assert_eq!(
-        output["steps"][2]["payload"]["LlmToolDefinition"]["name"],
-        "lua"
-    );
-    assert_eq!(output["steps"][3]["kind"], "UserMessage");
-    assert_eq!(
-        output["steps"][3]["payload"]["UserMessage"]["content"],
-        "Return JSON output"
-    );
+    assert_eq!(output["steps"][1]["kind"], "AssistantMessage");
     assert!(output["steps"][0]["created_at"].as_u64().is_some());
     assert!(output["steps"][0]["updated_at"].as_u64().is_some());
     assert!(output["steps"][0].get("status").is_none());
@@ -161,7 +147,7 @@ fn run_command_can_output_yaml() {
         .stdout(predicate::str::contains("created_at:"))
         .stdout(predicate::str::contains("updated_at:"))
         .stdout(predicate::str::contains("steps:"))
-        .stdout(predicate::str::contains("kind: SystemMessage"))
+        .stdout(predicate::str::contains("kind: UserMessage"))
         .stdout(predicate::str::contains("payload:"));
 
     let requests = mock.join();
@@ -242,22 +228,30 @@ fn session_show_outputs_active_session_state() {
     let output: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
 
     assert_eq!(output["session"]["name"], "default");
+    assert_eq!(output["session_context"][0]["sequence"], 1);
+    assert_eq!(output["session_context"][0]["kind"], "SystemPrompt");
+    assert!(
+        output["session_context"][0]["payload"]["SystemPrompt"]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("You are Jux"))
+    );
+    assert_eq!(output["session_context"][1]["sequence"], 2);
+    assert_eq!(output["session_context"][1]["kind"], "ToolDefinition");
+    assert_eq!(
+        output["session_context"][1]["payload"]["ToolDefinition"]["name"],
+        "echo"
+    );
+    assert_eq!(output["session_context"][2]["sequence"], 3);
+    assert_eq!(output["session_context"][2]["kind"], "ToolDefinition");
+    assert_eq!(
+        output["session_context"][2]["payload"]["ToolDefinition"]["name"],
+        "lua"
+    );
     assert_eq!(output["runs"][0]["request"], "Create session state");
     assert_eq!(output["runs"][0]["status"], "Completed");
     assert!(output.get("steps").is_none());
-    assert_eq!(output["runs"][0]["steps"][0]["kind"], "SystemMessage");
-    assert_eq!(output["runs"][0]["steps"][1]["kind"], "LlmToolDefinition");
-    assert_eq!(
-        output["runs"][0]["steps"][1]["payload"]["LlmToolDefinition"]["name"],
-        "echo"
-    );
-    assert_eq!(output["runs"][0]["steps"][2]["kind"], "LlmToolDefinition");
-    assert_eq!(
-        output["runs"][0]["steps"][2]["payload"]["LlmToolDefinition"]["name"],
-        "lua"
-    );
-    assert_eq!(output["runs"][0]["steps"][3]["kind"], "UserMessage");
-    assert_eq!(output["runs"][0]["steps"][4]["kind"], "AssistantMessage");
+    assert_eq!(output["runs"][0]["steps"][0]["kind"], "UserMessage");
+    assert_eq!(output["runs"][0]["steps"][1]["kind"], "AssistantMessage");
 }
 
 struct MockDeepseek {

@@ -3,7 +3,7 @@ use rig::OneOrMany;
 use rig::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage, Usage,
 };
-use rig::message::{AssistantContent, ToolCall, ToolFunction};
+use rig::message::{AssistantContent, Reasoning, ToolCall, ToolFunction};
 use rig::streaming::StreamingCompletionResponse;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -83,6 +83,52 @@ fn sqlite_store_persists_workspace_session_run_and_ordered_steps() {
 }
 
 #[test]
+fn sqlite_store_persists_ordered_session_context_items_once() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let workspace = store.init_workspace().expect("workspace initializes");
+    let session_id = workspace.active_session_id;
+
+    let first = store
+        .ensure_session_context_items(
+            &session_id,
+            vec![
+                (
+                    SessionContextKind::SystemPrompt,
+                    SessionContextPayload::SystemPrompt {
+                        content: "system".to_owned(),
+                    },
+                ),
+                (
+                    SessionContextKind::ToolDefinition,
+                    SessionContextPayload::ToolDefinition {
+                        name: "tool".to_owned(),
+                        description: "tool description".to_owned(),
+                        parameters: serde_json::json!({ "type": "object" }),
+                    },
+                ),
+            ],
+        )
+        .expect("session context initializes");
+    let second = store
+        .ensure_session_context_items(
+            &session_id,
+            vec![(
+                SessionContextKind::SystemPrompt,
+                SessionContextPayload::SystemPrompt {
+                    content: "ignored".to_owned(),
+                },
+            )],
+        )
+        .expect("existing session context loads");
+
+    assert_eq!(first, second);
+    assert_eq!(first[0].sequence, 1);
+    assert_eq!(first[0].kind, SessionContextKind::SystemPrompt);
+    assert_eq!(first[1].sequence, 2);
+    assert_eq!(first[1].kind, SessionContextKind::ToolDefinition);
+}
+
+#[test]
 fn run_loop_records_successful_llm_run_steps() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
     let model = TestModel::fixed_text("Mocked answer");
@@ -100,32 +146,40 @@ fn run_loop_records_successful_llm_run_steps() {
             .iter()
             .map(|step| step.kind.clone())
             .collect::<Vec<_>>(),
-        vec![
-            StepKind::SystemMessage,
-            StepKind::LlmToolDefinition,
-            StepKind::LlmToolDefinition,
-            StepKind::UserMessage,
-            StepKind::AssistantMessage,
-        ]
+        vec![StepKind::UserMessage, StepKind::AssistantMessage]
     );
     assert_eq!(
         output.steps[0].payload,
-        StepPayload::SystemMessage {
-            content: SYSTEM_PROMPT.to_owned(),
-        }
-    );
-    assert_eq!(
-        output.steps[3].payload,
         StepPayload::UserMessage {
             content: "Explain this project".to_owned(),
         }
     );
-    assert_eq!(output.steps[1].payload.to_tool_name(), Some("echo"));
-    assert_eq!(output.steps[2].payload.to_tool_name(), Some("lua"));
+    let context_items = store
+        .load_session_context_items(&output.session.id)
+        .expect("session context loads");
+    assert_eq!(context_items.len(), 3);
+    assert_eq!(context_items[0].sequence, 1);
+    assert_eq!(context_items[0].kind, SessionContextKind::SystemPrompt);
+    assert_eq!(
+        context_items[0].payload,
+        SessionContextPayload::SystemPrompt {
+            content: SYSTEM_PROMPT.to_owned(),
+        }
+    );
+    assert_eq!(context_items[1].sequence, 2);
+    assert_eq!(context_items[1].payload.to_tool_name(), Some("echo"));
+    assert_eq!(context_items[2].sequence, 3);
+    assert_eq!(context_items[2].payload.to_tool_name(), Some("lua"));
     assert_eq!(requests.len(), 1);
     assert!(requests[0].contains("You are Jux"));
     assert!(requests[0].contains("Explain this project"));
     assert!(requests[0].contains("\"tools\""));
+    assert!(requests[0].contains("restricted Jux Lua runtime"));
+    assert!(requests[0].contains("All Lua standard libraries are disabled"));
+    assert!(requests[0].contains("io.popen"));
+    assert!(requests[0].contains("not executed through a shell"));
+    assert!(requests[0].contains("Do not call print"));
+    assert!(requests[0].contains("Use return to send the result back to Jux"));
 }
 
 #[test]
@@ -148,6 +202,45 @@ fn run_loop_uses_session_history_when_calling_llm() {
     assert!(requests[1].contains("First request"));
     assert!(requests[1].contains("First answer"));
     assert!(requests[1].contains("Second request"));
+    let context_items = store
+        .load_session_context_items(&store.load_active_session().expect("session loads").id)
+        .expect("session context loads");
+    assert_eq!(context_items.len(), 3);
+}
+
+#[test]
+fn run_loop_records_reasoning_without_sending_it_back_to_llm() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![
+            AssistantContent::Reasoning(Reasoning::new("hidden reasoning")),
+            AssistantContent::text("Visible answer"),
+        ]),
+        Ok(vec![AssistantContent::text("Second answer")]),
+    ]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
+
+    let first_output = futures::executor::block_on(run_loop.run("First request".to_owned()))
+        .expect("first run loop succeeds");
+    futures::executor::block_on(run_loop.run("Second request".to_owned()))
+        .expect("second run loop succeeds");
+    let requests = model.recorded_requests();
+
+    assert_eq!(first_output.answer.as_deref(), Some("Visible answer"));
+    assert_eq!(
+        first_output
+            .steps
+            .iter()
+            .map(|step| step.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            StepKind::UserMessage,
+            StepKind::AssistantReasoning,
+            StepKind::AssistantMessage,
+        ]
+    );
+    assert!(requests[1].contains("Visible answer"));
+    assert!(!requests[1].contains("hidden reasoning"));
 }
 
 #[test]
@@ -181,18 +274,15 @@ fn run_loop_executes_echo_tool_call_and_continues_until_final_answer() {
             .map(|step| step.kind.clone())
             .collect::<Vec<_>>(),
         vec![
-            StepKind::SystemMessage,
-            StepKind::LlmToolDefinition,
-            StepKind::LlmToolDefinition,
             StepKind::UserMessage,
             StepKind::AssistantToolCall,
             StepKind::ToolResult,
             StepKind::AssistantMessage,
         ]
     );
-    assert_eq!(output.steps[4].payload.to_tool_call_name(), Some("echo"));
+    assert_eq!(output.steps[1].payload.to_tool_call_name(), Some("echo"));
     assert_eq!(
-        output.steps[5].payload.to_tool_result_content(),
+        output.steps[2].payload.to_tool_result_content(),
         Some("hello from tool")
     );
     assert_eq!(requests.len(), 2);
@@ -230,9 +320,6 @@ fn run_loop_executes_lua_tool_call_and_continues_until_final_answer() {
             .map(|step| step.kind.clone())
             .collect::<Vec<_>>(),
         vec![
-            StepKind::SystemMessage,
-            StepKind::LlmToolDefinition,
-            StepKind::LlmToolDefinition,
             StepKind::UserMessage,
             StepKind::AssistantToolCall,
             StepKind::ToolResult,
@@ -243,6 +330,159 @@ fn run_loop_executes_lua_tool_call_and_continues_until_final_answer() {
     assert!(requests[0].contains("You are Jux"));
     assert!(requests[0].contains("Use the lua tool"));
     assert!(requests[1].contains("hello from lua"));
+}
+
+#[test]
+fn run_loop_returns_lua_system_standard_library_access_errors_to_llm() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "lua",
+            serde_json::json!({ "code": "return os.getenv('HOME')" }),
+        ))]),
+        Ok(vec![AssistantContent::text("Lua access denied")]),
+    ]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
+
+    let output = futures::executor::block_on(run_loop.run("Use the lua os library".to_owned()))
+        .expect("run loop succeeds");
+    let requests = model.recorded_requests();
+    let tool_result = output.steps[2]
+        .payload
+        .to_tool_result_content()
+        .expect("tool result exists");
+
+    assert_eq!(output.run.status, RunStatus::Completed);
+    assert!(tool_result.contains("Tool execution failed"));
+    assert!(tool_result.contains("lua execution failed"));
+    assert!(requests[1].contains("Tool execution failed"));
+}
+
+#[test]
+fn run_loop_returns_lua_print_errors_to_llm() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "lua",
+            serde_json::json!({ "code": "print('hello from print')" }),
+        ))]),
+        Ok(vec![AssistantContent::text("Lua print denied")]),
+    ]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
+
+    let output = futures::executor::block_on(run_loop.run("Use lua print".to_owned()))
+        .expect("run loop succeeds");
+    let requests = model.recorded_requests();
+    let tool_result = output.steps[2]
+        .payload
+        .to_tool_result_content()
+        .expect("tool result exists");
+
+    assert_eq!(output.run.status, RunStatus::Completed);
+    assert!(tool_result.contains("Tool execution failed"));
+    assert!(tool_result.contains("print is disabled in the Jux Lua runtime"));
+    assert!(tool_result.contains("use return to send a tool result"));
+    assert!(requests[1].contains("print is disabled"));
+}
+
+#[test]
+fn run_loop_allows_lua_os_execute_with_single_command() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "lua",
+            serde_json::json!({ "code": "local ok, kind, code = os.execute('true'); return tostring(ok) .. ':' .. kind .. ':' .. tostring(code)" }),
+        ))]),
+        Ok(vec![AssistantContent::text("Lua command executed")]),
+    ]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
+
+    let output = futures::executor::block_on(run_loop.run("Use lua os.execute".to_owned()))
+        .expect("run loop succeeds");
+    let requests = model.recorded_requests();
+
+    assert_eq!(output.run.status, RunStatus::Completed);
+    assert!(requests[1].contains("true:exit:0"));
+}
+
+#[test]
+fn run_loop_allows_lua_io_popen_read_all() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "lua",
+            serde_json::json!({ "code": "local f = io.popen('printf hello', 'r'); local output = f:read('*a'); f:close(); return output" }),
+        ))]),
+        Ok(vec![AssistantContent::text("Lua popen read output")]),
+    ]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
+
+    let output = futures::executor::block_on(run_loop.run("Use lua io.popen".to_owned()))
+        .expect("run loop succeeds");
+    let requests = model.recorded_requests();
+
+    assert_eq!(output.run.status, RunStatus::Completed);
+    assert!(requests[1].contains("hello"));
+}
+
+#[test]
+fn run_loop_allows_lua_io_popen_lines() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "lua",
+            serde_json::json!({ "code": "local f = io.popen('printf hello', 'r'); local line = f:lines()(); f:close(); return line" }),
+        ))]),
+        Ok(vec![AssistantContent::text("Lua popen lines output")]),
+    ]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
+
+    let output = futures::executor::block_on(run_loop.run("Use lua io.popen lines".to_owned()))
+        .expect("run loop succeeds");
+    let requests = model.recorded_requests();
+
+    assert_eq!(output.run.status, RunStatus::Completed);
+    assert!(requests[1].contains("hello"));
+}
+
+#[test]
+fn run_loop_returns_lua_shell_style_command_errors_to_llm() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "lua",
+            serde_json::json!({ "code": "local f = io.popen('printf hello > output.txt', 'r'); return f:read('*a')" }),
+        ))]),
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_2",
+            "lua",
+            serde_json::json!({ "code": "local f = io.popen('printf hello', 'r'); return f:read('*a')" }),
+        ))]),
+        Ok(vec![AssistantContent::text("Lua command recovered")]),
+    ]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
+
+    let output = futures::executor::block_on(run_loop.run("Use shell syntax".to_owned()))
+        .expect("run loop succeeds");
+    let requests = model.recorded_requests();
+
+    assert_eq!(output.run.status, RunStatus::Completed);
+    assert_eq!(output.answer.as_deref(), Some("Lua command recovered"));
+    let first_tool_result = output.steps[2]
+        .payload
+        .to_tool_result_content()
+        .expect("first tool result exists");
+    assert!(first_tool_result.contains("Tool execution failed"));
+    assert!(first_tool_result.contains("shell syntax is not supported: >"));
+    assert!(requests[1].contains("Tool execution failed"));
+    assert!(requests[1].contains("shell syntax is not supported"));
+    assert!(requests[2].contains("hello"));
 }
 
 #[test]
@@ -267,19 +507,11 @@ fn run_loop_marks_run_failed_when_llm_fails() {
 }
 
 trait StepPayloadTestExt {
-    fn to_tool_name(&self) -> Option<&str>;
     fn to_tool_call_name(&self) -> Option<&str>;
     fn to_tool_result_content(&self) -> Option<&str>;
 }
 
 impl StepPayloadTestExt for StepPayload {
-    fn to_tool_name(&self) -> Option<&str> {
-        match self {
-            StepPayload::LlmToolDefinition { name, .. } => Some(name),
-            _ => None,
-        }
-    }
-
     fn to_tool_call_name(&self) -> Option<&str> {
         match self {
             StepPayload::AssistantToolCall { name, .. } => Some(name),
@@ -291,6 +523,19 @@ impl StepPayloadTestExt for StepPayload {
         match self {
             StepPayload::ToolResult { content, .. } => Some(content),
             _ => None,
+        }
+    }
+}
+
+trait SessionContextPayloadTestExt {
+    fn to_tool_name(&self) -> Option<&str>;
+}
+
+impl SessionContextPayloadTestExt for SessionContextPayload {
+    fn to_tool_name(&self) -> Option<&str> {
+        match self {
+            SessionContextPayload::ToolDefinition { name, .. } => Some(name),
+            SessionContextPayload::SystemPrompt { .. } => None,
         }
     }
 }

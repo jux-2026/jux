@@ -7,7 +7,10 @@ mod store;
 mod time;
 
 pub use ids::{RunId, SessionId, StepId, WorkspaceId};
-pub use model::{Run, RunStatus, Session, Step, StepKind, StepPayload, Workspace};
+pub use model::{
+    Run, RunStatus, Session, SessionContextItem, SessionContextKind, SessionContextPayload, Step,
+    StepKind, StepPayload, Workspace,
+};
 pub use orchestrator::{RunLoop, RunLoopError, RunLoopOutput, SYSTEM_PROMPT};
 pub use store::{SqliteWorkspaceStore, StoreError};
 

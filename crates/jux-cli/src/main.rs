@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use jux_core::{
-    Run, RunLoop, RunLoopOutput, Session, SessionId, SqliteWorkspaceStore, Step, StepPayload,
-    Workspace,
+    Run, RunLoop, RunLoopOutput, Session, SessionContextItem, SessionContextPayload, SessionId,
+    SqliteWorkspaceStore, Step, StepPayload, Workspace,
 };
 use rig::{client::CompletionClient, completion::CompletionModel, providers::deepseek};
 use serde::Serialize;
@@ -114,9 +114,10 @@ fn handle_session_show(args: SessionShowArgs, output_format: OutputFormat) -> Re
     };
     let runs = store.load_session_runs(&session.id)?;
     let steps = store.load_session_steps(&session.id)?;
+    let context_items = store.load_session_context_items(&session.id)?;
 
     print_session_show_output(
-        &SessionShowOutput::new(workspace, session, runs, steps),
+        &SessionShowOutput::new(workspace, session, context_items, runs, steps),
         output_format,
     )
 }
@@ -186,6 +187,11 @@ fn print_session_show_output(
                 output.workspace.active_session_id
             );
             println!();
+            println!("Context:");
+            for item in &output.session_context {
+                println!("  - {} {}", item.sequence, item.kind);
+            }
+            println!();
             println!("Runs:");
             for run in &output.runs {
                 println!("  - {} {} {}", run.id, run.status, run.request);
@@ -209,11 +215,22 @@ fn print_session_show_output(
 struct SessionShowOutput {
     workspace: Workspace,
     session: Session,
+    session_context: Vec<SessionContextItemOutput>,
     runs: Vec<SessionRunOutput>,
 }
 
 impl SessionShowOutput {
-    fn new(workspace: Workspace, session: Session, runs: Vec<Run>, steps: Vec<Step>) -> Self {
+    fn new(
+        workspace: Workspace,
+        session: Session,
+        context_items: Vec<SessionContextItem>,
+        runs: Vec<Run>,
+        steps: Vec<Step>,
+    ) -> Self {
+        let session_context = context_items
+            .iter()
+            .map(SessionContextItemOutput::from)
+            .collect();
         let runs = runs
             .into_iter()
             .map(|run| {
@@ -229,7 +246,29 @@ impl SessionShowOutput {
         Self {
             workspace,
             session,
+            session_context,
             runs,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SessionContextItemOutput {
+    sequence: u64,
+    kind: String,
+    payload: SessionContextPayload,
+    created_at: u128,
+    updated_at: u128,
+}
+
+impl From<&SessionContextItem> for SessionContextItemOutput {
+    fn from(item: &SessionContextItem) -> Self {
+        Self {
+            sequence: item.sequence,
+            kind: format!("{:?}", item.kind),
+            payload: item.payload.clone(),
+            created_at: item.created_at,
+            updated_at: item.updated_at,
         }
     }
 }

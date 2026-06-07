@@ -49,6 +49,55 @@ impl Session {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SessionContextItem {
+    pub session_id: SessionId,
+    pub sequence: u64,
+    pub kind: SessionContextKind,
+    pub payload: SessionContextPayload,
+    pub created_at: u128,
+    pub updated_at: u128,
+}
+
+impl SessionContextItem {
+    #[must_use]
+    pub fn new(
+        session_id: SessionId,
+        sequence: u64,
+        kind: SessionContextKind,
+        payload: SessionContextPayload,
+    ) -> Self {
+        let now = now_millis();
+
+        Self {
+            session_id,
+            sequence,
+            kind,
+            payload,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum SessionContextKind {
+    SystemPrompt,
+    ToolDefinition,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum SessionContextPayload {
+    SystemPrompt {
+        content: String,
+    },
+    ToolDefinition {
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Run {
     pub id: RunId,
@@ -140,6 +189,7 @@ pub enum StepKind {
     SystemMessage,
     UserMessage,
     AssistantMessage,
+    AssistantReasoning,
     AssistantToolCall,
     ToolResult,
     LlmToolDefinition,
@@ -155,6 +205,9 @@ pub enum StepPayload {
         content: String,
     },
     AssistantMessage {
+        content: String,
+    },
+    AssistantReasoning {
         content: String,
     },
     AssistantToolCall {
