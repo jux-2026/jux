@@ -375,7 +375,7 @@ fn run_with_model<M>(
 where
     M: CompletionModel,
 {
-    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let runtime = Builder::new_multi_thread().enable_all().build()?;
     let store = SqliteWorkspaceStore::new(workspace);
     let run_loop = RunLoop::new(store, model);
     Ok(runtime.block_on(run_loop.run(request))?)

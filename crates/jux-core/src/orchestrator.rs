@@ -3,6 +3,7 @@ use crate::model::{
     SessionContextPayload, Step, StepKind, StepPayload, Workspace,
 };
 use crate::store::{SqliteWorkspaceStore, StoreError};
+use crate::wasm_runtime::{WasmCommandRequest, WasmerRuntime};
 use mlua::{Lua, LuaOptions, StdLib, UserData, UserDataMethods, Value};
 use rig::OneOrMany;
 use rig::completion::{CompletionError, CompletionModel, ToolDefinition, Usage};
@@ -14,16 +15,16 @@ use serde::Serialize;
 use serde_json::json;
 use std::error::Error;
 use std::fmt::{self, Display};
-use std::process::Command as ProcessCommand;
 
 const MAX_LOOP_ITERATIONS: usize = 8;
 const EXEC_TOOL_NAME: &str = "exec";
 const LUA_TOOL_NAME: &str = "lua";
-const EXEC_TOOL_DESCRIPTION: &str = "Execute one command directly without a shell. \
-Provide the executable name in program and each argument as a separate string in args. \
-Do not use shell syntax such as &&, ||, ;, |, >, <, backticks, $(), wildcard expansion, \
-or newlines. The tool returns structured execution data as JSON: success, exit_code, \
-stdout, and stderr.";
+const EXEC_TOOL_DESCRIPTION: &str = "Execute one command from the Jux WASI coreutils runtime. \
+Provide the command name in program and each argument as a separate string in args. \
+Supported commands are basename, base32, base64, cat, dirname, echo, env, ls, mkdir, \
+mv, printf, pwd, sum, and wc. Do not use shell syntax such as &&, ||, ;, |, >, <, \
+backticks, $(), wildcard expansion, or newlines. The tool returns structured execution \
+data as JSON: success, exit_code, stdout, and stderr.";
 const LUA_TOOL_DESCRIPTION: &str = "Execute Lua code in a restricted Jux Lua runtime. \
 All Lua standard libraries are disabled by default. Only these globals are available: \
 os.execute(command), which executes one non-shell command; and io.popen(command, 'r'), \
@@ -564,16 +565,20 @@ fn run_exec_command(program: &str, args: &[String]) -> Result<CommandOutput, Str
         reject_shell_token(arg)?;
     }
 
-    let output = ProcessCommand::new(program)
-        .args(args)
-        .output()
-        .map_err(|error| format!("command execution failed: {error}"))?;
+    let output = WasmerRuntime::new()
+        .run_coreutils_command(WasmCommandRequest {
+            program: program.to_owned(),
+            args: args.to_vec(),
+            host_directory: std::env::current_dir()
+                .map_err(|error| format!("current directory cannot be loaded: {error}"))?,
+        })
+        .map_err(|error| format!("wasi coreutils execution failed: {error}"))?;
 
     Ok(CommandOutput {
-        success: output.status.success(),
-        status_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        success: output.success,
+        status_code: output.exit_code,
+        stdout: output.stdout,
+        stderr: output.stderr,
     })
 }
 

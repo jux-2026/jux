@@ -1,3 +1,4 @@
 /target/
 /.jux/
 .env.local.fish
+crates/jux-core/assets/**/*.webc

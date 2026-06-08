@@ -496,7 +496,7 @@ fn run_loop_allows_lua_os_execute_with_single_command() {
         Ok(vec![AssistantContent::ToolCall(test_tool_call(
             "call_1",
             "lua",
-            serde_json::json!({ "code": "local ok, kind, code = os.execute('true'); return tostring(ok) .. ':' .. kind .. ':' .. tostring(code)" }),
+            serde_json::json!({ "code": "local ok, kind, code = os.execute('printf hello'); return tostring(ok) .. ':' .. kind .. ':' .. tostring(code)" }),
         ))]),
         Ok(vec![AssistantContent::text("Lua command executed")]),
     ]);
@@ -608,6 +608,63 @@ fn run_loop_marks_run_failed_when_llm_fails() {
     assert_eq!(
         steps.last().expect("error step exists").kind,
         StepKind::Error
+    );
+}
+
+#[test]
+fn wasmer_runtime_calls_exported_i32_function() {
+    let wasm = wasmer::wat2wasm(
+        br#"
+        (module
+          (func (export "answer") (result i32)
+            i32.const 42))
+        "#,
+    )
+    .expect("wat compiles");
+    let runtime = WasmerRuntime::new();
+
+    let result = runtime
+        .call_exported_i32_function(&wasm, "answer")
+        .expect("wasm function runs");
+
+    assert_eq!(result, 42);
+}
+
+#[test]
+fn wasmer_runtime_runs_coreutils_command() {
+    let root = temp_workspace_root();
+    std::fs::write(root.join("hello.txt"), "hello").expect("fixture file is written");
+    let runtime = WasmerRuntime::new();
+
+    let output = runtime
+        .run_coreutils_command(WasmCommandRequest {
+            program: "cat".to_owned(),
+            args: vec!["hello.txt".to_owned()],
+            host_directory: root,
+        })
+        .expect("coreutils command runs");
+
+    assert!(output.success);
+    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(output.stdout, "hello");
+    assert_eq!(output.stderr, "");
+}
+
+#[test]
+fn wasmer_runtime_rejects_non_coreutils_command() {
+    let runtime = WasmerRuntime::new();
+
+    let error = runtime
+        .run_coreutils_command(WasmCommandRequest {
+            program: "true".to_owned(),
+            args: Vec::new(),
+            host_directory: temp_workspace_root(),
+        })
+        .expect_err("unsupported command is rejected");
+
+    assert_eq!(
+        error,
+        WasmRuntimeError::UnsupportedCommand("true".to_owned())
     );
 }
 
