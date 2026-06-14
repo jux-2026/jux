@@ -656,7 +656,7 @@ fn wasmer_runtime_rejects_non_coreutils_command() {
 
     let error = runtime
         .run_coreutils_command(WasmCommandRequest {
-            program: "true".to_owned(),
+            program: "definitely-not-coreutils".to_owned(),
             args: Vec::new(),
             host_directory: temp_workspace_root(),
         })
@@ -664,8 +664,47 @@ fn wasmer_runtime_rejects_non_coreutils_command() {
 
     assert_eq!(
         error,
-        WasmRuntimeError::UnsupportedCommand("true".to_owned())
+        WasmRuntimeError::UnsupportedCommand("definitely-not-coreutils".to_owned())
     );
+}
+
+#[test]
+fn wasmer_runtime_invokes_manifest_command_cp_without_host_writeback() {
+    let root = temp_workspace_root();
+    let target = root.join("target.txt");
+    std::fs::write(root.join("source.txt"), "hello").expect("fixture file is written");
+    let runtime = WasmerRuntime::new();
+
+    let output = runtime
+        .run_coreutils_command(WasmCommandRequest {
+            program: "cp".to_owned(),
+            args: vec!["source.txt".to_owned(), "target.txt".to_owned()],
+            host_directory: root,
+        })
+        .expect("cp command is declared by the coreutils package");
+
+    assert!(output.success);
+    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(output.stdout, "");
+    assert_eq!(output.stderr, "");
+    assert!(!target.exists());
+}
+
+#[test]
+fn wasmer_runtime_returns_command_failure_for_unavailable_manifest_command() {
+    let runtime = WasmerRuntime::new();
+
+    let output = runtime
+        .run_coreutils_command(WasmCommandRequest {
+            program: "mknod".to_owned(),
+            args: vec!["node".to_owned(), "p".to_owned()],
+            host_directory: temp_workspace_root(),
+        })
+        .expect("mknod command is declared by the coreutils package");
+
+    assert!(!output.success);
+    assert_eq!(output.exit_code, Some(1));
+    assert!(output.stdout.contains("function/utility not found"));
 }
 
 trait StepPayloadTestExt {

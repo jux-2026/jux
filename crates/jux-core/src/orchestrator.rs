@@ -21,10 +21,10 @@ const EXEC_TOOL_NAME: &str = "exec";
 const LUA_TOOL_NAME: &str = "lua";
 const EXEC_TOOL_DESCRIPTION: &str = "Execute one command from the Jux WASI coreutils runtime. \
 Provide the command name in program and each argument as a separate string in args. \
-Supported commands are basename, base32, base64, cat, dirname, echo, env, ls, mkdir, \
-mv, printf, pwd, sum, and wc. Do not use shell syntax such as &&, ||, ;, |, >, <, \
-backticks, $(), wildcard expansion, or newlines. The tool returns structured execution \
-data as JSON: success, exit_code, stdout, and stderr.";
+Supported commands are the commands declared by wasmer/coreutils. Some commands may still \
+fail or have reduced behavior in the WASI sandbox. Do not use shell syntax such as &&, \
+||, ;, |, >, <, backticks, $(), wildcard expansion, or newlines. The tool returns \
+structured execution data as JSON: success, exit_code, stdout, and stderr.";
 const LUA_TOOL_DESCRIPTION: &str = "Execute Lua code in a restricted Jux Lua runtime. \
 All Lua standard libraries are disabled by default. Only these globals are available: \
 os.execute(command), which executes one non-shell command; and io.popen(command, 'r'), \
