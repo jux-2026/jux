@@ -1,8 +1,20 @@
-use crate::wasm_assets::WasmAsset;
+//! Wasmer execution adapter.
+//!
+//! This module owns the mechanics of compiling, instantiating, and running WASM
+//! or WASIX packages through Wasmer. It consumes capability objects prepared by
+//! the WASM capability layer and keeps command execution details out of the
+//! higher-level agent orchestration code.
+
+use super::assets::WasmAsset;
+use super::capability::{
+    WasmerRuntimeCapabilities, apply_runner_capabilities, apply_runtime_capabilities,
+};
+use super::commands::{
+    COREUTILS_ASSET, WasmCommandOutput, WasmCommandRequest, is_supported_coreutils_command,
+};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 use wasmer::sys::{BaseTunables, Cranelift, EngineBuilder, NativeEngineExt};
 use wasmer::{Instance, Module, Store, imports};
@@ -10,129 +22,33 @@ use wasmer_package::utils::from_bytes;
 use wasmer_types::Features;
 use wasmer_wasix::PluggableRuntime;
 use wasmer_wasix::bin_factory::BinaryPackage;
-use wasmer_wasix::runners::MappedDirectory;
 use wasmer_wasix::runners::wasi::{RuntimeOrEngine, WasiRunner};
-use wasmer_wasix::runtime::package_loader::BuiltinPackageLoader;
 use wasmer_wasix::runtime::task_manager::tokio::TokioTaskManager;
 use wasmer_wasix::virtual_fs::{ArcFile, AsyncReadExt, AsyncSeekExt, BufferFile, NullFile};
 
-const COREUTILS_ASSET: WasmAsset = WasmAsset {
-    package: "wasmer/coreutils",
-    version: "1.0.25",
-    filename: "coreutils-1.0.25.webc",
-    download_url: "https://cdn.wasmer.io/webcimages/36ea48f185ca15fe8454b1defb6a11754659dbed6330549662b62874d509f95f.webc",
-    relative_dir: "coreutils",
-};
-const COREUTILS_COMMANDS: &[&str] = &[
-    "arch",
-    "base32",
-    "base64",
-    "baseenc",
-    "basename",
-    "cat",
-    "chcon",
-    "chgrp",
-    "chmod",
-    "chown",
-    "chroot",
-    "cksum",
-    "comm",
-    "cp",
-    "csplit",
-    "cut",
-    "date",
-    "dd",
-    "df",
-    "dircolors",
-    "dirname",
-    "du",
-    "echo",
-    "env",
-    "expand",
-    "expr",
-    "factor",
-    "false",
-    "fmt",
-    "fold",
-    "groups",
-    "hashsum",
-    "head",
-    "hostid",
-    "hostname",
-    "id",
-    "install",
-    "join",
-    "kill",
-    "link",
-    "ln",
-    "logname",
-    "ls",
-    "mkdir",
-    "mkfifo",
-    "mknod",
-    "mktemp",
-    "more",
-    "mv",
-    "nice",
-    "nl",
-    "nohup",
-    "nproc",
-    "numfmt",
-    "od",
-    "paste",
-    "pathchk",
-    "pinky",
-    "pr",
-    "printenv",
-    "printf",
-    "ptx",
-    "pwd",
-    "readlink",
-    "realpath",
-    "relpath",
-    "rm",
-    "rmdir",
-    "runcon",
-    "seq",
-    "shred",
-    "shuf",
-    "sleep",
-    "sort",
-    "split",
-    "stat",
-    "stdbuf",
-    "sum",
-    "sync",
-    "tac",
-    "tail",
-    "tee",
-    "test",
-    "timeout",
-    "touch",
-    "tr",
-    "true",
-    "truncate",
-    "tsort",
-    "tty",
-    "uname",
-    "unexpand",
-    "uniq",
-    "unlink",
-    "uptime",
-    "users",
-    "wc",
-    "who",
-    "whoami",
-    "yes",
-];
-
-#[derive(Clone, Debug, Default)]
-pub struct WasmerRuntime;
+#[derive(Clone, Debug)]
+/// Wasmer-backed WASM runtime used by Jux tools.
+///
+/// The runtime is intentionally configured through `WasmerRuntimeCapabilities`
+/// instead of accepting raw Wasmer builder options from callers.
+pub struct WasmerRuntime {
+    capabilities: WasmerRuntimeCapabilities,
+}
 
 impl WasmerRuntime {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::with_capabilities(WasmerRuntimeCapabilities::default())
+    }
+
+    #[must_use]
+    pub fn with_capabilities(capabilities: WasmerRuntimeCapabilities) -> Self {
+        Self { capabilities }
+    }
+
+    #[must_use]
+    pub fn capabilities(&self) -> &WasmerRuntimeCapabilities {
+        &self.capabilities
     }
 
     pub fn call_exported_i32_function(
@@ -159,7 +75,7 @@ impl WasmerRuntime {
         &self,
         request: WasmCommandRequest,
     ) -> Result<WasmCommandOutput, WasmRuntimeError> {
-        if !COREUTILS_COMMANDS.contains(&request.program.as_str()) {
+        if !is_supported_coreutils_command(&request.program) {
             return Err(WasmRuntimeError::UnsupportedCommand(request.program));
         }
 
@@ -172,7 +88,13 @@ impl WasmerRuntime {
         request: WasmCommandRequest,
     ) -> Result<WasmCommandOutput, WasmRuntimeError> {
         let package_bytes = load_wasm_asset(asset)?;
-        run_webc_command(package_bytes, request)
+        run_webc_command(package_bytes, request, self.capabilities.clone())
+    }
+}
+
+impl Default for WasmerRuntime {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -186,6 +108,7 @@ fn load_wasm_asset(asset: &WasmAsset) -> Result<Vec<u8>, WasmRuntimeError> {
 fn run_webc_command(
     package_bytes: Vec<u8>,
     request: WasmCommandRequest,
+    capabilities: WasmerRuntimeCapabilities,
 ) -> Result<WasmCommandOutput, WasmRuntimeError> {
     let stdout = ArcFile::new(Box::<BufferFile>::default());
     let stderr = ArcFile::new(Box::<BufferFile>::default());
@@ -196,10 +119,11 @@ fn run_webc_command(
         stdout: stdout.clone(),
         stderr: stderr.clone(),
     };
-    let thread_output =
-        std::thread::spawn(move || run_webc_command_in_thread(package_bytes, invocation))
-            .join()
-            .map_err(|_| WasmRuntimeError::Run("wasi command thread panicked".to_owned()))?;
+    let thread_output = std::thread::spawn(move || {
+        run_webc_command_in_thread(package_bytes, invocation, capabilities)
+    })
+    .join()
+    .map_err(|_| WasmRuntimeError::Run("wasi command thread panicked".to_owned()))?;
     let command_result = thread_output?;
 
     Ok(WasmCommandOutput {
@@ -213,13 +137,14 @@ fn run_webc_command(
 fn run_webc_command_in_thread(
     package_bytes: Vec<u8>,
     invocation: WasiCommandInvocation,
+    capabilities: WasmerRuntimeCapabilities,
 ) -> Result<WasiCommandResult, WasmRuntimeError> {
     let tokio_runtime = build_tokio_runtime()?;
-    let runtime = build_wasix_runtime(&tokio_runtime)?;
+    let runtime = build_wasix_runtime(&tokio_runtime, &capabilities)?;
     let package = load_webc_package(&tokio_runtime, package_bytes, &runtime)?;
     let mut stdout = invocation.stdout.clone();
     let mut stderr = invocation.stderr.clone();
-    let result = run_wasi_command(&tokio_runtime, runtime, package, invocation);
+    let result = run_wasi_command(&tokio_runtime, runtime, package, invocation, &capabilities);
     let stdout = read_virtual_file(&tokio_runtime, &mut stdout).map_err(WasmRuntimeError::Io)?;
     let stderr = read_virtual_file(&tokio_runtime, &mut stderr).map_err(WasmRuntimeError::Io)?;
     let exit_code = match result {
@@ -245,20 +170,13 @@ fn build_tokio_runtime() -> Result<tokio::runtime::Runtime, WasmRuntimeError> {
 
 fn build_wasix_runtime(
     tokio_runtime: &tokio::runtime::Runtime,
+    capabilities: &WasmerRuntimeCapabilities,
 ) -> Result<PluggableRuntime, WasmRuntimeError> {
     let _guard = tokio_runtime.enter();
     let tasks = Arc::new(TokioTaskManager::new(tokio_runtime.handle().clone()));
     let mut runtime = PluggableRuntime::new(Arc::clone(&tasks) as Arc<_>);
     runtime.set_engine(wasmer_engine_with_exceptions());
-    let http_client: Arc<dyn wasmer_wasix::http::HttpClient + Send + Sync> = Arc::new(
-        wasmer_wasix::http::default_http_client()
-            .ok_or_else(|| WasmRuntimeError::Run("wasm http client is unavailable".to_owned()))?,
-    );
-    runtime
-        .set_package_loader(
-            BuiltinPackageLoader::new().with_shared_http_client(http_client.clone()),
-        )
-        .set_http_client(http_client);
+    apply_runtime_capabilities(&mut runtime, capabilities)?;
     Ok(runtime)
 }
 
@@ -274,10 +192,10 @@ fn load_webc_package(
         .map_err(|error| WasmRuntimeError::Run(error.to_string()))
 }
 
-struct WasiCommandInvocation {
+pub(super) struct WasiCommandInvocation {
     program: String,
     args: Vec<String>,
-    host_directory: PathBuf,
+    host_directory: std::path::PathBuf,
     stdout: ArcFile<BufferFile>,
     stderr: ArcFile<BufferFile>,
 }
@@ -293,6 +211,7 @@ fn run_wasi_command(
     runtime: PluggableRuntime,
     package: BinaryPackage,
     invocation: WasiCommandInvocation,
+    capabilities: &WasmerRuntimeCapabilities,
 ) -> Result<(), anyhow::Error> {
     let _guard = tokio_runtime.enter();
     let mut runner = WasiRunner::new();
@@ -301,12 +220,8 @@ fn run_wasi_command(
         .with_stdin(Box::<NullFile>::default())
         .with_stdout(Box::new(invocation.stdout))
         .with_stderr(Box::new(invocation.stderr))
-        .with_current_dir("/")
-        .with_forward_host_env(false)
-        .with_mapped_directories([MappedDirectory {
-            host: invocation.host_directory,
-            guest: "/".to_owned(),
-        }]);
+        .with_current_dir("/");
+    apply_runner_capabilities(&mut runner, capabilities, invocation.host_directory);
 
     runner.run_command(
         &invocation.program,
@@ -355,21 +270,6 @@ impl Display for WasmRuntimeError {
 }
 
 impl Error for WasmRuntimeError {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WasmCommandRequest {
-    pub program: String,
-    pub args: Vec<String>,
-    pub host_directory: PathBuf,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WasmCommandOutput {
-    pub success: bool,
-    pub exit_code: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
-}
 
 fn wasm_exit_code(error: &anyhow::Error) -> Option<i32> {
     error

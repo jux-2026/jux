@@ -1,3 +1,10 @@
+//! Local asset management for WASM runtimes.
+//!
+//! This module tracks external WASM/WEBC packages that Jux needs at runtime,
+//! ensures they exist under the crate-local `assets` directory, and downloads
+//! missing files before execution. It does not decide sandbox permissions; those
+//! are defined by the WASM capability layer.
+
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;

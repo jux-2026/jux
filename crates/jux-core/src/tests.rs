@@ -651,6 +651,86 @@ fn wasmer_runtime_runs_coreutils_command() {
 }
 
 #[test]
+fn wasmer_runtime_exposes_default_capabilities() {
+    let runtime = WasmerRuntime::new();
+
+    assert_eq!(
+        runtime.capabilities(),
+        &WasmerRuntimeCapabilities {
+            filesystem: WasmFilesystemCapability::MappedHostDirectory,
+            environment: WasmEnvironmentCapability::Isolated,
+            stdio: WasmStdioCapability::Buffered,
+            network: WasmNetworkCapability::HttpClient,
+            package_loading: WasmPackageLoadingCapability::BuiltinWithHttpClient,
+        }
+    );
+}
+
+#[test]
+fn wasm_permissions_convert_to_wasmer_runtime_capabilities() {
+    let capabilities = WasmerRuntimeCapabilities::from(WasmPermissions {
+        filesystem: WasmFilesystemPermission::HostDirectoryMapping,
+        environment: WasmEnvironmentPermission::ForwardHost,
+        network: WasmNetworkPermission::HttpClient,
+    });
+
+    assert_eq!(
+        capabilities,
+        WasmerRuntimeCapabilities {
+            filesystem: WasmFilesystemCapability::MappedHostDirectory,
+            environment: WasmEnvironmentCapability::ForwardHost,
+            stdio: WasmStdioCapability::Buffered,
+            network: WasmNetworkCapability::HttpClient,
+            package_loading: WasmPackageLoadingCapability::BuiltinWithHttpClient,
+        }
+    );
+}
+
+#[test]
+fn wasmer_runtime_can_disable_host_filesystem_mapping() {
+    let root = temp_workspace_root();
+    std::fs::write(root.join("hello.txt"), "hello").expect("fixture file is written");
+    let runtime = WasmerRuntime::with_capabilities(WasmerRuntimeCapabilities {
+        filesystem: WasmFilesystemCapability::Disabled,
+        ..WasmerRuntimeCapabilities::default()
+    });
+
+    let output = runtime
+        .run_coreutils_command(WasmCommandRequest {
+            program: "cat".to_owned(),
+            args: vec!["hello.txt".to_owned()],
+            host_directory: root,
+        })
+        .expect("coreutils command runs without a mapped host directory");
+
+    assert!(!output.success);
+    assert_eq!(output.exit_code, Some(1));
+    assert_eq!(output.stdout, "");
+}
+
+#[test]
+fn wasmer_runtime_rejects_http_package_loading_when_network_is_disabled() {
+    let runtime = WasmerRuntime::with_capabilities(WasmerRuntimeCapabilities {
+        network: WasmNetworkCapability::Disabled,
+        package_loading: WasmPackageLoadingCapability::BuiltinWithHttpClient,
+        ..WasmerRuntimeCapabilities::default()
+    });
+
+    let error = runtime
+        .run_coreutils_command(WasmCommandRequest {
+            program: "true".to_owned(),
+            args: Vec::new(),
+            host_directory: temp_workspace_root(),
+        })
+        .expect_err("http package loading requires network capability");
+
+    assert_eq!(
+        error,
+        WasmRuntimeError::Run("wasm package loading requires an enabled http client".to_owned())
+    );
+}
+
+#[test]
 fn wasmer_runtime_rejects_non_coreutils_command() {
     let runtime = WasmerRuntime::new();
 

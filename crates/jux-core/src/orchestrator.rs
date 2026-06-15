@@ -3,7 +3,7 @@ use crate::model::{
     SessionContextPayload, Step, StepKind, StepPayload, Workspace,
 };
 use crate::store::{SqliteWorkspaceStore, StoreError};
-use crate::wasm_runtime::{WasmCommandRequest, WasmerRuntime};
+use crate::wasm::{WasmCommandRequest, WasmerRuntime};
 use mlua::{Lua, LuaOptions, StdLib, UserData, UserDataMethods, Value};
 use rig::OneOrMany;
 use rig::completion::{CompletionError, CompletionModel, ToolDefinition, Usage};
