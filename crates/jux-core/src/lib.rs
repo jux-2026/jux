@@ -15,10 +15,11 @@ pub use model::{
 pub use orchestrator::{RunLoop, RunLoopError, RunLoopOutput, SYSTEM_PROMPT};
 pub use store::{SqliteWorkspaceStore, StoreError};
 pub use wasm::{
-    WasmCommandOutput, WasmCommandRequest, WasmEnvironmentCapability, WasmEnvironmentPermission,
-    WasmFilesystemCapability, WasmFilesystemPermission, WasmNetworkCapability,
-    WasmNetworkPermission, WasmPackageLoadingCapability, WasmPermissions, WasmRuntimeError,
-    WasmStdioCapability, WasmerRuntime, WasmerRuntimeCapabilities,
+    WasmCommandDefinition, WasmCommandOutput, WasmCommandRequest, WasmEnvironmentCapability,
+    WasmEnvironmentPermission, WasmFilesystemCapability, WasmFilesystemPermission,
+    WasmNetworkCapability, WasmNetworkPermission, WasmPackageLoadingCapability, WasmPermissions,
+    WasmRuntimeError, WasmStdioCapability, WasmerRuntime, WasmerRuntimeCapabilities,
+    available_wasm_command_names, available_wasm_commands,
 };
 
 /// Returns the current workspace package version.

@@ -12,10 +12,11 @@ use super::capability::{
 use super::commands::{
     COREUTILS_ASSET, WasmCommandOutput, WasmCommandRequest, is_supported_coreutils_command,
 };
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use wasmer::sys::{BaseTunables, Cranelift, EngineBuilder, NativeEngineExt};
 use wasmer::{Instance, Module, Store, imports};
 use wasmer_package::utils::from_bytes;
@@ -26,13 +27,14 @@ use wasmer_wasix::runners::wasi::{RuntimeOrEngine, WasiRunner};
 use wasmer_wasix::runtime::task_manager::tokio::TokioTaskManager;
 use wasmer_wasix::virtual_fs::{ArcFile, AsyncReadExt, AsyncSeekExt, BufferFile, NullFile};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 /// Wasmer-backed WASM runtime used by Jux tools.
 ///
 /// The runtime is intentionally configured through `WasmerRuntimeCapabilities`
 /// instead of accepting raw Wasmer builder options from callers.
 pub struct WasmerRuntime {
     capabilities: WasmerRuntimeCapabilities,
+    package_sessions: Arc<Mutex<HashMap<WasiPackageSessionKey, Arc<WasiPackageSession>>>>,
 }
 
 impl WasmerRuntime {
@@ -43,7 +45,10 @@ impl WasmerRuntime {
 
     #[must_use]
     pub fn with_capabilities(capabilities: WasmerRuntimeCapabilities) -> Self {
-        Self { capabilities }
+        Self {
+            capabilities,
+            package_sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     #[must_use]
@@ -87,8 +92,36 @@ impl WasmerRuntime {
         asset: &WasmAsset,
         request: WasmCommandRequest,
     ) -> Result<WasmCommandOutput, WasmRuntimeError> {
-        let package_bytes = load_wasm_asset(asset)?;
-        run_webc_command(package_bytes, request, self.capabilities.clone())
+        let session = self.wasi_package_session(asset)?;
+        run_webc_command(session, request, self.capabilities.clone())
+    }
+
+    fn wasi_package_session(
+        &self,
+        asset: &WasmAsset,
+    ) -> Result<Arc<WasiPackageSession>, WasmRuntimeError> {
+        let key = WasiPackageSessionKey::from(asset);
+        let mut package_sessions = self
+            .package_sessions
+            .lock()
+            .map_err(|_| WasmRuntimeError::Run("wasm package session lock poisoned".to_owned()))?;
+
+        if let Some(session) = package_sessions.get(&key) {
+            return Ok(Arc::clone(session));
+        }
+
+        let session = Arc::new(load_wasi_package_session(asset, &self.capabilities)?);
+        package_sessions.insert(key, Arc::clone(&session));
+        Ok(session)
+    }
+}
+
+impl fmt::Debug for WasmerRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WasmerRuntime")
+            .field("capabilities", &self.capabilities)
+            .finish_non_exhaustive()
     }
 }
 
@@ -105,8 +138,24 @@ fn load_wasm_asset(asset: &WasmAsset) -> Result<Vec<u8>, WasmRuntimeError> {
     fs::read(&package_path).map_err(|source| WasmRuntimeError::Io(source.to_string()))
 }
 
+fn load_wasi_package_session(
+    asset: &WasmAsset,
+    capabilities: &WasmerRuntimeCapabilities,
+) -> Result<WasiPackageSession, WasmRuntimeError> {
+    let package_bytes = load_wasm_asset(asset)?;
+    let tokio_runtime = build_tokio_runtime()?;
+    let runtime = Arc::new(build_wasix_runtime(&tokio_runtime, capabilities)?);
+    let package = load_webc_package(&tokio_runtime, package_bytes, runtime.as_ref())?;
+
+    Ok(WasiPackageSession {
+        tokio_runtime,
+        runtime,
+        package,
+    })
+}
+
 fn run_webc_command(
-    package_bytes: Vec<u8>,
+    session: Arc<WasiPackageSession>,
     request: WasmCommandRequest,
     capabilities: WasmerRuntimeCapabilities,
 ) -> Result<WasmCommandOutput, WasmRuntimeError> {
@@ -119,11 +168,10 @@ fn run_webc_command(
         stdout: stdout.clone(),
         stderr: stderr.clone(),
     };
-    let thread_output = std::thread::spawn(move || {
-        run_webc_command_in_thread(package_bytes, invocation, capabilities)
-    })
-    .join()
-    .map_err(|_| WasmRuntimeError::Run("wasi command thread panicked".to_owned()))?;
+    let thread_output =
+        std::thread::spawn(move || run_webc_command_in_thread(session, invocation, capabilities))
+            .join()
+            .map_err(|_| WasmRuntimeError::Run("wasi command thread panicked".to_owned()))?;
     let command_result = thread_output?;
 
     Ok(WasmCommandOutput {
@@ -135,18 +183,17 @@ fn run_webc_command(
 }
 
 fn run_webc_command_in_thread(
-    package_bytes: Vec<u8>,
+    session: Arc<WasiPackageSession>,
     invocation: WasiCommandInvocation,
     capabilities: WasmerRuntimeCapabilities,
 ) -> Result<WasiCommandResult, WasmRuntimeError> {
-    let tokio_runtime = build_tokio_runtime()?;
-    let runtime = build_wasix_runtime(&tokio_runtime, &capabilities)?;
-    let package = load_webc_package(&tokio_runtime, package_bytes, &runtime)?;
     let mut stdout = invocation.stdout.clone();
     let mut stderr = invocation.stderr.clone();
-    let result = run_wasi_command(&tokio_runtime, runtime, package, invocation, &capabilities);
-    let stdout = read_virtual_file(&tokio_runtime, &mut stdout).map_err(WasmRuntimeError::Io)?;
-    let stderr = read_virtual_file(&tokio_runtime, &mut stderr).map_err(WasmRuntimeError::Io)?;
+    let result = run_wasi_command(&session, invocation, &capabilities);
+    let stdout =
+        read_virtual_file(&session.tokio_runtime, &mut stdout).map_err(WasmRuntimeError::Io)?;
+    let stderr =
+        read_virtual_file(&session.tokio_runtime, &mut stderr).map_err(WasmRuntimeError::Io)?;
     let exit_code = match result {
         Ok(()) => 0,
         Err(error) => {
@@ -200,6 +247,29 @@ pub(super) struct WasiCommandInvocation {
     stderr: ArcFile<BufferFile>,
 }
 
+struct WasiPackageSession {
+    tokio_runtime: tokio::runtime::Runtime,
+    runtime: Arc<PluggableRuntime>,
+    package: BinaryPackage,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WasiPackageSessionKey {
+    package: &'static str,
+    version: &'static str,
+    filename: &'static str,
+}
+
+impl From<&WasmAsset> for WasiPackageSessionKey {
+    fn from(asset: &WasmAsset) -> Self {
+        Self {
+            package: asset.package,
+            version: asset.version,
+            filename: asset.filename,
+        }
+    }
+}
+
 struct WasiCommandResult {
     exit_code: i32,
     stdout: String,
@@ -207,13 +277,11 @@ struct WasiCommandResult {
 }
 
 fn run_wasi_command(
-    tokio_runtime: &tokio::runtime::Runtime,
-    runtime: PluggableRuntime,
-    package: BinaryPackage,
+    session: &WasiPackageSession,
     invocation: WasiCommandInvocation,
     capabilities: &WasmerRuntimeCapabilities,
 ) -> Result<(), anyhow::Error> {
-    let _guard = tokio_runtime.enter();
+    let _guard = session.tokio_runtime.enter();
     let mut runner = WasiRunner::new();
     runner
         .with_args(invocation.args)
@@ -225,8 +293,8 @@ fn run_wasi_command(
 
     runner.run_command(
         &invocation.program,
-        &package,
-        RuntimeOrEngine::Runtime(Arc::new(runtime)),
+        &session.package,
+        RuntimeOrEngine::Runtime(session.runtime.clone()),
     )
 }
 

@@ -7,6 +7,8 @@
 use super::assets::WasmAsset;
 use std::path::PathBuf;
 
+const COREUTILS_TOOL_ID: &str = "coreutils";
+
 pub(super) const COREUTILS_ASSET: WasmAsset = WasmAsset {
     package: "wasmer/coreutils",
     version: "1.0.25",
@@ -15,112 +17,117 @@ pub(super) const COREUTILS_ASSET: WasmAsset = WasmAsset {
     relative_dir: "coreutils",
 };
 
-const COREUTILS_COMMANDS: &[&str] = &[
-    "arch",
-    "base32",
-    "base64",
-    "baseenc",
-    "basename",
-    "cat",
-    "chcon",
-    "chgrp",
-    "chmod",
-    "chown",
-    "chroot",
-    "cksum",
-    "comm",
-    "cp",
-    "csplit",
-    "cut",
-    "date",
-    "dd",
-    "df",
-    "dircolors",
-    "dirname",
-    "du",
-    "echo",
-    "env",
-    "expand",
-    "expr",
-    "factor",
-    "false",
-    "fmt",
-    "fold",
-    "groups",
-    "hashsum",
-    "head",
-    "hostid",
-    "hostname",
-    "id",
-    "install",
-    "join",
-    "kill",
-    "link",
-    "ln",
-    "logname",
-    "ls",
-    "mkdir",
-    "mkfifo",
-    "mknod",
-    "mktemp",
-    "more",
-    "mv",
-    "nice",
-    "nl",
-    "nohup",
-    "nproc",
-    "numfmt",
-    "od",
-    "paste",
-    "pathchk",
-    "pinky",
-    "pr",
-    "printenv",
-    "printf",
-    "ptx",
-    "pwd",
-    "readlink",
-    "realpath",
-    "relpath",
-    "rm",
-    "rmdir",
-    "runcon",
-    "seq",
-    "shred",
-    "shuf",
-    "sleep",
-    "sort",
-    "split",
-    "stat",
-    "stdbuf",
-    "sum",
-    "sync",
-    "tac",
-    "tail",
-    "tee",
-    "test",
-    "timeout",
-    "touch",
-    "tr",
-    "true",
-    "truncate",
-    "tsort",
-    "tty",
-    "uname",
-    "unexpand",
-    "uniq",
-    "unlink",
-    "uptime",
-    "users",
-    "wc",
-    "who",
-    "whoami",
-    "yes",
+const WASM_COMMANDS: &[WasmCommandDefinition] = &[
+    coreutils_command("arch"),
+    coreutils_command("base32"),
+    coreutils_command("base64"),
+    coreutils_command("basename"),
+    coreutils_command("cat"),
+    coreutils_command("cksum"),
+    coreutils_command("comm"),
+    coreutils_command("cp"),
+    coreutils_command("csplit"),
+    coreutils_command("cut"),
+    coreutils_command("date"),
+    coreutils_command("dircolors"),
+    coreutils_command("dirname"),
+    coreutils_command("echo"),
+    coreutils_command("env"),
+    coreutils_command("expand"),
+    coreutils_command("factor"),
+    coreutils_command("false"),
+    coreutils_command("fmt"),
+    coreutils_command("fold"),
+    coreutils_command("hashsum"),
+    coreutils_command("head"),
+    coreutils_command("join"),
+    coreutils_command("link"),
+    coreutils_command("ln"),
+    coreutils_command("ls"),
+    coreutils_command("md5sum"),
+    coreutils_command("mkdir"),
+    coreutils_command("mktemp"),
+    coreutils_command("mv"),
+    coreutils_command("nl"),
+    coreutils_command("nproc"),
+    coreutils_command("numfmt"),
+    coreutils_command("od"),
+    coreutils_command("paste"),
+    coreutils_command("printenv"),
+    coreutils_command("printf"),
+    coreutils_command("ptx"),
+    coreutils_command("pwd"),
+    coreutils_command("readlink"),
+    coreutils_command("realpath"),
+    coreutils_command("relpath"),
+    coreutils_command("rm"),
+    coreutils_command("rmdir"),
+    coreutils_command("seq"),
+    coreutils_command("sha1sum"),
+    coreutils_command("sha224sum"),
+    coreutils_command("sha256sum"),
+    coreutils_command("sha3-224sum"),
+    coreutils_command("sha3-256sum"),
+    coreutils_command("sha3-384sum"),
+    coreutils_command("sha3-512sum"),
+    coreutils_command("sha384sum"),
+    coreutils_command("sha3sum"),
+    coreutils_command("sha512sum"),
+    coreutils_command("shake128sum"),
+    coreutils_command("shake256sum"),
+    coreutils_command("shred"),
+    coreutils_command("shuf"),
+    coreutils_command("sleep"),
+    coreutils_command("sum"),
+    coreutils_command("tee"),
+    coreutils_command("touch"),
+    coreutils_command("tr"),
+    coreutils_command("true"),
+    coreutils_command("truncate"),
+    coreutils_command("tsort"),
+    coreutils_command("unexpand"),
+    coreutils_command("uniq"),
+    coreutils_command("unlink"),
+    coreutils_command("wc"),
+    coreutils_command("yes"),
 ];
+
+const fn coreutils_command(program: &'static str) -> WasmCommandDefinition {
+    WasmCommandDefinition {
+        tool_id: COREUTILS_TOOL_ID,
+        program,
+    }
+}
+
+/// Command entry that can be exposed to the LLM.
+///
+/// The command catalog intentionally contains command names, not usage
+/// instructions. The system prompt can list these names while relying on common
+/// command knowledge and tool-call errors for command-specific behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WasmCommandDefinition {
+    pub tool_id: &'static str,
+    pub program: &'static str,
+}
+
+#[must_use]
+pub fn available_wasm_commands() -> &'static [WasmCommandDefinition] {
+    WASM_COMMANDS
+}
+
+#[must_use]
+pub fn available_wasm_command_names() -> Vec<&'static str> {
+    WASM_COMMANDS
+        .iter()
+        .map(|command| command.program)
+        .collect()
+}
 
 #[must_use]
 pub(super) fn is_supported_coreutils_command(program: &str) -> bool {
-    COREUTILS_COMMANDS.contains(&program)
+    WASM_COMMANDS
+        .iter()
+        .any(|command| command.tool_id == COREUTILS_TOOL_ID && command.program == program)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
