@@ -1,20 +1,20 @@
 //! Core library for the Jux agent runtime.
 
 mod ids;
+mod main_loop;
 mod model;
-mod orchestrator;
 mod store;
 mod time;
-mod wasm;
+mod tools;
 
 pub use ids::{RunId, SessionId, StepId, WorkspaceId};
+pub use main_loop::{RunLoop, RunLoopError, RunLoopOutput, SYSTEM_PROMPT};
 pub use model::{
     AssistantResponseItem, LlmUsage, Run, RunStatus, Session, SessionContextItem,
     SessionContextKind, SessionContextPayload, Step, StepKind, StepPayload, Workspace,
 };
-pub use orchestrator::{RunLoop, RunLoopError, RunLoopOutput, SYSTEM_PROMPT};
 pub use store::{SqliteWorkspaceStore, StoreError};
-pub use wasm::{
+pub use tools::wasm::{
     WasmCommandDefinition, WasmCommandOutput, WasmCommandRequest, WasmEnvironmentCapability,
     WasmEnvironmentPermission, WasmFilesystemCapability, WasmFilesystemPermission,
     WasmNetworkCapability, WasmNetworkPermission, WasmPackageLoadingCapability, WasmPermissions,

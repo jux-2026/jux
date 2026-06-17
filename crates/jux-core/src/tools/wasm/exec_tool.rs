@@ -1,5 +1,5 @@
 use super::{WasmCommandRequest, WasmerRuntime, available_wasm_command_names};
-use crate::orchestrator::JuxTool;
+use crate::tools::JuxTool;
 use rig::completion::ToolDefinition;
 use serde::Deserialize;
 use serde::Serialize;
