@@ -6,12 +6,6 @@ use serde::Serialize;
 use serde_json::json;
 
 const EXEC_TOOL_NAME: &str = "exec";
-const EXEC_TOOL_DESCRIPTION_PREFIX: &str = "Execute one command from the Jux WASI runtime. \
-Provide the command name in program and each argument as a separate string in args. \
-Available commands: ";
-const EXEC_TOOL_DESCRIPTION_SUFFIX: &str = ". Do not use shell syntax such as &&, \
-||, ;, |, >, <, backticks, $(), wildcard expansion, or newlines. The tool returns \
-structured execution data as JSON: success, exit_code, stdout, and stderr.";
 
 #[must_use]
 pub(crate) fn exec_tool() -> WasmExecTool {
@@ -28,7 +22,14 @@ impl JuxTool for WasmExecTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: EXEC_TOOL_NAME.to_owned(),
-            description: exec_tool_description(),
+            description: format!(
+                "Execute one command from the Jux WASI runtime. Provide the command name in \
+                program and each argument as a separate string in args. Available commands: {}. \
+                Do not use shell syntax such as &&, ||, ;, |, >, <, backticks, $(), wildcard \
+                expansion, or newlines. The tool returns structured execution data as JSON: \
+                success, exit_code, stdout, and stderr.",
+                available_wasm_command_names().join(", ")
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -53,21 +54,12 @@ impl JuxTool for WasmExecTool {
 }
 
 pub(crate) fn run_exec_command_line(command: &str) -> Result<WasmCommandExecution, String> {
-    reject_shell_command(command)?;
+    reject_shell_token(command)?;
     let parts = shlex::split(command).ok_or_else(|| "invalid command syntax".to_owned())?;
     let (program, args) = parts
         .split_first()
         .ok_or_else(|| "command cannot be empty".to_owned())?;
     run_exec_command(program, args)
-}
-
-fn exec_tool_description() -> String {
-    format!(
-        "{}{}{}",
-        EXEC_TOOL_DESCRIPTION_PREFIX,
-        available_wasm_command_names().join(", "),
-        EXEC_TOOL_DESCRIPTION_SUFFIX
-    )
 }
 
 fn run_exec_command(program: &str, args: &[String]) -> Result<WasmCommandExecution, String> {
@@ -102,10 +94,6 @@ fn run_exec_command_in_thread(
         stdout: output.stdout,
         stderr: output.stderr,
     })
-}
-
-fn reject_shell_command(command: &str) -> Result<(), String> {
-    reject_shell_token(command)
 }
 
 fn reject_shell_token(value: &str) -> Result<(), String> {
