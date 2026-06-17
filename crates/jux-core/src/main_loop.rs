@@ -46,19 +46,56 @@ where
         let run = self.start_run(request)?;
 
         for _ in 0..MAX_LOOP_ITERATIONS {
-            let iteration = match self.run_iteration(&run).await {
-                Ok(iteration) => iteration,
-                Err(RunLoopIterationError::Store(error)) => return Err(error.into()),
-                Err(RunLoopIterationError::Completion(error)) => {
-                    return self.fail_completion_call(run, error);
+            let llm_request = match self.build_completion_request(&run) {
+                Ok(request) => request,
+                Err(RunLoopError::Store(error)) => return Err(error.into()),
+                Err(RunLoopError::Prompt { source, .. }) => {
+                    return self.fail_completion_call(run, *source);
                 }
-                Err(RunLoopIterationError::Runtime(message)) => {
+                Err(RunLoopError::Runtime { message, .. }) => {
                     return self.fail_runtime(run, message);
                 }
             };
+            let history_len = llm_request.history.len();
+            tracing::debug!(run_id = %run.id, history_len, "built llm completion request");
 
-            if iteration.tool_calls.is_empty() {
-                return self.complete_run(run, iteration.final_answer);
+            let request = self
+                .model
+                .completion_request(llm_request.prompt)
+                .messages(llm_request.history)
+                .tools(llm_request.tools)
+                .build();
+            let response = match self.model.completion(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    return self.fail_completion_call(run, error);
+                }
+            };
+            let assistant_turn = match assistant_turn_from_response(response.choice) {
+                Ok(assistant_turn) => assistant_turn,
+                Err(message) => {
+                    return self.fail_runtime(run, message);
+                }
+            };
+            let AssistantTurn {
+                final_answer,
+                tool_calls,
+                items,
+            } = assistant_turn;
+
+            self.record_assistant_response(
+                &run,
+                response.message_id,
+                LlmUsage::from(response.usage),
+                items,
+            )?;
+
+            if tool_calls.is_empty() {
+                return self.complete_run(run, final_answer);
+            }
+
+            for tool_call in &tool_calls {
+                self.execute_tool_call(&run, tool_call)?;
             }
         }
 
@@ -82,40 +119,6 @@ where
         Ok(run)
     }
 
-    async fn run_iteration(&self, run: &Run) -> Result<RunLoopIteration, RunLoopIterationError> {
-        let llm_request = self
-            .build_completion_request(run)
-            .map_err(RunLoopIterationError::from_run_loop_error)?;
-        let history_len = llm_request.history.len();
-        tracing::debug!(run_id = %run.id, history_len, "built llm completion request");
-
-        let request = self
-            .model
-            .completion_request(llm_request.prompt)
-            .messages(llm_request.history)
-            .tools(llm_request.tools)
-            .build();
-        let response = self
-            .model
-            .completion(request)
-            .await
-            .map_err(RunLoopIterationError::Completion)?;
-        let assistant_turn = assistant_turn_from_response(response.choice)?;
-
-        self.record_assistant_response(
-            run,
-            response.message_id,
-            LlmUsage::from(response.usage),
-            assistant_turn.items,
-        )?;
-        self.execute_tool_calls(run, &assistant_turn.tool_calls)?;
-
-        Ok(RunLoopIteration {
-            final_answer: assistant_turn.final_answer,
-            tool_calls: assistant_turn.tool_calls,
-        })
-    }
-
     fn record_assistant_response(
         &self,
         run: &Run,
@@ -132,17 +135,6 @@ where
                 items,
             },
         )?;
-        Ok(())
-    }
-
-    fn execute_tool_calls(
-        &self,
-        run: &Run,
-        tool_calls: &[AssistantResponseItem],
-    ) -> Result<(), StoreError> {
-        for tool_call in tool_calls {
-            self.execute_tool_call(run, tool_call)?;
-        }
         Ok(())
     }
 
@@ -289,33 +281,6 @@ where
     }
 }
 
-struct RunLoopIteration {
-    final_answer: String,
-    tool_calls: Vec<AssistantResponseItem>,
-}
-
-enum RunLoopIterationError {
-    Store(StoreError),
-    Completion(CompletionError),
-    Runtime(String),
-}
-
-impl RunLoopIterationError {
-    fn from_run_loop_error(error: RunLoopError) -> Self {
-        match error {
-            RunLoopError::Store(error) => Self::Store(error),
-            RunLoopError::Prompt { source, .. } => Self::Completion(*source),
-            RunLoopError::Runtime { message, .. } => Self::Runtime(message),
-        }
-    }
-}
-
-impl From<StoreError> for RunLoopIterationError {
-    fn from(error: StoreError) -> Self {
-        Self::Store(error)
-    }
-}
-
 struct AssistantTurn {
     final_answer: String,
     tool_calls: Vec<AssistantResponseItem>,
@@ -324,7 +289,7 @@ struct AssistantTurn {
 
 fn assistant_turn_from_response(
     content: OneOrMany<AssistantContent>,
-) -> Result<AssistantTurn, RunLoopIterationError> {
+) -> Result<AssistantTurn, String> {
     let mut final_answer = String::new();
     let mut tool_calls = Vec::new();
     let mut items = Vec::new();
@@ -352,9 +317,7 @@ fn assistant_turn_from_response(
                 }
             }
             AssistantContent::Image(_) => {
-                return Err(RunLoopIterationError::Runtime(
-                    "LLM returned an unsupported image response".to_owned(),
-                ));
+                return Err("LLM returned an unsupported image response".to_owned());
             }
         }
     }
