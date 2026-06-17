@@ -76,10 +76,21 @@ fn run_exec_command(program: &str, args: &[String]) -> Result<WasmCommandExecuti
         reject_shell_token(arg)?;
     }
 
+    let program = program.to_owned();
+    let args = args.to_vec();
+    std::thread::spawn(move || run_exec_command_in_thread(program, args))
+        .join()
+        .map_err(|_| "wasi coreutils execution thread panicked".to_owned())?
+}
+
+fn run_exec_command_in_thread(
+    program: String,
+    args: Vec<String>,
+) -> Result<WasmCommandExecution, String> {
     let output = WasmerRuntime::new()
         .run_coreutils_command(WasmCommandRequest {
-            program: program.to_owned(),
-            args: args.to_vec(),
+            program,
+            args,
             host_directory: std::env::current_dir()
                 .map_err(|error| format!("current directory cannot be loaded: {error}"))?,
         })

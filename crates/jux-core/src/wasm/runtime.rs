@@ -142,6 +142,18 @@ fn load_wasi_package_session(
     asset: &WasmAsset,
     capabilities: &WasmerRuntimeCapabilities,
 ) -> Result<WasiPackageSession, WasmRuntimeError> {
+    let asset = *asset;
+    let capabilities = capabilities.clone();
+
+    std::thread::spawn(move || load_wasi_package_session_in_thread(&asset, &capabilities))
+        .join()
+        .map_err(|_| WasmRuntimeError::Run("wasi package session thread panicked".to_owned()))?
+}
+
+fn load_wasi_package_session_in_thread(
+    asset: &WasmAsset,
+    capabilities: &WasmerRuntimeCapabilities,
+) -> Result<WasiPackageSession, WasmRuntimeError> {
     let package_bytes = load_wasm_asset(asset)?;
     let tokio_runtime = build_tokio_runtime()?;
     let runtime = Arc::new(build_wasix_runtime(&tokio_runtime, capabilities)?);

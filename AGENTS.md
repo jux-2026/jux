@@ -78,7 +78,11 @@ git config core.hooksPath .githooks
 - Do not pass business data through unstructured JSON, dynamic maps, or string protocols.
 - Keep the CLI crate as an adapter over core behavior.
 - Prefer small, verifiable changes with tests.
-- Keep unit tests in a `tests.rs` file in the same directory as the code under test.
+- Keep Rust tests under each crate's `tests/` directory instead of embedding test modules in `src/`.
+- Mirror the source tree in the crate's `tests/` directory. A source file such as `src/main.rs` should have `tests/test_main.rs`; `src/wasm/runtime.rs` should have `tests/wasm/test_runtime.rs`.
+- Use a `test_` prefix for every Rust test file, including nested test modules.
+- For source module files that only load submodules, such as `src/wasm/mod.rs`, keep a matching test entry file such as `tests/test_wasm.rs` that declares the nested test modules.
+- Keep test files focused on the corresponding source file. Shared test helpers should stay local to the smallest test module that needs them unless duplication becomes meaningful.
 - Use `tracing` for diagnostics and structured logs. Initialize `tracing-subscriber` in application crates, keep logs on stderr, and keep user-facing command output on stdout.
 - Keep `make quick-check` passing before committing.
 - Keep `make check` passing before pushing or merging.

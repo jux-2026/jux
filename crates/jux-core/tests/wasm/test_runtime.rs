@@ -1,12 +1,8 @@
-use super::capability::{
-    WasmEnvironmentCapability, WasmFilesystemCapability, WasmNetworkCapability,
-    WasmPackageLoadingCapability, WasmStdioCapability, WasmerRuntimeCapabilities,
+use jux_core::{
+    WasmCommandRequest, WasmEnvironmentCapability, WasmFilesystemCapability, WasmNetworkCapability,
+    WasmPackageLoadingCapability, WasmRuntimeError, WasmStdioCapability, WasmerRuntime,
+    WasmerRuntimeCapabilities,
 };
-use super::commands::WasmCommandRequest;
-use super::permissions::{
-    WasmEnvironmentPermission, WasmFilesystemPermission, WasmNetworkPermission, WasmPermissions,
-};
-use super::runtime::{WasmRuntimeError, WasmerRuntime};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
@@ -60,26 +56,6 @@ fn wasmer_runtime_exposes_default_capabilities() {
         &WasmerRuntimeCapabilities {
             filesystem: WasmFilesystemCapability::MappedHostDirectory,
             environment: WasmEnvironmentCapability::Isolated,
-            stdio: WasmStdioCapability::Buffered,
-            network: WasmNetworkCapability::HttpClient,
-            package_loading: WasmPackageLoadingCapability::BuiltinWithHttpClient,
-        }
-    );
-}
-
-#[test]
-fn wasm_permissions_convert_to_wasmer_runtime_capabilities() {
-    let capabilities = WasmerRuntimeCapabilities::from(WasmPermissions {
-        filesystem: WasmFilesystemPermission::HostDirectoryMapping,
-        environment: WasmEnvironmentPermission::ForwardHost,
-        network: WasmNetworkPermission::HttpClient,
-    });
-
-    assert_eq!(
-        capabilities,
-        WasmerRuntimeCapabilities {
-            filesystem: WasmFilesystemCapability::MappedHostDirectory,
-            environment: WasmEnvironmentCapability::ForwardHost,
             stdio: WasmStdioCapability::Buffered,
             network: WasmNetworkCapability::HttpClient,
             package_loading: WasmPackageLoadingCapability::BuiltinWithHttpClient,

@@ -17,9 +17,6 @@ mod exec_tool;
 mod permissions;
 mod runtime;
 
-#[cfg(test)]
-mod tests;
-
 pub use self::capability::{
     WasmEnvironmentCapability, WasmFilesystemCapability, WasmNetworkCapability,
     WasmPackageLoadingCapability, WasmStdioCapability, WasmerRuntimeCapabilities,
