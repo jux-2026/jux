@@ -11,13 +11,19 @@ pub(crate) trait JuxTool {
     fn definition(&self) -> ToolDefinition;
     fn execute(
         &self,
-        context: &ToolExecutionContext<'_>,
+        context: &dyn ToolExecutionContext,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, String>;
 }
 
-pub(crate) struct ToolExecutionContext<'a> {
-    pub policy: &'a RuntimePolicy,
+pub(crate) trait ToolExecutionContext {
+    fn policy(&self) -> &RuntimePolicy;
+}
+
+impl ToolExecutionContext for RuntimePolicy {
+    fn policy(&self) -> &RuntimePolicy {
+        self
+    }
 }
 
 pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
@@ -25,7 +31,7 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
 }
 
 pub(crate) fn execute_tool(
-    context: &ToolExecutionContext<'_>,
+    context: &dyn ToolExecutionContext,
     tool_name: &str,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {

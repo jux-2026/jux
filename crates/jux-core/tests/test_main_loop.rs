@@ -1,6 +1,7 @@
 use jux_core::{
-    AssistantResponseItem, LlmUsage, RunLoop, RunLoopError, RunStatus, SYSTEM_PROMPT,
-    SessionContextKind, SessionContextPayload, SqliteWorkspaceStore, StepKind, StepPayload,
+    AssistantResponseItem, LlmUsage, RunLoop, RunLoopContext, RunLoopError, RunStatus,
+    RuntimePolicy, SYSTEM_PROMPT, SessionContextKind, SessionContextPayload, SqliteWorkspaceStore,
+    StepKind, StepPayload,
 };
 use rig::OneOrMany;
 use rig::completion::{
@@ -139,9 +140,9 @@ fn run_loop_records_reasoning_without_sending_it_back_to_llm() {
 }
 #[test]
 fn run_loop_executes_exec_tool_call_and_returns_structured_output() {
-    let workspace_root = temp_workspace_root();
-    std::fs::write(workspace_root.join("hello.txt"), "hello").expect("fixture file is written");
-    let store = SqliteWorkspaceStore::new(workspace_root);
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let execution_root = temp_workspace_root();
+    std::fs::write(execution_root.join("hello.txt"), "hello").expect("fixture file is written");
     let model = TestModel::responses([
         Ok(vec![AssistantContent::ToolCall(test_tool_call(
             "call_1",
@@ -150,7 +151,9 @@ fn run_loop_executes_exec_tool_call_and_returns_structured_output() {
         ))]),
         Ok(vec![AssistantContent::text("Exec returned hello")]),
     ]);
-    let run_loop = RunLoop::new(store.clone(), model.clone());
+    let policy = RuntimePolicy::workspace_default(execution_root);
+    let context = RunLoopContext::new(store.clone(), model.clone(), policy);
+    let run_loop = RunLoop::with_context(context);
 
     let output = futures::executor::block_on(run_loop.run("Use the exec tool".to_owned()))
         .expect("run loop succeeds");

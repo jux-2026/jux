@@ -17,6 +17,28 @@ mod exec_tool;
 mod permissions;
 mod runtime;
 
+use crate::WasmSandboxPolicy;
+use crate::tools::ToolExecutionContext;
+use std::path::Path;
+
+pub(crate) trait WasmExecutionContext {
+    fn wasm_policy(&self) -> &WasmSandboxPolicy;
+    fn workspace_root(&self) -> &Path;
+}
+
+impl<T> WasmExecutionContext for T
+where
+    T: ToolExecutionContext + ?Sized,
+{
+    fn wasm_policy(&self) -> &WasmSandboxPolicy {
+        &self.policy().wasm
+    }
+
+    fn workspace_root(&self) -> &Path {
+        self.policy().workspace_root.as_path()
+    }
+}
+
 pub use self::capability::{
     WasmEnvironmentCapability, WasmFilesystemCapability, WasmNetworkCapability,
     WasmPackageLoadingCapability, WasmStdioCapability, WasmerRuntimeCapabilities,

@@ -44,12 +44,12 @@ impl JuxTool for LuaTool {
 
     fn execute(
         &self,
-        context: &ToolExecutionContext<'_>,
+        context: &dyn ToolExecutionContext,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let args = serde_json::from_value::<LuaToolArgs>(args.clone())
             .map_err(|error| format!("invalid lua tool arguments: {error}"))?;
-        execute_lua(&args.code, context.policy)
+        execute_lua(&args.code, context.policy())
     }
 }
 

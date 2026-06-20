@@ -9,7 +9,7 @@ mod time;
 mod tools;
 
 pub use ids::{RunId, SessionId, StepId, WorkspaceId};
-pub use main_loop::{RunLoop, RunLoopError, RunLoopOutput, SYSTEM_PROMPT};
+pub use main_loop::{RunLoop, RunLoopContext, RunLoopError, RunLoopOutput, SYSTEM_PROMPT};
 pub use model::{
     AssistantResponseItem, LlmUsage, Run, RunStatus, Session, SessionContextItem,
     SessionContextKind, SessionContextPayload, Step, StepKind, StepPayload, Workspace,

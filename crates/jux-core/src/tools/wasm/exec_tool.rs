@@ -1,5 +1,7 @@
-use super::{WasmCommandRequest, WasmerRuntime, available_wasm_command_names};
-use crate::RuntimePolicy;
+use super::{
+    WasmCommandRequest, WasmExecutionContext, WasmerRuntime, available_wasm_command_names,
+};
+use crate::WasmSandboxPolicy;
 use crate::tools::{JuxTool, ToolExecutionContext};
 use rig::completion::ToolDefinition;
 use serde::Deserialize;
@@ -47,34 +49,40 @@ impl JuxTool for WasmExecTool {
 
     fn execute(
         &self,
-        context: &ToolExecutionContext<'_>,
+        context: &dyn ToolExecutionContext,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let args = serde_json::from_value::<ExecToolArgs>(args.clone())
             .map_err(|error| format!("invalid exec tool arguments: {error}"))?;
-        let output = run_exec_command(&args.program, &args.args, context.policy)?;
+        let output = run_exec_command(&args.program, &args.args, context)?;
         serde_json::to_value(ExecToolOutput::from(output))
             .map_err(|error| format!("exec output serialization failed: {error}"))
     }
 }
 
-pub(crate) fn run_exec_command_line(
+pub(crate) fn run_exec_command_line<C>(
     command: &str,
-    policy: &RuntimePolicy,
-) -> Result<WasmCommandExecution, String> {
+    context: &C,
+) -> Result<WasmCommandExecution, String>
+where
+    C: WasmExecutionContext + ?Sized,
+{
     reject_shell_token(command)?;
     let parts = shlex::split(command).ok_or_else(|| "invalid command syntax".to_owned())?;
     let (program, args) = parts
         .split_first()
         .ok_or_else(|| "command cannot be empty".to_owned())?;
-    run_exec_command(program, args, policy)
+    run_exec_command(program, args, context)
 }
 
-fn run_exec_command(
+fn run_exec_command<C>(
     program: &str,
     args: &[String],
-    policy: &RuntimePolicy,
-) -> Result<WasmCommandExecution, String> {
+    context: &C,
+) -> Result<WasmCommandExecution, String>
+where
+    C: WasmExecutionContext + ?Sized,
+{
     reject_shell_token(program)?;
     for arg in args {
         reject_shell_token(arg)?;
@@ -82,22 +90,26 @@ fn run_exec_command(
 
     let program = program.to_owned();
     let args = args.to_vec();
-    let policy = policy.clone();
-    std::thread::spawn(move || run_exec_command_in_thread(program, args, policy))
-        .join()
-        .map_err(|_| "wasi coreutils execution thread panicked".to_owned())?
+    let wasm_policy = context.wasm_policy().clone();
+    let host_directory = context.workspace_root().to_path_buf();
+    std::thread::spawn(move || {
+        run_exec_command_in_thread(program, args, wasm_policy, host_directory)
+    })
+    .join()
+    .map_err(|_| "wasi coreutils execution thread panicked".to_owned())?
 }
 
 fn run_exec_command_in_thread(
     program: String,
     args: Vec<String>,
-    policy: RuntimePolicy,
+    wasm_policy: WasmSandboxPolicy,
+    host_directory: std::path::PathBuf,
 ) -> Result<WasmCommandExecution, String> {
-    let output = WasmerRuntime::with_wasm_policy(&policy.wasm)
+    let output = WasmerRuntime::with_wasm_policy(&wasm_policy)
         .run_coreutils_command(WasmCommandRequest {
             program,
             args,
-            host_directory: policy.workspace_root,
+            host_directory,
         })
         .map_err(|error| format!("wasi coreutils execution failed: {error}"))?;
 

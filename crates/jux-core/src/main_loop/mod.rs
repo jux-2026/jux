@@ -1,10 +1,13 @@
+mod context;
+
+pub use self::context::RunLoopContext;
+
 use crate::model::{
     AssistantResponseItem, LlmUsage, Run, RunStatus, Session, SessionContextKind,
     SessionContextPayload, Step, StepKind, StepPayload, Workspace,
 };
-use crate::policy::RuntimePolicy;
 use crate::store::{SqliteWorkspaceStore, StoreError};
-use crate::tools::{ToolExecutionContext, execute_tool, tool_definitions};
+use crate::tools::{execute_tool, tool_definitions};
 use rig::OneOrMany;
 use rig::completion::{CompletionError, CompletionModel, ToolDefinition, Usage};
 use rig::message::{
@@ -30,9 +33,7 @@ impl From<Usage> for LlmUsage {
 }
 
 pub struct RunLoop<M> {
-    store: SqliteWorkspaceStore,
-    model: M,
-    policy: RuntimePolicy,
+    context: RunLoopContext<M>,
 }
 
 impl<M> RunLoop<M>
@@ -41,17 +42,13 @@ where
 {
     #[must_use]
     pub fn new(store: SqliteWorkspaceStore, model: M) -> Self {
-        let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
-        Self::with_policy(store, model, policy)
+        let context = RunLoopContext::workspace_default(store, model);
+        Self::with_context(context)
     }
 
     #[must_use]
-    pub fn with_policy(store: SqliteWorkspaceStore, model: M, policy: RuntimePolicy) -> Self {
-        Self {
-            store,
-            model,
-            policy,
-        }
+    pub fn with_context(context: RunLoopContext<M>) -> Self {
+        Self { context }
     }
 
     pub async fn run(&self, request: String) -> Result<RunLoopOutput, RunLoopError> {
@@ -72,12 +69,13 @@ where
             tracing::debug!(run_id = %run.id, history_len, "built llm completion request");
 
             let request = self
+                .context
                 .model
                 .completion_request(llm_request.prompt)
                 .messages(llm_request.history)
                 .tools(llm_request.tools)
                 .build();
-            let response = match self.model.completion(request).await {
+            let response = match self.context.model.completion(request).await {
                 Ok(response) => response,
                 Err(error) => {
                     return self.fail_completion_call(run, error);
@@ -118,11 +116,12 @@ where
     }
 
     fn start_run(&self, request: String) -> Result<Run, RunLoopError> {
-        let run = self.store.create_run(request.clone())?;
+        let run = self.context.store.create_run(request.clone())?;
         tracing::info!(run_id = %run.id, "created run");
-        self.store
+        self.context
+            .store
             .ensure_session_context_items(&run.id.session_id(), default_session_context_items())?;
-        self.store.append_step(
+        self.context.store.append_step(
             &run.id,
             StepKind::UserMessage,
             StepPayload::UserMessage { content: request },
@@ -138,7 +137,7 @@ where
         usage: LlmUsage,
         items: Vec<AssistantResponseItem>,
     ) -> Result<(), StoreError> {
-        self.store.append_step(
+        self.context.store.append_step(
             &run.id,
             StepKind::AssistantResponse,
             StepPayload::AssistantResponse {
@@ -170,10 +169,7 @@ where
             "executing tool call"
         );
 
-        let context = ToolExecutionContext {
-            policy: &self.policy,
-        };
-        let content = match execute_tool(&context, name, arguments) {
+        let content = match execute_tool(&self.context, name, arguments) {
             Ok(output) => output,
             Err(error) => {
                 tracing::warn!(
@@ -188,7 +184,7 @@ where
                 })
             }
         };
-        self.store.append_step(
+        self.context.store.append_step(
             &run.id,
             StepKind::ToolResult,
             StepPayload::ToolResult {
@@ -202,11 +198,12 @@ where
 
     fn complete_run(&self, run: Run, answer: String) -> Result<RunLoopOutput, RunLoopError> {
         let run = self
+            .context
             .store
             .update_run_status(&run.id, RunStatus::Completed)?;
-        let workspace = self.store.load_workspace()?;
-        let session = self.store.load_session(&run.id.session_id())?;
-        let steps = self.store.load_run_steps(&run.id)?;
+        let workspace = self.context.store.load_workspace()?;
+        let session = self.context.store.load_session(&run.id.session_id())?;
+        let steps = self.context.store.load_run_steps(&run.id)?;
         tracing::info!(
             run_id = %run.id,
             step_count = steps.len(),
@@ -228,10 +225,14 @@ where
         error: CompletionError,
     ) -> Result<RunLoopOutput, RunLoopError> {
         let message = error.to_string();
-        self.store
+        self.context
+            .store
             .append_step(&run.id, StepKind::Error, StepPayload::Error { message })?;
 
-        let run = self.store.update_run_status(&run.id, RunStatus::Failed)?;
+        let run = self
+            .context
+            .store
+            .update_run_status(&run.id, RunStatus::Failed)?;
         tracing::error!(run_id = %run.id, "failed run");
         Err(RunLoopError::Prompt {
             run: Box::new(run),
@@ -241,7 +242,10 @@ where
 
     fn fail_runtime(&self, run: Run, message: String) -> Result<RunLoopOutput, RunLoopError> {
         self.record_runtime_error(&run, message.clone())?;
-        let run = self.store.update_run_status(&run.id, RunStatus::Failed)?;
+        let run = self
+            .context
+            .store
+            .update_run_status(&run.id, RunStatus::Failed)?;
         tracing::error!(run_id = %run.id, "failed run");
         Err(RunLoopError::Runtime {
             run: Box::new(run),
@@ -250,13 +254,15 @@ where
     }
 
     fn record_runtime_error(&self, run: &Run, message: String) -> Result<(), RunLoopError> {
-        self.store
+        self.context
+            .store
             .append_step(&run.id, StepKind::Error, StepPayload::Error { message })?;
         Ok(())
     }
 
     fn build_completion_request(&self, run: &Run) -> Result<LlmCompletionRequest, RunLoopError> {
         let context = self
+            .context
             .store
             .load_session_context_items(&run.id.session_id())?;
         let mut messages = context
@@ -272,7 +278,10 @@ where
                 message,
             })?;
 
-        let steps = self.store.load_session_steps(&run.id.session_id())?;
+        let steps = self
+            .context
+            .store
+            .load_session_steps(&run.id.session_id())?;
         messages.extend(
             steps
                 .iter()
