@@ -13,6 +13,7 @@ path = "src/lib.rs"
 anyhow.workspace = true
 futures.workspace = true
 mlua.workspace = true
+regex.workspace = true
 rig-core.workspace = true
 rusqlite.workspace = true
 reqwest.workspace = true

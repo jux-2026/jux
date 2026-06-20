@@ -3,6 +3,7 @@
 mod ids;
 mod main_loop;
 mod model;
+mod policy;
 mod store;
 mod time;
 mod tools;
@@ -12,6 +13,11 @@ pub use main_loop::{RunLoop, RunLoopError, RunLoopOutput, SYSTEM_PROMPT};
 pub use model::{
     AssistantResponseItem, LlmUsage, Run, RunStatus, Session, SessionContextItem,
     SessionContextKind, SessionContextPayload, Step, StepKind, StepPayload, Workspace,
+};
+pub use policy::{
+    NativeCommandPolicy, NativeCommandRule, RuntimePolicy, WasmEnvironmentPolicy,
+    WasmFilesystemPolicy, WasmHttpDecision, WasmHttpMatchKind, WasmHttpMethod, WasmHttpRule,
+    WasmHttpRuleEffect, WasmNetworkPolicy, WasmPackageRule, WasmPackageSource, WasmSandboxPolicy,
 };
 pub use store::{SqliteWorkspaceStore, StoreError};
 pub use tools::wasm::{

@@ -2041,6 +2041,7 @@ dependencies = [
  "anyhow",
  "futures",
  "mlua",
+ "regex",
  "reqwest 0.12.28",
  "rig-core",
  "rusqlite",
