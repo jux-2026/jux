@@ -48,6 +48,7 @@ fn runtime_policy_derives_wasm_capabilities() {
             environment: WasmEnvironmentCapability::Isolated,
             stdio: WasmStdioCapability::Buffered,
             network: WasmNetworkCapability::Disabled,
+            http_policy: None,
             package_loading: WasmPackageLoadingCapability::Builtin,
         }
     );
@@ -72,6 +73,7 @@ fn wasm_sandbox_policy_derives_disabled_wasmer_capabilities() {
             environment: WasmEnvironmentCapability::Isolated,
             stdio: WasmStdioCapability::Buffered,
             network: WasmNetworkCapability::Disabled,
+            http_policy: None,
             package_loading: WasmPackageLoadingCapability::Disabled,
         }
     );
@@ -149,6 +151,7 @@ fn wasm_network_policy_uses_ordered_http_rules() {
         },
         packages: Vec::new(),
     };
+    let expected_http_policy = policy.network.clone();
     let capabilities = WasmerRuntimeCapabilities::from(&policy);
 
     assert_eq!(
@@ -173,6 +176,7 @@ fn wasm_network_policy_uses_ordered_http_rules() {
         WasmHttpDecision::Deny
     );
     assert_eq!(capabilities.network, WasmNetworkCapability::HttpClient);
+    assert_eq!(capabilities.http_policy, Some(expected_http_policy));
 }
 
 #[test]

@@ -19,6 +19,7 @@ fn wasm_permissions_convert_to_wasmer_runtime_capabilities() {
             environment: WasmEnvironmentCapability::ForwardHost,
             stdio: WasmStdioCapability::Buffered,
             network: WasmNetworkCapability::HttpClient,
+            http_policy: None,
             package_loading: WasmPackageLoadingCapability::BuiltinWithHttpClient,
         }
     );

@@ -1,5 +1,6 @@
-use crate::tools::JuxTool;
+use crate::RuntimePolicy;
 use crate::tools::wasm::run_exec_command_line;
+use crate::tools::{JuxTool, ToolExecutionContext};
 use mlua::{Lua, LuaOptions, StdLib, UserData, UserDataMethods, Value};
 use rig::completion::ToolDefinition;
 use serde::Deserialize;
@@ -41,10 +42,14 @@ impl JuxTool for LuaTool {
         }
     }
 
-    fn execute(&self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    fn execute(
+        &self,
+        context: &ToolExecutionContext<'_>,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let args = serde_json::from_value::<LuaToolArgs>(args.clone())
             .map_err(|error| format!("invalid lua tool arguments: {error}"))?;
-        execute_lua(&args.code)
+        execute_lua(&args.code, context.policy)
     }
 }
 
@@ -53,10 +58,11 @@ struct LuaToolArgs {
     code: String,
 }
 
-fn execute_lua(script: &str) -> Result<serde_json::Value, String> {
+fn execute_lua(script: &str, policy: &RuntimePolicy) -> Result<serde_json::Value, String> {
     let lua = Lua::new_with(StdLib::NONE, LuaOptions::default())
         .map_err(|error| format!("lua initialization failed: {error}"))?;
-    install_lua_command_api(&lua).map_err(|error| format!("lua api setup failed: {error}"))?;
+    install_lua_command_api(&lua, policy.clone())
+        .map_err(|error| format!("lua api setup failed: {error}"))?;
     let value = lua
         .load(script)
         .eval::<Value>()
@@ -75,7 +81,7 @@ fn lua_value_to_json(value: Value) -> mlua::Result<serde_json::Value> {
     }
 }
 
-fn install_lua_command_api(lua: &Lua) -> mlua::Result<()> {
+fn install_lua_command_api(lua: &Lua, policy: RuntimePolicy) -> mlua::Result<()> {
     let globals = lua.globals();
     globals.set(
         "print",
@@ -87,10 +93,12 @@ fn install_lua_command_api(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     let os = lua.create_table()?;
+    let execute_policy = policy.clone();
     os.set(
         "execute",
-        lua.create_function(|lua, command: String| {
-            let output = run_single_command(&command).map_err(mlua::Error::external)?;
+        lua.create_function(move |lua, command: String| {
+            let output =
+                run_single_command(&command, &execute_policy).map_err(mlua::Error::external)?;
             let status = output.status_code.unwrap_or(1);
             let status_text = lua.create_string("exit")?;
             if output.success {
@@ -103,9 +111,10 @@ fn install_lua_command_api(lua: &Lua) -> mlua::Result<()> {
     globals.set("os", os)?;
 
     let io = lua.create_table()?;
+    let popen_policy = policy.clone();
     io.set(
         "popen",
-        lua.create_function(|lua, (command, mode): (String, Option<String>)| {
+        lua.create_function(move |lua, (command, mode): (String, Option<String>)| {
             let mode = mode.unwrap_or_else(|| "r".to_owned());
             if mode != "r" {
                 return Err(mlua::Error::external(
@@ -113,7 +122,8 @@ fn install_lua_command_api(lua: &Lua) -> mlua::Result<()> {
                 ));
             }
 
-            let output = run_single_command(&command).map_err(mlua::Error::external)?;
+            let output =
+                run_single_command(&command, &popen_policy).map_err(mlua::Error::external)?;
             if !output.success {
                 return Err(mlua::Error::external(format!(
                     "command exited with status {}",
@@ -136,8 +146,8 @@ struct CommandOutput {
     stdout: String,
 }
 
-fn run_single_command(command: &str) -> Result<CommandOutput, String> {
-    let output = run_exec_command_line(command)?;
+fn run_single_command(command: &str, policy: &RuntimePolicy) -> Result<CommandOutput, String> {
+    let output = run_exec_command_line(command, policy)?;
     Ok(CommandOutput {
         success: output.success,
         status_code: output.status_code,

@@ -145,6 +145,22 @@ pub enum WasmHttpMethod {
     Options,
 }
 
+impl WasmHttpMethod {
+    #[must_use]
+    pub fn from_http_method(method: &str) -> Option<Self> {
+        match method {
+            "GET" => Some(Self::Get),
+            "POST" => Some(Self::Post),
+            "PUT" => Some(Self::Put),
+            "PATCH" => Some(Self::Patch),
+            "DELETE" => Some(Self::Delete),
+            "HEAD" => Some(Self::Head),
+            "OPTIONS" => Some(Self::Options),
+            _ => None,
+        }
+    }
+}
+
 fn wildcard_matches(pattern: &str, value: &str) -> Result<bool, String> {
     let pattern = pattern
         .split('*')

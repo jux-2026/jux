@@ -139,12 +139,14 @@ fn run_loop_records_reasoning_without_sending_it_back_to_llm() {
 }
 #[test]
 fn run_loop_executes_exec_tool_call_and_returns_structured_output() {
-    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let workspace_root = temp_workspace_root();
+    std::fs::write(workspace_root.join("hello.txt"), "hello").expect("fixture file is written");
+    let store = SqliteWorkspaceStore::new(workspace_root);
     let model = TestModel::responses([
         Ok(vec![AssistantContent::ToolCall(test_tool_call(
             "call_1",
             "exec",
-            serde_json::json!({ "program": "printf", "args": ["hello"] }),
+            serde_json::json!({ "program": "cat", "args": ["hello.txt"] }),
         ))]),
         Ok(vec![AssistantContent::text("Exec returned hello")]),
     ]);

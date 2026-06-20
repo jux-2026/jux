@@ -2,8 +2,9 @@ use crate::model::{
     AssistantResponseItem, LlmUsage, Run, RunStatus, Session, SessionContextKind,
     SessionContextPayload, Step, StepKind, StepPayload, Workspace,
 };
+use crate::policy::RuntimePolicy;
 use crate::store::{SqliteWorkspaceStore, StoreError};
-use crate::tools::{execute_tool, tool_definitions};
+use crate::tools::{ToolExecutionContext, execute_tool, tool_definitions};
 use rig::OneOrMany;
 use rig::completion::{CompletionError, CompletionModel, ToolDefinition, Usage};
 use rig::message::{
@@ -31,6 +32,7 @@ impl From<Usage> for LlmUsage {
 pub struct RunLoop<M> {
     store: SqliteWorkspaceStore,
     model: M,
+    policy: RuntimePolicy,
 }
 
 impl<M> RunLoop<M>
@@ -39,7 +41,17 @@ where
 {
     #[must_use]
     pub fn new(store: SqliteWorkspaceStore, model: M) -> Self {
-        Self { store, model }
+        let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+        Self::with_policy(store, model, policy)
+    }
+
+    #[must_use]
+    pub fn with_policy(store: SqliteWorkspaceStore, model: M, policy: RuntimePolicy) -> Self {
+        Self {
+            store,
+            model,
+            policy,
+        }
     }
 
     pub async fn run(&self, request: String) -> Result<RunLoopOutput, RunLoopError> {
@@ -158,7 +170,10 @@ where
             "executing tool call"
         );
 
-        let content = match execute_tool(name, arguments) {
+        let context = ToolExecutionContext {
+            policy: &self.policy,
+        };
+        let content = match execute_tool(&context, name, arguments) {
             Ok(output) => output,
             Err(error) => {
                 tracing::warn!(

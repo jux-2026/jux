@@ -1,7 +1,8 @@
 use jux_core::{
-    WasmCommandRequest, WasmEnvironmentCapability, WasmFilesystemCapability, WasmNetworkCapability,
-    WasmPackageLoadingCapability, WasmRuntimeError, WasmStdioCapability, WasmerRuntime,
-    WasmerRuntimeCapabilities,
+    WasmCommandRequest, WasmEnvironmentCapability, WasmEnvironmentPolicy, WasmFilesystemCapability,
+    WasmFilesystemPolicy, WasmHttpMatchKind, WasmHttpMethod, WasmHttpRule, WasmHttpRuleEffect,
+    WasmNetworkCapability, WasmNetworkPolicy, WasmPackageLoadingCapability, WasmRuntimeError,
+    WasmSandboxPolicy, WasmStdioCapability, WasmerRuntime, WasmerRuntimeCapabilities,
 };
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -58,9 +59,36 @@ fn wasmer_runtime_exposes_default_capabilities() {
             environment: WasmEnvironmentCapability::Isolated,
             stdio: WasmStdioCapability::Buffered,
             network: WasmNetworkCapability::HttpClient,
+            http_policy: None,
             package_loading: WasmPackageLoadingCapability::BuiltinWithHttpClient,
         }
     );
+}
+
+#[test]
+fn wasmer_runtime_can_be_created_from_wasm_policy() {
+    let network = WasmNetworkPolicy {
+        http_rules: vec![WasmHttpRule {
+            effect: WasmHttpRuleEffect::Allow,
+            method: WasmHttpMethod::Get,
+            match_kind: WasmHttpMatchKind::Literal,
+            pattern: "https://api.example.com/v1/status".to_owned(),
+        }],
+    };
+    let policy = WasmSandboxPolicy {
+        filesystem: WasmFilesystemPolicy::ReadWriteWorkspace,
+        environment: WasmEnvironmentPolicy::Isolated,
+        network: network.clone(),
+        packages: Vec::new(),
+    };
+
+    let runtime = WasmerRuntime::with_wasm_policy(&policy);
+
+    assert_eq!(
+        runtime.capabilities().network,
+        WasmNetworkCapability::HttpClient
+    );
+    assert_eq!(runtime.capabilities().http_policy, Some(network));
 }
 
 #[test]

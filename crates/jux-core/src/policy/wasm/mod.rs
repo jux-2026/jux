@@ -70,6 +70,11 @@ impl From<&WasmSandboxPolicy> for WasmerRuntimeCapabilities {
             } else {
                 WasmNetworkCapability::HttpClient
             },
+            http_policy: if policy.network.http_rules.is_empty() {
+                None
+            } else {
+                Some(policy.network.clone())
+            },
             package_loading: if policy.requires_http_package_loading() {
                 WasmPackageLoadingCapability::BuiltinWithHttpClient
             } else if !policy.packages.is_empty() {

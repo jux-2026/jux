@@ -6,8 +6,11 @@
 //! through permissions, then this layer decides which Wasmer knobs are enabled.
 
 use super::runtime::WasmRuntimeError;
+use crate::{WasmHttpDecision, WasmHttpMethod, WasmNetworkPolicy};
+use futures::future::BoxFuture;
 use std::path::PathBuf;
 use std::sync::Arc;
+use wasmer_wasix::http::{HttpClient, HttpRequest, HttpResponse};
 use wasmer_wasix::runners::MappedDirectory;
 use wasmer_wasix::runners::wasi::WasiRunner;
 use wasmer_wasix::runtime::package_loader::BuiltinPackageLoader;
@@ -24,6 +27,7 @@ pub struct WasmerRuntimeCapabilities {
     pub environment: WasmEnvironmentCapability,
     pub stdio: WasmStdioCapability,
     pub network: WasmNetworkCapability,
+    pub http_policy: Option<WasmNetworkPolicy>,
     pub package_loading: WasmPackageLoadingCapability,
 }
 
@@ -34,6 +38,7 @@ impl Default for WasmerRuntimeCapabilities {
             environment: WasmEnvironmentCapability::Isolated,
             stdio: WasmStdioCapability::Buffered,
             network: WasmNetworkCapability::HttpClient,
+            http_policy: None,
             package_loading: WasmPackageLoadingCapability::BuiltinWithHttpClient,
         }
     }
@@ -86,7 +91,7 @@ pub(super) fn apply_runtime_capabilities(
                 .set_source(InMemorySource::new());
             None
         }
-        WasmNetworkCapability::HttpClient => Some(default_http_client()?),
+        WasmNetworkCapability::HttpClient => Some(configured_http_client(capabilities)?),
     };
 
     match capabilities.package_loading {
@@ -134,10 +139,53 @@ pub(super) fn apply_runner_capabilities(
     }
 }
 
-fn default_http_client()
--> Result<Arc<dyn wasmer_wasix::http::HttpClient + Send + Sync>, WasmRuntimeError> {
+fn default_http_client() -> Result<Arc<dyn HttpClient + Send + Sync>, WasmRuntimeError> {
     Ok(Arc::new(
         wasmer_wasix::http::default_http_client()
             .ok_or_else(|| WasmRuntimeError::Run("wasm http client is unavailable".to_owned()))?,
     ))
+}
+
+fn configured_http_client(
+    capabilities: &WasmerRuntimeCapabilities,
+) -> Result<Arc<dyn HttpClient + Send + Sync>, WasmRuntimeError> {
+    let inner = default_http_client()?;
+    let Some(policy) = capabilities.http_policy.clone() else {
+        return Ok(inner);
+    };
+    Ok(Arc::new(PolicyHttpClient { inner, policy }))
+}
+
+#[derive(Debug)]
+struct PolicyHttpClient {
+    inner: Arc<dyn HttpClient + Send + Sync>,
+    policy: WasmNetworkPolicy,
+}
+
+impl HttpClient for PolicyHttpClient {
+    fn request(&self, request: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, anyhow::Error>> {
+        let method = request.method.as_str().to_owned();
+        let url = request.url.to_string();
+        let Some(method) = WasmHttpMethod::from_http_method(&method) else {
+            return Box::pin(async move {
+                Err(anyhow::anyhow!(
+                    "wasm HTTP request denied by policy: unsupported method {method} {url}"
+                ))
+            });
+        };
+
+        match self.policy.decide_http_request(method, &url) {
+            Ok(WasmHttpDecision::Allow) => self.inner.request(request),
+            Ok(WasmHttpDecision::Deny) => Box::pin(async move {
+                Err(anyhow::anyhow!(
+                    "wasm HTTP request denied by policy: {method:?} {url}"
+                ))
+            }),
+            Err(error) => Box::pin(async move {
+                Err(anyhow::anyhow!(
+                    "wasm HTTP policy evaluation failed: {error}"
+                ))
+            }),
+        }
+    }
 }

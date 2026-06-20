@@ -49,6 +49,7 @@ impl From<WasmPermissions> for WasmerRuntimeCapabilities {
                 WasmNetworkPermission::Disabled => WasmNetworkCapability::Disabled,
                 WasmNetworkPermission::HttpClient => WasmNetworkCapability::HttpClient,
             },
+            http_policy: None,
             package_loading: match permissions.network {
                 WasmNetworkPermission::Disabled => WasmPackageLoadingCapability::Builtin,
                 WasmNetworkPermission::HttpClient => {

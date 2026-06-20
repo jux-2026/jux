@@ -12,6 +12,7 @@ use super::capability::{
 use super::commands::{
     COREUTILS_ASSET, WasmCommandOutput, WasmCommandRequest, is_supported_coreutils_command,
 };
+use crate::WasmSandboxPolicy;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -49,6 +50,11 @@ impl WasmerRuntime {
             capabilities,
             package_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    #[must_use]
+    pub fn with_wasm_policy(policy: &WasmSandboxPolicy) -> Self {
+        Self::with_capabilities(WasmerRuntimeCapabilities::from(policy))
     }
 
     #[must_use]
