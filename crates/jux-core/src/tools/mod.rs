@@ -1,3 +1,13 @@
+//! Tool registry and execution boundary.
+//!
+//! This module exposes the tools that the run loop can advertise to the LLM and
+//! execute after a tool call. Tool implementations receive a narrow
+//! `ToolExecutionContext` instead of the full run-loop context so each tool can
+//! access policy-controlled capabilities without reaching into persistence or
+//! model state.
+//!
+//! Concrete tool families live in submodules such as `lua` and `wasm`.
+
 pub(crate) mod lua;
 pub(crate) mod wasm;
 

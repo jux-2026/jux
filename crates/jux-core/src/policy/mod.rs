@@ -1,3 +1,13 @@
+//! Runtime policy model.
+//!
+//! This module defines Jux's internal execution policy. The policy is not a
+//! user-facing configuration format; configuration should be normalized into
+//! these types before tools or execution backends use it.
+//!
+//! `RuntimePolicy` is the top-level policy object. It groups workspace scope,
+//! WASM sandbox policy, and native command policy so each backend can derive its
+//! own narrower execution context and capabilities.
+
 mod native;
 mod wasm;
 

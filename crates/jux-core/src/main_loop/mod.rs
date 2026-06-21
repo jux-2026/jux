@@ -1,3 +1,14 @@
+//! Agent run-loop orchestration.
+//!
+//! This module owns the top-level control flow for one user request. It starts
+//! and persists runs, builds LLM completion requests from stored context and
+//! visible history, records assistant responses, executes requested tools, and
+//! decides when the run is complete or failed.
+//!
+//! The run loop is intentionally the only layer that writes run and step state.
+//! Lower-level modules receive narrower context traits so they can execute work
+//! without knowing about persistence, model calls, or the full agent runtime.
+
 mod context;
 
 pub use self::context::RunLoopContext;
