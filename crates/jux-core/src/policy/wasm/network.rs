@@ -1,7 +1,7 @@
 //! WASM HTTP network policy.
 //!
 //! HTTP access is expressed as one ordered list of rules. Each rule declares an
-//! action (`Allow` or `Deny`), one HTTP method, one URL matching strategy, and
+//! action (`Allow` or `Deny`), one HTTP method, one URL pattern strategy, and
 //! one pattern. Request evaluation is intentionally simple:
 //!
 //! 1. Iterate over `http_rules` from first to last.
@@ -12,7 +12,7 @@
 //! placed after narrow deny rules, or a broad deny rule can be placed after
 //! narrow allow rules, depending on the desired policy.
 
-use regex::Regex;
+use crate::{MatchPattern, MatchPatternKind};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Network policy for WASM execution.
@@ -80,13 +80,12 @@ impl WasmHttpRule {
     }
 
     fn matches_url(&self, url: &str) -> Result<bool, String> {
-        match self.match_kind {
-            WasmHttpMatchKind::Literal => Ok(self.pattern == url),
-            WasmHttpMatchKind::Regex => Regex::new(&self.pattern)
-                .map(|regex| regex.is_match(url))
-                .map_err(|error| format!("invalid HTTP URL regex pattern: {error}")),
-            WasmHttpMatchKind::Wildcard => wildcard_matches(&self.pattern, url),
-        }
+        MatchPattern::new(
+            MatchPatternKind::from(self.match_kind),
+            self.pattern.clone(),
+        )
+        .matches(url)
+        .map_err(|error| format!("invalid HTTP URL policy pattern: {error}"))
     }
 }
 
@@ -124,13 +123,24 @@ pub enum WasmHttpMatchKind {
     ///
     /// Example pattern: `^https://api\\.example\\.com(:443)?/v1/.*$`.
     Regex,
-    /// Star wildcard match against the full request URL.
+    /// Wildcard match against the full request URL.
     ///
-    /// `*` matches any sequence of characters. All other characters are treated
-    /// literally.
+    /// `*` matches within one `/`-delimited segment, `**` matches across
+    /// segments, `?` matches one non-`/` character, and `\` escapes wildcard
+    /// tokens. All other characters are treated literally.
     ///
-    /// Example pattern: `https://*.example.com/v1/*`.
+    /// Example pattern: `https://*.example.com/v1/**`.
     Wildcard,
+}
+
+impl From<WasmHttpMatchKind> for MatchPatternKind {
+    fn from(kind: WasmHttpMatchKind) -> Self {
+        match kind {
+            WasmHttpMatchKind::Literal => Self::Literal,
+            WasmHttpMatchKind::Regex => Self::Regex,
+            WasmHttpMatchKind::Wildcard => Self::Wildcard,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,15 +169,4 @@ impl WasmHttpMethod {
             _ => None,
         }
     }
-}
-
-fn wildcard_matches(pattern: &str, value: &str) -> Result<bool, String> {
-    let pattern = pattern
-        .split('*')
-        .map(regex::escape)
-        .collect::<Vec<_>>()
-        .join(".*");
-    Regex::new(&format!("^{pattern}$"))
-        .map(|regex| regex.is_match(value))
-        .map_err(|error| format!("invalid generated HTTP wildcard pattern: {error}"))
 }

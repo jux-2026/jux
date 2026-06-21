@@ -8,11 +8,13 @@
 //! WASM sandbox policy, and native command policy so each backend can derive its
 //! own narrower execution context and capabilities.
 
+mod match_pattern;
 mod native;
 mod wasm;
 
 use std::path::PathBuf;
 
+pub use self::match_pattern::{MatchPattern, MatchPatternKind};
 pub use self::native::{NativeCommandPolicy, NativeCommandRule};
 pub use self::wasm::{
     WasmEnvironmentPolicy, WasmFilesystemPolicy, WasmHttpDecision, WasmHttpMatchKind,

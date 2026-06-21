@@ -1,9 +1,9 @@
 use jux_core::{
-    NativeCommandPolicy, RuntimePolicy, WasmEnvironmentCapability, WasmEnvironmentPolicy,
-    WasmFilesystemCapability, WasmFilesystemPolicy, WasmHttpDecision, WasmHttpMatchKind,
-    WasmHttpMethod, WasmHttpRule, WasmHttpRuleEffect, WasmNetworkCapability, WasmNetworkPolicy,
-    WasmPackageLoadingCapability, WasmPackageRule, WasmPackageSource, WasmSandboxPolicy,
-    WasmStdioCapability, WasmerRuntimeCapabilities,
+    MatchPattern, MatchPatternKind, NativeCommandPolicy, RuntimePolicy, WasmEnvironmentCapability,
+    WasmEnvironmentPolicy, WasmFilesystemCapability, WasmFilesystemPolicy, WasmHttpDecision,
+    WasmHttpMatchKind, WasmHttpMethod, WasmHttpRule, WasmHttpRuleEffect, WasmNetworkCapability,
+    WasmNetworkPolicy, WasmPackageLoadingCapability, WasmPackageRule, WasmPackageSource,
+    WasmSandboxPolicy, WasmStdioCapability, WasmerRuntimeCapabilities,
 };
 
 #[test]
@@ -145,7 +145,7 @@ fn wasm_network_policy_uses_ordered_http_rules() {
                     effect: WasmHttpRuleEffect::Allow,
                     method: WasmHttpMethod::Get,
                     match_kind: WasmHttpMatchKind::Wildcard,
-                    pattern: "https://api.example.com/v1/*".to_owned(),
+                    pattern: "https://api.example.com/v1/**".to_owned(),
                 },
             ],
         },
@@ -177,6 +177,45 @@ fn wasm_network_policy_uses_ordered_http_rules() {
     );
     assert_eq!(capabilities.network, WasmNetworkCapability::HttpClient);
     assert_eq!(capabilities.http_policy, Some(expected_http_policy));
+}
+
+#[test]
+fn policy_pattern_supports_glob_like_wildcards() {
+    let direct_child = MatchPattern::new(MatchPatternKind::Wildcard, "/workspace/*.rs");
+    let recursive = MatchPattern::new(MatchPatternKind::Wildcard, "/workspace/**/*.rs");
+    let single_char = MatchPattern::new(MatchPatternKind::Wildcard, "/workspace/file-?.txt");
+    let escaped = MatchPattern::new(MatchPatternKind::Wildcard, "/workspace/\\*.txt");
+
+    assert!(
+        direct_child
+            .matches("/workspace/main.rs")
+            .expect("wildcard matches")
+    );
+    assert!(
+        !direct_child
+            .matches("/workspace/src/main.rs")
+            .expect("wildcard matches")
+    );
+    assert!(
+        recursive
+            .matches("/workspace/src/main.rs")
+            .expect("recursive wildcard matches")
+    );
+    assert!(
+        single_char
+            .matches("/workspace/file-a.txt")
+            .expect("single-character wildcard matches")
+    );
+    assert!(
+        !single_char
+            .matches("/workspace/file-ab.txt")
+            .expect("single-character wildcard matches")
+    );
+    assert!(
+        escaped
+            .matches("/workspace/*.txt")
+            .expect("escaped wildcard matches")
+    );
 }
 
 #[test]

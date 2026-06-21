@@ -8,9 +8,10 @@ mod util;
 
 pub use main_loop::{RunLoop, RunLoopContext, RunLoopError, RunLoopOutput, SYSTEM_PROMPT};
 pub use policy::{
-    NativeCommandPolicy, NativeCommandRule, RuntimePolicy, WasmEnvironmentPolicy,
-    WasmFilesystemPolicy, WasmHttpDecision, WasmHttpMatchKind, WasmHttpMethod, WasmHttpRule,
-    WasmHttpRuleEffect, WasmNetworkPolicy, WasmPackageRule, WasmPackageSource, WasmSandboxPolicy,
+    MatchPattern, MatchPatternKind, NativeCommandPolicy, NativeCommandRule, RuntimePolicy,
+    WasmEnvironmentPolicy, WasmFilesystemPolicy, WasmHttpDecision, WasmHttpMatchKind,
+    WasmHttpMethod, WasmHttpRule, WasmHttpRuleEffect, WasmNetworkPolicy, WasmPackageRule,
+    WasmPackageSource, WasmSandboxPolicy,
 };
 pub use state::{
     AssistantResponseItem, LlmUsage, Run, RunId, RunStatus, Session, SessionContextItem,
