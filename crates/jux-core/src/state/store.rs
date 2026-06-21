@@ -1,8 +1,8 @@
-use crate::ids::{RunId, SessionId, StepId, WorkspaceId};
-use crate::model::{
+use crate::state::{
     Run, RunStatus, Session, SessionContextItem, SessionContextKind, SessionContextPayload, Step,
-    StepKind, StepPayload, Workspace,
+    StepId, StepKind, StepPayload, Workspace,
 };
+use crate::state::{RunId, SessionId, WorkspaceId};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::error::Error;
 use std::fmt::{self, Display};

@@ -2,11 +2,11 @@ mod context;
 
 pub use self::context::RunLoopContext;
 
-use crate::model::{
+use crate::state::{
     AssistantResponseItem, LlmUsage, Run, RunStatus, Session, SessionContextKind,
     SessionContextPayload, Step, StepKind, StepPayload, Workspace,
 };
-use crate::store::{SqliteWorkspaceStore, StoreError};
+use crate::state::{SqliteWorkspaceStore, StoreError};
 use crate::tools::{execute_tool, tool_definitions};
 use rig::OneOrMany;
 use rig::completion::{CompletionError, CompletionModel, ToolDefinition, Usage};
@@ -422,7 +422,7 @@ fn assistant_response_item_to_chat_content(
 }
 
 fn session_context_item_to_chat_message(
-    item: &crate::model::SessionContextItem,
+    item: &crate::state::SessionContextItem,
 ) -> Option<Message> {
     match &item.payload {
         SessionContextPayload::SystemPrompt { content } => Some(Message::System {
@@ -433,7 +433,7 @@ fn session_context_item_to_chat_message(
 }
 
 fn session_context_item_to_tool_definition(
-    item: &crate::model::SessionContextItem,
+    item: &crate::state::SessionContextItem,
 ) -> Option<Result<ToolDefinition, String>> {
     match &item.payload {
         SessionContextPayload::ToolDefinition {
