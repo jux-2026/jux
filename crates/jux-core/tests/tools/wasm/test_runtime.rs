@@ -76,7 +76,7 @@ fn wasmer_runtime_can_be_created_from_wasm_policy() {
         }],
     };
     let policy = WasmSandboxPolicy {
-        filesystem: WasmFilesystemPolicy::ReadWriteWorkspace,
+        filesystem: WasmFilesystemPolicy::read_write_workdir("/workspace"),
         environment: WasmEnvironmentPolicy::Isolated,
         network: network.clone(),
         packages: Vec::new(),

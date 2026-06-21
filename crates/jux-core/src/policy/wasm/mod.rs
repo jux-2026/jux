@@ -1,3 +1,4 @@
+mod filesystem;
 mod network;
 
 use crate::tools::wasm::{
@@ -5,6 +6,10 @@ use crate::tools::wasm::{
     WasmPackageLoadingCapability, WasmStdioCapability, WasmerRuntimeCapabilities,
 };
 
+pub use self::filesystem::{
+    WasmFilesystemAccess, WasmFilesystemDecision, WasmFilesystemPermissions, WasmFilesystemPolicy,
+    WasmFilesystemRule, WasmFilesystemRuleBase,
+};
 pub use self::network::{
     WasmHttpDecision, WasmHttpMatchKind, WasmHttpMethod, WasmHttpRule, WasmHttpRuleEffect,
     WasmNetworkPolicy,
@@ -23,7 +28,7 @@ impl WasmSandboxPolicy {
     #[must_use]
     pub fn workspace_default() -> Self {
         Self {
-            filesystem: WasmFilesystemPolicy::ReadWriteWorkspace,
+            filesystem: WasmFilesystemPolicy::disabled(),
             environment: WasmEnvironmentPolicy::Isolated,
             network: WasmNetworkPolicy {
                 http_rules: Vec::new(),
@@ -54,11 +59,10 @@ impl WasmSandboxPolicy {
 impl From<&WasmSandboxPolicy> for WasmerRuntimeCapabilities {
     fn from(policy: &WasmSandboxPolicy) -> Self {
         Self {
-            filesystem: match policy.filesystem {
-                WasmFilesystemPolicy::Disabled => WasmFilesystemCapability::Disabled,
-                WasmFilesystemPolicy::ReadWriteWorkspace => {
-                    WasmFilesystemCapability::MappedHostDirectory
-                }
+            filesystem: if policy.filesystem.has_rules() {
+                WasmFilesystemCapability::MappedHostDirectory
+            } else {
+                WasmFilesystemCapability::Disabled
             },
             environment: match policy.environment {
                 WasmEnvironmentPolicy::Isolated => WasmEnvironmentCapability::Isolated,
@@ -84,13 +88,6 @@ impl From<&WasmSandboxPolicy> for WasmerRuntimeCapabilities {
             },
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Filesystem policy for WASM execution.
-pub enum WasmFilesystemPolicy {
-    Disabled,
-    ReadWriteWorkspace,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

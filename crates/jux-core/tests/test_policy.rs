@@ -1,6 +1,7 @@
 use jux_core::{
     MatchPattern, MatchPatternKind, NativeCommandPolicy, RuntimePolicy, WasmEnvironmentCapability,
-    WasmEnvironmentPolicy, WasmFilesystemCapability, WasmFilesystemPolicy, WasmHttpDecision,
+    WasmEnvironmentPolicy, WasmFilesystemAccess, WasmFilesystemCapability, WasmFilesystemDecision,
+    WasmFilesystemPermissions, WasmFilesystemPolicy, WasmFilesystemRule, WasmHttpDecision,
     WasmHttpMatchKind, WasmHttpMethod, WasmHttpRule, WasmHttpRuleEffect, WasmNetworkCapability,
     WasmNetworkPolicy, WasmPackageLoadingCapability, WasmPackageRule, WasmPackageSource,
     WasmSandboxPolicy, WasmStdioCapability, WasmerRuntimeCapabilities,
@@ -16,7 +17,7 @@ fn runtime_policy_workspace_default_disables_native_commands() {
     assert_eq!(
         policy.wasm,
         WasmSandboxPolicy {
-            filesystem: WasmFilesystemPolicy::ReadWriteWorkspace,
+            filesystem: WasmFilesystemPolicy::read_write_workdir(workspace_root.clone()),
             environment: WasmEnvironmentPolicy::Isolated,
             network: WasmNetworkPolicy {
                 http_rules: Vec::new()
@@ -57,7 +58,7 @@ fn runtime_policy_derives_wasm_capabilities() {
 #[test]
 fn wasm_sandbox_policy_derives_disabled_wasmer_capabilities() {
     let policy = WasmSandboxPolicy {
-        filesystem: WasmFilesystemPolicy::Disabled,
+        filesystem: WasmFilesystemPolicy::disabled(),
         environment: WasmEnvironmentPolicy::Isolated,
         network: WasmNetworkPolicy {
             http_rules: Vec::new(),
@@ -80,9 +81,69 @@ fn wasm_sandbox_policy_derives_disabled_wasmer_capabilities() {
 }
 
 #[test]
+fn wasm_filesystem_policy_uses_ordered_rules_and_default_deny() {
+    let policy = WasmFilesystemPolicy::new(
+        vec!["/workspace/a".into(), "/workspace/b".into()],
+        vec![
+            WasmFilesystemRule::deny("secrets/**"),
+            WasmFilesystemRule::allow_read_write("src/**"),
+            WasmFilesystemRule::allow_read("README.md"),
+            WasmFilesystemRule::allow_read_write_absolute("/tmp/jux/**"),
+            WasmFilesystemRule::workdir_regex("docs/.+\\.md", WasmFilesystemPermissions::read()),
+        ],
+    );
+
+    assert_eq!(
+        policy
+            .decide_path_access("src/main.rs", WasmFilesystemAccess::ReadWrite)
+            .expect("filesystem decision succeeds"),
+        WasmFilesystemDecision::Allow
+    );
+    assert_eq!(
+        policy
+            .decide_path_access("/workspace/a/secrets/token.txt", WasmFilesystemAccess::Read)
+            .expect("filesystem decision succeeds"),
+        WasmFilesystemDecision::Deny
+    );
+    assert_eq!(
+        policy
+            .decide_path_access(
+                "/workspace/a/public/../secrets/token.txt",
+                WasmFilesystemAccess::Read
+            )
+            .expect("filesystem decision succeeds"),
+        WasmFilesystemDecision::Deny
+    );
+    assert_eq!(
+        policy
+            .decide_path_access("/workspace/b/README.md", WasmFilesystemAccess::Write)
+            .expect("filesystem decision succeeds"),
+        WasmFilesystemDecision::Deny
+    );
+    assert_eq!(
+        policy
+            .decide_path_access("/workspace/b/docs/guide.md", WasmFilesystemAccess::Read)
+            .expect("filesystem decision succeeds"),
+        WasmFilesystemDecision::Allow
+    );
+    assert_eq!(
+        policy
+            .decide_path_access("/tmp/jux/session/out.txt", WasmFilesystemAccess::Write)
+            .expect("filesystem decision succeeds"),
+        WasmFilesystemDecision::Allow
+    );
+    assert_eq!(
+        policy
+            .decide_path_access("/workspace/a/notes.txt", WasmFilesystemAccess::Read)
+            .expect("filesystem decision succeeds"),
+        WasmFilesystemDecision::Deny
+    );
+}
+
+#[test]
 fn wasm_sandbox_policy_allows_configured_packages() {
     let policy = WasmSandboxPolicy {
-        filesystem: WasmFilesystemPolicy::ReadWriteWorkspace,
+        filesystem: WasmFilesystemPolicy::read_write_workdir("/workspace"),
         environment: WasmEnvironmentPolicy::Isolated,
         network: WasmNetworkPolicy {
             http_rules: Vec::new(),
@@ -109,7 +170,7 @@ fn wasm_sandbox_policy_allows_configured_packages() {
 #[test]
 fn wasm_package_policy_enables_http_package_loading_when_needed() {
     let policy = WasmSandboxPolicy {
-        filesystem: WasmFilesystemPolicy::ReadWriteWorkspace,
+        filesystem: WasmFilesystemPolicy::read_write_workdir("/workspace"),
         environment: WasmEnvironmentPolicy::Isolated,
         network: WasmNetworkPolicy {
             http_rules: Vec::new(),
@@ -131,7 +192,7 @@ fn wasm_package_policy_enables_http_package_loading_when_needed() {
 #[test]
 fn wasm_network_policy_uses_ordered_http_rules() {
     let policy = WasmSandboxPolicy {
-        filesystem: WasmFilesystemPolicy::ReadWriteWorkspace,
+        filesystem: WasmFilesystemPolicy::read_write_workdir("/workspace"),
         environment: WasmEnvironmentPolicy::Isolated,
         network: WasmNetworkPolicy {
             http_rules: vec![

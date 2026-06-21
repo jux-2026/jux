@@ -84,7 +84,12 @@ fn wildcard_to_regex(pattern: &str) -> Result<String, String> {
         match char {
             '*' if chars.peek() == Some(&'*') => {
                 chars.next();
-                regex.push_str(".*");
+                if chars.peek() == Some(&'/') {
+                    chars.next();
+                    regex.push_str("(?:.*/)?");
+                } else {
+                    regex.push_str(".*");
+                }
             }
             '*' => regex.push_str("[^/]*"),
             '?' => regex.push_str("[^/]"),

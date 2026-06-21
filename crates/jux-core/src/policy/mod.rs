@@ -17,9 +17,10 @@ use std::path::PathBuf;
 pub use self::match_pattern::{MatchPattern, MatchPatternKind};
 pub use self::native::{NativeCommandPolicy, NativeCommandRule};
 pub use self::wasm::{
-    WasmEnvironmentPolicy, WasmFilesystemPolicy, WasmHttpDecision, WasmHttpMatchKind,
-    WasmHttpMethod, WasmHttpRule, WasmHttpRuleEffect, WasmNetworkPolicy, WasmPackageRule,
-    WasmPackageSource, WasmSandboxPolicy,
+    WasmEnvironmentPolicy, WasmFilesystemAccess, WasmFilesystemDecision, WasmFilesystemPermissions,
+    WasmFilesystemPolicy, WasmFilesystemRule, WasmFilesystemRuleBase, WasmHttpDecision,
+    WasmHttpMatchKind, WasmHttpMethod, WasmHttpRule, WasmHttpRuleEffect, WasmNetworkPolicy,
+    WasmPackageRule, WasmPackageSource, WasmSandboxPolicy,
 };
 use crate::tools::wasm::WasmerRuntimeCapabilities;
 
@@ -38,9 +39,11 @@ impl RuntimePolicy {
     #[must_use]
     pub fn workspace_default(workspace_root: impl Into<PathBuf>) -> Self {
         let workspace_root = workspace_root.into();
+        let mut wasm = WasmSandboxPolicy::workspace_default();
+        wasm.filesystem = WasmFilesystemPolicy::read_write_workdir(workspace_root.clone());
         Self {
             workspace_root,
-            wasm: WasmSandboxPolicy::workspace_default(),
+            wasm,
             native: NativeCommandPolicy::disabled(),
         }
     }
