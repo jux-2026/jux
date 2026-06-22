@@ -13,7 +13,10 @@ pub use config::{
     JuxConfig, JuxConfigLoader, LoggingConfig, LoggingLevelConfig, MatchKindConfig, ModelConfig,
     NativeConfig, NetworkConfig, ResolvedConfig, RuleEffect, SandboxConfig,
 };
-pub use main_loop::{RunLoop, RunLoopContext, RunLoopError, RunLoopOutput, SYSTEM_PROMPT};
+pub use main_loop::{
+    AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AgentEventSink, NoopAgentEventSink,
+    RunLoop, RunLoopContext, RunLoopError, RunLoopOutput, SYSTEM_PROMPT,
+};
 pub use policy::{
     MatchPattern, MatchPatternKind, NativeCommandPolicy, NativeCommandRule, RuntimePolicy,
     WasmEnvironmentPolicy, WasmFilesystemAccess, WasmFilesystemDecision, WasmFilesystemPermissions,

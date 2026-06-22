@@ -1,7 +1,7 @@
 use jux_core::{
-    AssistantResponseItem, LlmUsage, RunLoop, RunLoopContext, RunLoopError, RunStatus,
-    RuntimePolicy, SYSTEM_PROMPT, SessionContextKind, SessionContextPayload, SqliteWorkspaceStore,
-    StepKind, StepPayload,
+    AgentEvent, AgentEventKind, AgentEventSink, AssistantResponseItem, LlmUsage, RunLoop,
+    RunLoopContext, RunLoopError, RunStatus, RuntimePolicy, SYSTEM_PROMPT, SessionContextKind,
+    SessionContextPayload, SqliteWorkspaceStore, StepKind, StepPayload,
 };
 use rig::OneOrMany;
 use rig::completion::{
@@ -247,6 +247,35 @@ fn run_loop_executes_lua_tool_call_and_continues_until_final_answer() {
 }
 
 #[test]
+fn run_loop_streams_hierarchical_events() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "lua",
+            serde_json::json!({ "code": "return 'streamed lua'" }),
+        ))]),
+        Ok(vec![AssistantContent::text("Streamed answer")]),
+    ]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
+    let mut events = VecAgentEventSink::default();
+
+    let output = futures::executor::block_on(
+        run_loop.run_with_events("Stream this run".to_owned(), &mut events),
+    )
+    .expect("run loop succeeds");
+    let event_ids = events.ids();
+
+    assert_eq!(output.answer.as_deref(), Some("Streamed answer"));
+    assert_eq!(event_ids[0], "run");
+    assert!(event_ids.contains(&"run.iteration.1".to_owned()));
+    assert!(event_ids.contains(&"run.iteration.1.llm.1".to_owned()));
+    assert!(event_ids.contains(&"run.iteration.1.tool.lua.1".to_owned()));
+    assert!(events.contains(AgentEventKind::Output, "run.iteration.1.tool.lua.1"));
+    assert!(events.contains(AgentEventKind::Completed, "run"));
+}
+
+#[test]
 fn run_loop_returns_lua_system_standard_library_access_errors_to_llm() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
     let model = TestModel::responses([
@@ -486,6 +515,32 @@ impl SessionContextPayloadTestExt for SessionContextPayload {
             SessionContextPayload::ToolDefinition { name, .. } => Some(name),
             SessionContextPayload::SystemPrompt { .. } => None,
         }
+    }
+}
+
+#[derive(Default)]
+struct VecAgentEventSink {
+    events: Vec<AgentEvent>,
+}
+
+impl VecAgentEventSink {
+    fn ids(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .map(|event| event.id.to_string())
+            .collect()
+    }
+
+    fn contains(&self, kind: AgentEventKind, id: &str) -> bool {
+        self.events
+            .iter()
+            .any(|event| event.kind == kind && event.id.as_str() == id)
+    }
+}
+
+impl AgentEventSink for VecAgentEventSink {
+    fn emit(&mut self, event: AgentEvent) {
+        self.events.push(event);
     }
 }
 

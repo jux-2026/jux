@@ -10,8 +10,12 @@
 //! without knowing about persistence, model calls, or the full agent runtime.
 
 mod context;
+mod event;
 
 pub use self::context::RunLoopContext;
+pub use self::event::{
+    AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AgentEventSink, NoopAgentEventSink,
+};
 
 use crate::state::{
     AssistantResponseItem, LlmUsage, Run, RunStatus, Session, SessionContextKind,
@@ -20,7 +24,9 @@ use crate::state::{
 use crate::state::{SqliteWorkspaceStore, StoreError};
 use crate::tools::{execute_tool, tool_definitions};
 use rig::OneOrMany;
-use rig::completion::{CompletionError, CompletionModel, ToolDefinition, Usage};
+use rig::completion::{
+    CompletionError, CompletionModel, CompletionResponse, ToolDefinition, Usage,
+};
 use rig::message::{
     AssistantContent, Message, ToolCall, ToolFunction, ToolResult, ToolResultContent,
 };
@@ -63,39 +69,27 @@ where
     }
 
     pub async fn run(&self, request: String) -> Result<RunLoopOutput, RunLoopError> {
+        let mut events = NoopAgentEventSink;
+        self.run_with_events(request, &mut events).await
+    }
+
+    pub async fn run_with_events(
+        &self,
+        request: String,
+        events: &mut impl AgentEventSink,
+    ) -> Result<RunLoopOutput, RunLoopError> {
         let run = self.start_run(request)?;
+        self.emit_run_started(events, &run.request);
 
-        for _ in 0..MAX_LOOP_ITERATIONS {
-            let llm_request = match self.build_completion_request(&run) {
-                Ok(request) => request,
-                Err(RunLoopError::Store(error)) => return Err(error.into()),
-                Err(RunLoopError::Prompt { source, .. }) => {
-                    return self.fail_completion_call(run, *source);
-                }
-                Err(RunLoopError::Runtime { message, .. }) => {
-                    return self.fail_runtime(run, message);
-                }
-            };
-            let history_len = llm_request.history.len();
-            tracing::debug!(run_id = %run.id, history_len, "built llm completion request");
-
-            let request = self
-                .context
-                .model
-                .completion_request(llm_request.prompt)
-                .messages(llm_request.history)
-                .tools(llm_request.tools)
-                .build();
-            let response = match self.context.model.completion(request).await {
-                Ok(response) => response,
-                Err(error) => {
-                    return self.fail_completion_call(run, error);
-                }
-            };
+        for iteration_index in 1..=MAX_LOOP_ITERATIONS {
+            self.emit_iteration_started(events, iteration_index);
+            let response = self
+                .complete_llm_call(&run, iteration_index, events)
+                .await?;
             let assistant_turn = match assistant_turn_from_response(response.choice) {
                 Ok(assistant_turn) => assistant_turn,
                 Err(message) => {
-                    return self.fail_runtime(run, message);
+                    return self.fail_runtime(run.clone(), message, events);
                 }
             };
             let AssistantTurn {
@@ -112,18 +106,81 @@ where
             )?;
 
             if tool_calls.is_empty() {
-                return self.complete_run(run, final_answer);
+                self.emit_iteration_completed(events, iteration_index);
+                return self.complete_run(run, final_answer, events);
             }
 
-            for tool_call in &tool_calls {
-                self.execute_tool_call(&run, tool_call)?;
+            for (tool_index, tool_call) in tool_calls.iter().enumerate() {
+                self.execute_tool_call(&run, tool_call, events, iteration_index, tool_index + 1)?;
             }
+            self.emit_iteration_completed(events, iteration_index);
         }
 
         self.fail_runtime(
             run,
             "run loop reached the maximum number of iterations".to_owned(),
+            events,
         )
+    }
+
+    async fn complete_llm_call(
+        &self,
+        run: &Run,
+        iteration_index: usize,
+        events: &mut impl AgentEventSink,
+    ) -> Result<CompletionResponse<M::Response>, RunLoopError> {
+        let llm_request = self.llm_request_or_fail(run, iteration_index, events)?;
+        let history_len = llm_request.history.len();
+        tracing::debug!(run_id = %run.id, history_len, "built llm completion request");
+
+        let llm_id = AgentEventId::llm(iteration_index, 1);
+        events.emit(AgentEvent::new(
+            llm_id.clone(),
+            AgentEventKind::Started,
+            AgentEventData::LlmStarted,
+        ));
+        let request = self
+            .context
+            .model
+            .completion_request(llm_request.prompt)
+            .messages(llm_request.history)
+            .tools(llm_request.tools)
+            .build();
+        let response = self
+            .context
+            .model
+            .completion(request)
+            .await
+            .map_err(|error| {
+                self.fail_completion_call(run.clone(), error, events, iteration_index)
+                    .expect_err("completion failure returns a run-loop error")
+            })?;
+        events.emit(AgentEvent::new(
+            llm_id,
+            AgentEventKind::Completed,
+            AgentEventData::LlmCompleted,
+        ));
+        Ok(response)
+    }
+
+    fn llm_request_or_fail(
+        &self,
+        run: &Run,
+        iteration_index: usize,
+        events: &mut impl AgentEventSink,
+    ) -> Result<LlmCompletionRequest, RunLoopError> {
+        match self.build_completion_request(run) {
+            Ok(request) => Ok(request),
+            Err(RunLoopError::Store(error)) => Err(error.into()),
+            Err(RunLoopError::Prompt { source, .. }) => {
+                self.fail_completion_call(run.clone(), *source, events, iteration_index)?;
+                unreachable!("fail_completion_call always returns an error")
+            }
+            Err(RunLoopError::Runtime { message, .. }) => {
+                self.fail_runtime(run.clone(), message, events)?;
+                unreachable!("fail_runtime always returns an error")
+            }
+        }
     }
 
     fn start_run(&self, request: String) -> Result<Run, RunLoopError> {
@@ -164,50 +221,112 @@ where
         &self,
         run: &Run,
         tool_call: &AssistantResponseItem,
+        events: &mut impl AgentEventSink,
+        iteration_index: usize,
+        tool_index: usize,
     ) -> Result<(), StoreError> {
-        let AssistantResponseItem::ToolCall {
-            id,
-            call_id,
-            name,
-            arguments,
-        } = tool_call
-        else {
+        let Some(tool_call) = ToolCallRequest::from_assistant_item(tool_call) else {
             return Ok(());
         };
         tracing::info!(
             run_id = %run.id,
-            tool_name = %name,
+            tool_name = %tool_call.name,
             "executing tool call"
         );
 
-        let content = match execute_tool(&self.context, name, arguments) {
-            Ok(output) => output,
-            Err(error) => {
-                tracing::warn!(
-                    run_id = %run.id,
-                    tool_name = %name,
-                    error = %error,
-                    "tool call failed"
-                );
-                json!({
-                    "success": false,
-                    "error": error,
-                })
-            }
-        };
+        let tool_id = AgentEventId::tool(iteration_index, &tool_call.name, tool_index);
+        events.emit(AgentEvent::new(
+            tool_id.clone(),
+            AgentEventKind::Started,
+            AgentEventData::ToolStarted {
+                name: tool_call.name.clone(),
+                call_id: tool_call.call_id.clone(),
+            },
+        ));
+        let content = self.execute_tool_content(run, &tool_call, tool_id, events);
         self.context.store.append_step(
             &run.id,
             StepKind::ToolResult,
             StepPayload::ToolResult {
-                id: id.clone(),
-                call_id: call_id.clone(),
+                id: tool_call.id,
+                call_id: tool_call.call_id,
                 content,
             },
         )?;
         Ok(())
     }
 
-    fn complete_run(&self, run: Run, answer: String) -> Result<RunLoopOutput, RunLoopError> {
+    fn execute_tool_content(
+        &self,
+        run: &Run,
+        tool_call: &ToolCallRequest,
+        tool_id: AgentEventId,
+        events: &mut impl AgentEventSink,
+    ) -> serde_json::Value {
+        match execute_tool(&self.context, &tool_call.name, &tool_call.arguments) {
+            Ok(output) => self.record_tool_output(tool_call, tool_id, events, output),
+            Err(error) => self.record_tool_failure(run, tool_call, tool_id, events, error),
+        }
+    }
+
+    fn record_tool_output(
+        &self,
+        tool_call: &ToolCallRequest,
+        tool_id: AgentEventId,
+        events: &mut impl AgentEventSink,
+        output: serde_json::Value,
+    ) -> serde_json::Value {
+        events.emit(AgentEvent::new(
+            tool_id.clone(),
+            AgentEventKind::Output,
+            AgentEventData::ToolOutput {
+                name: tool_call.name.clone(),
+                content: output.clone(),
+            },
+        ));
+        events.emit(AgentEvent::new(
+            tool_id,
+            AgentEventKind::Completed,
+            AgentEventData::ToolCompleted {
+                name: tool_call.name.clone(),
+                call_id: tool_call.call_id.clone(),
+            },
+        ));
+        output
+    }
+
+    fn record_tool_failure(
+        &self,
+        run: &Run,
+        tool_call: &ToolCallRequest,
+        tool_id: AgentEventId,
+        events: &mut impl AgentEventSink,
+        error: String,
+    ) -> serde_json::Value {
+        tracing::warn!(
+            run_id = %run.id,
+            tool_name = %tool_call.name,
+            error = %error,
+            "tool call failed"
+        );
+        events.emit(AgentEvent::new(
+            tool_id,
+            AgentEventKind::Failed,
+            AgentEventData::ToolFailed {
+                name: tool_call.name.clone(),
+                call_id: tool_call.call_id.clone(),
+                error: error.clone(),
+            },
+        ));
+        json!({ "success": false, "error": error })
+    }
+
+    fn complete_run(
+        &self,
+        run: Run,
+        answer: String,
+        events: &mut impl AgentEventSink,
+    ) -> Result<RunLoopOutput, RunLoopError> {
         let run = self
             .context
             .store
@@ -221,6 +340,13 @@ where
             "completed run"
         );
 
+        events.emit(AgentEvent::new(
+            AgentEventId::run(),
+            AgentEventKind::Completed,
+            AgentEventData::RunCompleted {
+                answer: answer.clone(),
+            },
+        ));
         Ok(RunLoopOutput {
             workspace,
             session,
@@ -234,30 +360,50 @@ where
         &self,
         run: Run,
         error: CompletionError,
+        events: &mut impl AgentEventSink,
+        iteration_index: usize,
     ) -> Result<RunLoopOutput, RunLoopError> {
         let message = error.to_string();
-        self.context
-            .store
-            .append_step(&run.id, StepKind::Error, StepPayload::Error { message })?;
+        events.emit(AgentEvent::new(
+            AgentEventId::llm(iteration_index, 1),
+            AgentEventKind::Failed,
+            AgentEventData::LlmFailed {
+                error: message.clone(),
+            },
+        ));
+        self.context.store.append_step(
+            &run.id,
+            StepKind::Error,
+            StepPayload::Error {
+                message: message.clone(),
+            },
+        )?;
 
         let run = self
             .context
             .store
             .update_run_status(&run.id, RunStatus::Failed)?;
         tracing::error!(run_id = %run.id, "failed run");
+        self.emit_run_failed(events, message);
         Err(RunLoopError::Prompt {
             run: Box::new(run),
             source: Box::new(error),
         })
     }
 
-    fn fail_runtime(&self, run: Run, message: String) -> Result<RunLoopOutput, RunLoopError> {
+    fn fail_runtime(
+        &self,
+        run: Run,
+        message: String,
+        events: &mut impl AgentEventSink,
+    ) -> Result<RunLoopOutput, RunLoopError> {
         self.record_runtime_error(&run, message.clone())?;
         let run = self
             .context
             .store
             .update_run_status(&run.id, RunStatus::Failed)?;
         tracing::error!(run_id = %run.id, "failed run");
+        self.emit_run_failed(events, message.clone());
         Err(RunLoopError::Runtime {
             run: Box::new(run),
             message,
@@ -314,12 +460,73 @@ where
             tools,
         })
     }
+
+    fn emit_iteration_started(&self, events: &mut impl AgentEventSink, index: usize) {
+        events.emit(AgentEvent::new(
+            AgentEventId::iteration(index),
+            AgentEventKind::Started,
+            AgentEventData::IterationStarted { index },
+        ));
+    }
+
+    fn emit_run_started(&self, events: &mut impl AgentEventSink, request: &str) {
+        events.emit(AgentEvent::new(
+            AgentEventId::run(),
+            AgentEventKind::Started,
+            AgentEventData::RunStarted {
+                request: request.to_owned(),
+            },
+        ));
+    }
+
+    fn emit_iteration_completed(&self, events: &mut impl AgentEventSink, index: usize) {
+        events.emit(AgentEvent::new(
+            AgentEventId::iteration(index),
+            AgentEventKind::Completed,
+            AgentEventData::IterationCompleted { index },
+        ));
+    }
+
+    fn emit_run_failed(&self, events: &mut impl AgentEventSink, error: String) {
+        events.emit(AgentEvent::new(
+            AgentEventId::run(),
+            AgentEventKind::Failed,
+            AgentEventData::RunFailed { error },
+        ));
+    }
 }
 
 struct AssistantTurn {
     final_answer: String,
     tool_calls: Vec<AssistantResponseItem>,
     items: Vec<AssistantResponseItem>,
+}
+
+struct ToolCallRequest {
+    id: String,
+    call_id: Option<String>,
+    name: String,
+    arguments: serde_json::Value,
+}
+
+impl ToolCallRequest {
+    fn from_assistant_item(item: &AssistantResponseItem) -> Option<Self> {
+        let AssistantResponseItem::ToolCall {
+            id,
+            call_id,
+            name,
+            arguments,
+        } = item
+        else {
+            return None;
+        };
+        Some(Self {
+            id: id.clone(),
+            call_id: call_id.clone(),
+            name: name.clone(),
+            arguments: arguments.clone(),
+        })
+    }
 }
 
 fn assistant_turn_from_response(

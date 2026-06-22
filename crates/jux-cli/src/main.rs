@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use jux_core::{
-    Run, RunLoop, RunLoopOutput, Session, SessionContextItem, SessionContextPayload, SessionId,
-    SqliteWorkspaceStore, Step, StepPayload, Workspace,
+    AgentEvent, AgentEventData, AgentEventKind, AgentEventSink, Run, RunLoop, RunLoopOutput,
+    Session, SessionContextItem, SessionContextPayload, SessionId, SqliteWorkspaceStore, Step,
+    StepPayload, Workspace,
 };
 use rig::{client::CompletionClient, completion::CompletionModel, providers::deepseek};
 use serde::Serialize;
@@ -71,6 +72,12 @@ struct RunArgs {
 
     #[arg(long, env = "JUX_DEEPSEEK_MODEL", default_value = DEFAULT_DEEPSEEK_MODEL, help = "DeepSeek model name.")]
     deepseek_model: String,
+
+    #[arg(
+        long,
+        help = "Stream hierarchical run events while the request executes."
+    )]
+    stream: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -132,7 +139,7 @@ fn handle_run(args: RunArgs, output_format: OutputFormat) -> Result<()> {
     let output = match args.provider {
         LlmProviderName::Deepseek => {
             let model = deepseek_model(args.deepseek_base_url, args.deepseek_model)?;
-            run_with_model(args.workspace, model, args.request)?
+            run_with_model(args.workspace, model, args.request, args.stream)?
         }
     };
     print_run_output(&output, output_format)?;
@@ -371,6 +378,7 @@ fn run_with_model<M>(
     workspace: PathBuf,
     model: M,
     request: String,
+    stream: bool,
 ) -> Result<jux_core::RunLoopOutput>
 where
     M: CompletionModel,
@@ -378,7 +386,67 @@ where
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     let store = SqliteWorkspaceStore::new(workspace);
     let run_loop = RunLoop::new(store, model);
-    Ok(runtime.block_on(run_loop.run(request))?)
+    if stream {
+        let mut events = StdoutAgentEventSink;
+        Ok(runtime.block_on(run_loop.run_with_events(request, &mut events))?)
+    } else {
+        Ok(runtime.block_on(run_loop.run(request))?)
+    }
+}
+
+struct StdoutAgentEventSink;
+
+impl AgentEventSink for StdoutAgentEventSink {
+    fn emit(&mut self, event: AgentEvent) {
+        let line = format!(
+            "{} {} {}",
+            event.id,
+            event_kind_label(event.kind),
+            event_message(&event.data)
+        );
+        if event.kind == AgentEventKind::Failed {
+            println!("\x1b[31m{line}\x1b[0m");
+        } else {
+            println!("{line}");
+        }
+    }
+}
+
+fn event_kind_label(kind: AgentEventKind) -> &'static str {
+    match kind {
+        AgentEventKind::Started => "started",
+        AgentEventKind::Output => "output",
+        AgentEventKind::Completed => "completed",
+        AgentEventKind::Failed => "failed",
+    }
+}
+
+fn event_message(data: &AgentEventData) -> String {
+    match data {
+        AgentEventData::RunStarted { request } => format!("request={request:?}"),
+        AgentEventData::RunCompleted { answer } => format!("answer={answer:?}"),
+        AgentEventData::RunFailed { error } => format!("error={error:?}"),
+        AgentEventData::IterationStarted { index } => format!("index={index}"),
+        AgentEventData::IterationCompleted { index } => format!("index={index}"),
+        AgentEventData::LlmStarted => "llm".to_owned(),
+        AgentEventData::LlmCompleted => "llm".to_owned(),
+        AgentEventData::LlmFailed { error } => format!("error={error:?}"),
+        AgentEventData::ToolStarted { name, call_id } => tool_message(name, call_id),
+        AgentEventData::ToolOutput { name, content } => format!("tool={name:?} content={content}"),
+        AgentEventData::ToolCompleted { name, call_id } => tool_message(name, call_id),
+        AgentEventData::ToolFailed {
+            name,
+            call_id,
+            error,
+        } => format!("{} error={error:?}", tool_message(name, call_id)),
+    }
+}
+
+fn tool_message(name: &str, call_id: &Option<String>) -> String {
+    match call_id {
+        Some(call_id) => format!("tool={name:?} call_id={call_id:?}"),
+        None => format!("tool={name:?}"),
+    }
 }
 
 fn deepseek_model(

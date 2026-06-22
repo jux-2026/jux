@@ -25,6 +25,13 @@ fn cli_exposes_foundation_commands() {
         .stdout(predicate::str::contains("--output"))
         .stdout(predicate::str::contains("run"))
         .stdout(predicate::str::contains("session"));
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args(["run", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--stream"));
 }
 
 #[test]
@@ -189,6 +196,48 @@ fn run_command_executes_mocked_tool_call_loop() {
     assert!(requests[0].contains("\"tools\""));
     assert!(requests[1].contains("cli tool result"));
     assert!(requests[1].contains("\"role\":\"tool\""));
+}
+
+#[test]
+fn run_command_can_stream_hierarchical_events() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock_sequence([
+        DeepseekMockResponse::tool_call(
+            "call_1",
+            "exec",
+            serde_json::json!({ "program": "printf", "args": ["streamed result"] }),
+        ),
+        DeepseekMockResponse::text("Final streamed answer"),
+    ]);
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Stream a tool run",
+            "--stream",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run started"))
+        .stdout(predicate::str::contains("run.iteration.1 started"))
+        .stdout(predicate::str::contains("run.iteration.1.llm.1 started"))
+        .stdout(predicate::str::contains(
+            "run.iteration.1.tool.exec.1 started",
+        ))
+        .stdout(predicate::str::contains(
+            "run.iteration.1.tool.exec.1 output",
+        ))
+        .stdout(predicate::str::contains("run completed"))
+        .stdout(predicate::str::contains("Final streamed answer"));
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 2);
 }
 
 #[test]
