@@ -1,11 +1,18 @@
 //! Core library for the Jux agent runtime.
 
+mod config;
 mod main_loop;
 mod policy;
 mod state;
 mod tools;
 mod util;
 
+pub use config::{
+    AgentConfig, ConfigError, FilesystemConfig, FilesystemPermissionConfig,
+    FilesystemRuleBaseConfig, FilesystemRuleConfig, HttpConfig, HttpMethodConfig, HttpRuleConfig,
+    JuxConfig, JuxConfigLoader, LoggingConfig, LoggingLevelConfig, MatchKindConfig, ModelConfig,
+    NativeConfig, NetworkConfig, ResolvedConfig, RuleEffect, SandboxConfig,
+};
 pub use main_loop::{RunLoop, RunLoopContext, RunLoopError, RunLoopOutput, SYSTEM_PROMPT};
 pub use policy::{
     MatchPattern, MatchPatternKind, NativeCommandPolicy, NativeCommandRule, RuntimePolicy,

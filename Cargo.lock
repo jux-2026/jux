@@ -2047,6 +2047,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml",
  "shlex 2.0.1",
  "tokio",
  "tracing",
