@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use jux_core::{
-    AgentEvent, AgentEventData, AgentEventKind, AgentEventSink, Run, RunLoop, RunLoopOutput,
-    Session, SessionContextItem, SessionContextPayload, SessionId, SqliteWorkspaceStore, Step,
-    StepPayload, Workspace,
+    AgentEvent, AgentEventData, AgentEventKind, AgentEventSink, InstructionDocument,
+    InstructionResolver, Run, RunLoop, RunLoopOutput, Session, SessionContextItem,
+    SessionContextPayload, SessionId, SqliteWorkspaceStore, Step, StepPayload, Workspace,
 };
 use rig::{client::CompletionClient, completion::CompletionModel, providers::deepseek};
 use serde::Serialize;
@@ -385,13 +385,27 @@ where
 {
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     let store = SqliteWorkspaceStore::new(workspace);
-    let run_loop = RunLoop::new(store, model);
+    let instructions = load_instruction_documents(store.root())?;
+    let policy = jux_core::RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let context =
+        jux_core::RunLoopContext::new(store, model, policy).with_instructions(instructions);
+    let run_loop = RunLoop::with_context(context);
     if stream {
         let mut events = StdoutAgentEventSink;
         Ok(runtime.block_on(run_loop.run_with_events(request, &mut events))?)
     } else {
         Ok(runtime.block_on(run_loop.run(request))?)
     }
+}
+
+fn load_instruction_documents(
+    workspace_root: &std::path::Path,
+) -> Result<Vec<InstructionDocument>> {
+    let resolver = match env::var_os("HOME") {
+        Some(home) => InstructionResolver::new(PathBuf::from(home), workspace_root),
+        None => InstructionResolver::project_only(workspace_root),
+    };
+    Ok(resolver.resolve()?)
 }
 
 struct StdoutAgentEventSink;

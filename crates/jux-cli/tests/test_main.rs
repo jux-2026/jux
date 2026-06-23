@@ -71,6 +71,45 @@ fn run_command_executes_mocked_llm_and_persists_state() {
 }
 
 #[test]
+fn run_command_loads_user_and_project_agents_documents() {
+    let home = TempDir::new().expect("temp home exists");
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock("Instruction answer");
+    std::fs::create_dir_all(home.path().join(".jux")).expect("user .jux exists");
+    std::fs::create_dir_all(workspace.path().join(".jux")).expect("project .jux exists");
+    std::fs::write(home.path().join(".jux/AGENTS.md"), "Use user agent rules.")
+        .expect("user agents file is written");
+    std::fs::write(
+        workspace.path().join(".jux/AGENTS.md"),
+        "Use project agent rules.",
+    )
+    .expect("project agents file is written");
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Use instruction documents",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("HOME", home.path())
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Instruction answer"));
+
+    let requests = mock.join();
+    let request = requests.first().expect("mock receives one request");
+    assert!(request.contains("Project instructions have higher priority than user instructions."));
+    assert!(request.contains("Use user agent rules."));
+    assert!(request.contains("Use project agent rules."));
+    assert!(request.find("Use user agent rules.") < request.find("Use project agent rules."));
+}
+
+#[test]
 fn run_command_can_output_json() {
     let workspace = TempDir::new().expect("temp workspace exists");
     let mock = start_deepseek_mock("JSON answer");

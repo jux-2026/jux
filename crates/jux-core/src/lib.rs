@@ -1,6 +1,7 @@
 //! Core library for the Jux agent runtime.
 
 mod config;
+mod instructions;
 mod main_loop;
 mod policy;
 mod state;
@@ -12,6 +13,10 @@ pub use config::{
     FilesystemRuleBaseConfig, FilesystemRuleConfig, HttpConfig, HttpMethodConfig, HttpRuleConfig,
     JuxConfig, JuxConfigLoader, LoggingConfig, LoggingLevelConfig, MatchKindConfig, ModelConfig,
     NativeConfig, NetworkConfig, ResolvedConfig, RuleEffect, SandboxConfig,
+};
+pub use instructions::{
+    InstructionDocument, InstructionError, InstructionResolver, InstructionScope,
+    render_instruction_documents,
 };
 pub use main_loop::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AgentEventSink, NoopAgentEventSink,

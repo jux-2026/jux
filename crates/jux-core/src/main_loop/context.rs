@@ -1,3 +1,4 @@
+use crate::instructions::InstructionDocument;
 use crate::policy::RuntimePolicy;
 use crate::state::SqliteWorkspaceStore;
 use crate::tools::ToolExecutionContext;
@@ -17,6 +18,7 @@ pub struct RunLoopContext<M> {
     pub store: SqliteWorkspaceStore,
     pub model: M,
     pub policy: RuntimePolicy,
+    pub instructions: Vec<InstructionDocument>,
 }
 
 impl<M> RunLoopContext<M> {
@@ -26,7 +28,14 @@ impl<M> RunLoopContext<M> {
             store,
             model,
             policy,
+            instructions: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_instructions(mut self, instructions: Vec<InstructionDocument>) -> Self {
+        self.instructions = instructions;
+        self
     }
 
     #[must_use]

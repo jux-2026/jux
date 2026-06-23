@@ -1,7 +1,8 @@
 use jux_core::{
-    AgentEvent, AgentEventKind, AgentEventSink, AssistantResponseItem, LlmUsage, RunLoop,
-    RunLoopContext, RunLoopError, RunStatus, RuntimePolicy, SYSTEM_PROMPT, SessionContextKind,
-    SessionContextPayload, SqliteWorkspaceStore, StepKind, StepPayload,
+    AgentEvent, AgentEventKind, AgentEventSink, AssistantResponseItem, InstructionDocument,
+    InstructionScope, LlmUsage, RunLoop, RunLoopContext, RunLoopError, RunStatus, RuntimePolicy,
+    SYSTEM_PROMPT, SessionContextKind, SessionContextPayload, SqliteWorkspaceStore, StepKind,
+    StepPayload,
 };
 use rig::OneOrMany;
 use rig::completion::{
@@ -71,6 +72,38 @@ fn run_loop_records_successful_llm_run_steps() {
     assert_eq!(
         output.steps[1].payload.to_assistant_usage(),
         Some(&LlmUsage::default())
+    );
+}
+
+#[test]
+fn run_loop_sends_user_and_project_instruction_documents_to_llm() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::fixed_text("Instruction-aware answer");
+    let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let context =
+        RunLoopContext::new(store.clone(), model.clone(), policy).with_instructions(vec![
+            InstructionDocument {
+                scope: InstructionScope::User,
+                path: "/home/user/.jux/AGENTS.md".into(),
+                content: "Always prefer user defaults.".to_owned(),
+            },
+            InstructionDocument {
+                scope: InstructionScope::Project,
+                path: "/workspace/.jux/AGENTS.md".into(),
+                content: "Project instructions win.".to_owned(),
+            },
+        ]);
+    let run_loop = RunLoop::with_context(context);
+
+    futures::executor::block_on(run_loop.run("Read instructions".to_owned()))
+        .expect("run loop succeeds");
+    let request = model.recorded_requests().remove(0);
+
+    assert!(request.contains("Project instructions have higher priority than user instructions."));
+    assert!(request.contains("Always prefer user defaults."));
+    assert!(request.contains("Project instructions win."));
+    assert!(
+        request.find("Always prefer user defaults.") < request.find("Project instructions win.")
     );
 }
 
