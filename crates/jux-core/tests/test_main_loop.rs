@@ -1,8 +1,8 @@
 use jux_core::{
     AgentEvent, AgentEventKind, AgentEventSink, AssistantResponseItem, InstructionDocument,
     InstructionScope, LlmUsage, RunLoop, RunLoopContext, RunLoopError, RunStatus, RuntimePolicy,
-    SYSTEM_PROMPT, SessionContextKind, SessionContextPayload, SqliteWorkspaceStore, StepKind,
-    StepPayload,
+    SYSTEM_PROMPT, SessionContextKind, SessionContextPayload, SkillDefinition, SkillScope,
+    SqliteWorkspaceStore, StepKind, StepPayload,
 };
 use rig::OneOrMany;
 use rig::completion::{
@@ -105,6 +105,31 @@ fn run_loop_sends_user_and_project_instruction_documents_to_llm() {
     assert!(
         request.find("Always prefer user defaults.") < request.find("Project instructions win.")
     );
+}
+
+#[test]
+fn run_loop_sends_available_skill_index_to_llm_without_full_skill_body() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::fixed_text("Skill-aware answer");
+    let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let context = RunLoopContext::new(store.clone(), model.clone(), policy).with_skills(vec![
+        SkillDefinition {
+            name: "review".to_owned(),
+            description: "Review code changes".to_owned(),
+            content: "Full review skill body should not be in the index.".to_owned(),
+            scope: SkillScope::Project,
+            path: "/workspace/.jux/skills/review/SKILL.md".into(),
+        },
+    ]);
+    let run_loop = RunLoop::with_context(context);
+
+    futures::executor::block_on(run_loop.run("Use available skills".to_owned()))
+        .expect("run loop succeeds");
+    let request = model.recorded_requests().remove(0);
+
+    assert!(request.contains("## Available Skills"));
+    assert!(request.contains("- review: Review code changes"));
+    assert!(!request.contains("Full review skill body should not be in the index."));
 }
 
 #[test]

@@ -144,6 +144,39 @@ fn run_command_loads_user_agents_documents_from_userprofile() {
 }
 
 #[test]
+fn run_command_loads_available_skill_index() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock("Skill index answer");
+    write_skill(
+        workspace.path(),
+        "review",
+        "Review code changes",
+        "Full review skill body should not be sent in the index.",
+    );
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Use available skills",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Skill index answer"));
+
+    let requests = mock.join();
+    let request = requests.first().expect("mock receives one request");
+    assert!(request.contains("## Available Skills"));
+    assert!(request.contains("- review: Review code changes"));
+    assert!(!request.contains("Full review skill body should not be sent in the index."));
+}
+
+#[test]
 fn run_command_can_output_json() {
     let workspace = TempDir::new().expect("temp workspace exists");
     let mock = start_deepseek_mock("JSON answer");
@@ -572,4 +605,11 @@ fn request_body_len(request: &[u8]) -> usize {
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .map_or(0, |header_end| request.len().saturating_sub(header_end + 4))
+}
+
+fn write_skill(root: &std::path::Path, name: &str, description: &str, content: &str) {
+    let directory = root.join(".jux/skills").join(name);
+    std::fs::create_dir_all(&directory).expect("skill directory is created");
+    let skill = format!("---\nname: {name}\ndescription: {description}\n---\n{content}");
+    std::fs::write(directory.join("SKILL.md"), skill).expect("skill file is written");
 }

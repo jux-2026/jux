@@ -1,5 +1,6 @@
 use crate::instructions::InstructionDocument;
 use crate::policy::RuntimePolicy;
+use crate::skills::SkillDefinition;
 use crate::state::SqliteWorkspaceStore;
 use crate::tools::ToolExecutionContext;
 
@@ -19,6 +20,7 @@ pub struct RunLoopContext<M> {
     pub model: M,
     pub policy: RuntimePolicy,
     pub instructions: Vec<InstructionDocument>,
+    pub skills: Vec<SkillDefinition>,
 }
 
 impl<M> RunLoopContext<M> {
@@ -29,12 +31,19 @@ impl<M> RunLoopContext<M> {
             model,
             policy,
             instructions: Vec::new(),
+            skills: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn with_instructions(mut self, instructions: Vec<InstructionDocument>) -> Self {
         self.instructions = instructions;
+        self
+    }
+
+    #[must_use]
+    pub fn with_skills(mut self, skills: Vec<SkillDefinition>) -> Self {
+        self.skills = skills;
         self
     }
 

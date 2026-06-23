@@ -1,9 +1,10 @@
 //! Skill discovery.
 //!
 //! Skills are reusable instruction packages stored under `.jux/skills`.
-//! This module currently discovers available skills only; metadata parsing and
-//! prompt injection are handled by later feature slices.
+//! This module discovers available skills and validates the basic `SKILL.md`
+//! shape. Prompt injection is handled by later feature slices.
 
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -17,8 +18,16 @@ const SKILL_FILE_NAME: &str = "SKILL.md";
 /// One discovered skill.
 pub struct SkillDefinition {
     pub name: String,
+    pub description: String,
+    pub content: String,
     pub scope: SkillScope,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +101,19 @@ impl Display for SkillError {
 
 impl Error for SkillError {}
 
+#[must_use]
+/// Renders the available skill index for inclusion in the system prompt.
+pub fn render_skill_index(skills: &[SkillDefinition]) -> String {
+    let mut output = String::from(
+        "## Available Skills\n\n\
+         Project skills override user skills with the same name.\n\n",
+    );
+    for skill in skills {
+        output.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+    }
+    output
+}
+
 fn discover_skills(
     skills: &mut BTreeMap<String, SkillDefinition>,
     scope: SkillScope,
@@ -114,27 +136,26 @@ fn discover_skills(
                 directory.display()
             ))
         })?;
-        insert_skill(skills, scope, entry.path());
+        insert_skill(skills, scope, entry.path())?;
     }
     Ok(())
 }
 
-fn insert_skill(skills: &mut BTreeMap<String, SkillDefinition>, scope: SkillScope, path: PathBuf) {
+fn insert_skill(
+    skills: &mut BTreeMap<String, SkillDefinition>,
+    scope: SkillScope,
+    path: PathBuf,
+) -> Result<(), SkillError> {
     let Some(name) = skill_directory_name(&path) else {
-        return;
+        return Ok(());
     };
     let skill_file = path.join(SKILL_FILE_NAME);
     if !skill_file.is_file() {
-        return;
+        return Ok(());
     }
-    skills.insert(
-        name.clone(),
-        SkillDefinition {
-            name,
-            scope,
-            path: skill_file,
-        },
-    );
+    let skill = parse_skill_file(name, scope, skill_file)?;
+    skills.insert(skill.name.clone(), skill);
+    Ok(())
 }
 
 fn skill_directory_name(path: &Path) -> Option<String> {
@@ -142,4 +163,75 @@ fn skill_directory_name(path: &Path) -> Option<String> {
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
+}
+
+fn parse_skill_file(
+    expected_name: String,
+    scope: SkillScope,
+    path: PathBuf,
+) -> Result<SkillDefinition, SkillError> {
+    let raw = fs::read_to_string(&path).map_err(|error| {
+        SkillError::new(format!(
+            "failed to read skill file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if raw.trim().is_empty() {
+        return Err(SkillError::new(format!(
+            "empty skill file {}",
+            path.display()
+        )));
+    }
+    let (frontmatter, content) = split_skill_file(&raw, &path)?;
+    let metadata = parse_frontmatter(frontmatter, &path)?;
+    let name = required_field(metadata.name, "name", &path)?;
+    let description = required_field(metadata.description, "description", &path)?;
+    if name != expected_name {
+        return Err(SkillError::new(format!(
+            "skill name {name:?} does not match directory name {expected_name:?}"
+        )));
+    }
+    Ok(SkillDefinition {
+        name,
+        description,
+        content: content.trim().to_owned(),
+        scope,
+        path,
+    })
+}
+
+fn split_skill_file<'a>(raw: &'a str, path: &Path) -> Result<(&'a str, &'a str), SkillError> {
+    let Some(rest) = raw.strip_prefix("---") else {
+        return Err(SkillError::new(format!(
+            "skill file {} is missing frontmatter",
+            path.display()
+        )));
+    };
+    let Some((frontmatter, content)) = rest.split_once("\n---") else {
+        return Err(SkillError::new(format!(
+            "skill file {} has unterminated frontmatter",
+            path.display()
+        )));
+    };
+    Ok((frontmatter, content.trim_start_matches(['\r', '\n'])))
+}
+
+fn parse_frontmatter(frontmatter: &str, path: &Path) -> Result<SkillFrontmatter, SkillError> {
+    serde_yaml::from_str(frontmatter).map_err(|error| {
+        SkillError::new(format!(
+            "failed to parse skill frontmatter {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn required_field(value: Option<String>, field: &str, path: &Path) -> Result<String, SkillError> {
+    let value = value.unwrap_or_default();
+    if value.trim().is_empty() {
+        return Err(SkillError::new(format!(
+            "skill file {} is missing {field}",
+            path.display()
+        )));
+    }
+    Ok(value)
 }

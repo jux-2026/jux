@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventKind, AgentEventSink, InstructionDocument,
     InstructionResolver, Run, RunLoop, RunLoopOutput, Session, SessionContextItem,
-    SessionContextPayload, SessionId, SqliteWorkspaceStore, Step, StepPayload, Workspace,
+    SessionContextPayload, SessionId, SkillDefinition, SkillResolver, SqliteWorkspaceStore, Step,
+    StepPayload, Workspace,
 };
 use rig::{client::CompletionClient, completion::CompletionModel, providers::deepseek};
 use serde::Serialize;
@@ -386,9 +387,11 @@ where
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     let store = SqliteWorkspaceStore::new(workspace);
     let instructions = load_instruction_documents(store.root())?;
+    let skills = load_skill_definitions(store.root())?;
     let policy = jux_core::RuntimePolicy::workspace_default(store.root().to_path_buf());
-    let context =
-        jux_core::RunLoopContext::new(store, model, policy).with_instructions(instructions);
+    let context = jux_core::RunLoopContext::new(store, model, policy)
+        .with_instructions(instructions)
+        .with_skills(skills);
     let run_loop = RunLoop::with_context(context);
     if stream {
         let mut events = StdoutAgentEventSink;
@@ -428,6 +431,14 @@ fn windows_home_drive_path() -> Option<PathBuf> {
         drive.to_string_lossy(),
         path.to_string_lossy()
     )))
+}
+
+fn load_skill_definitions(workspace_root: &std::path::Path) -> Result<Vec<SkillDefinition>> {
+    let resolver = match user_home_dir_from_env() {
+        Some(home) => SkillResolver::new(home, workspace_root),
+        None => SkillResolver::project_only(workspace_root),
+    };
+    Ok(resolver.resolve()?)
 }
 
 struct StdoutAgentEventSink;
