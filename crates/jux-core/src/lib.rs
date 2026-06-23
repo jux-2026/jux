@@ -4,6 +4,7 @@ mod config;
 mod instructions;
 mod main_loop;
 mod policy;
+mod skills;
 mod state;
 mod tools;
 mod util;
@@ -29,6 +30,7 @@ pub use policy::{
     WasmHttpMatchKind, WasmHttpMethod, WasmHttpRule, WasmHttpRuleEffect, WasmNetworkPolicy,
     WasmPackageRule, WasmPackageSource, WasmSandboxPolicy,
 };
+pub use skills::{SkillDefinition, SkillError, SkillResolver, SkillScope};
 pub use state::{
     AssistantResponseItem, LlmUsage, Run, RunId, RunStatus, Session, SessionContextItem,
     SessionContextKind, SessionContextPayload, SessionId, SqliteWorkspaceStore, Step, StepId,
