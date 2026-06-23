@@ -110,6 +110,40 @@ fn run_command_loads_user_and_project_agents_documents() {
 }
 
 #[test]
+fn run_command_loads_user_agents_documents_from_userprofile() {
+    let home = TempDir::new().expect("temp home exists");
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock("Userprofile instruction answer");
+    std::fs::create_dir_all(home.path().join(".jux")).expect("user .jux exists");
+    std::fs::write(
+        home.path().join(".jux/AGENTS.md"),
+        "Use userprofile agent rules.",
+    )
+    .expect("user agents file is written");
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Use USERPROFILE instruction documents",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env_remove("HOME")
+        .env("USERPROFILE", home.path())
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Userprofile instruction answer"));
+
+    let requests = mock.join();
+    let request = requests.first().expect("mock receives one request");
+    assert!(request.contains("Use userprofile agent rules."));
+}
+
+#[test]
 fn run_command_can_output_json() {
     let workspace = TempDir::new().expect("temp workspace exists");
     let mock = start_deepseek_mock("JSON answer");

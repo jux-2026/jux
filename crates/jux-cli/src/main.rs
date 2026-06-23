@@ -401,11 +401,33 @@ where
 fn load_instruction_documents(
     workspace_root: &std::path::Path,
 ) -> Result<Vec<InstructionDocument>> {
-    let resolver = match env::var_os("HOME") {
-        Some(home) => InstructionResolver::new(PathBuf::from(home), workspace_root),
+    let resolver = match user_home_dir_from_env() {
+        Some(home) => InstructionResolver::new(home, workspace_root),
         None => InstructionResolver::project_only(workspace_root),
     };
     Ok(resolver.resolve()?)
+}
+
+fn user_home_dir_from_env() -> Option<PathBuf> {
+    env_path("HOME")
+        .or_else(|| env_path("USERPROFILE"))
+        .or_else(windows_home_drive_path)
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn windows_home_drive_path() -> Option<PathBuf> {
+    let drive = env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
+    let path = env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
+    Some(PathBuf::from(format!(
+        "{}{}",
+        drive.to_string_lossy(),
+        path.to_string_lossy()
+    )))
 }
 
 struct StdoutAgentEventSink;
