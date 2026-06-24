@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Local project state container.
+///
+/// A workspace represents one filesystem root known to Jux. It owns the active
+/// session pointer used by commands that do not explicitly select a session.
 pub struct Workspace {
     pub id: WorkspaceId,
     pub root: PathBuf,
@@ -28,6 +32,11 @@ impl Workspace {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Long-lived conversation container within a workspace.
+///
+/// A session groups multiple runs under one shared history. The run loop builds
+/// new LLM requests from the session context plus visible steps from previous
+/// runs in the same session.
 pub struct Session {
     pub id: SessionId,
     pub name: Option<String>,
@@ -50,6 +59,11 @@ impl Session {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// Persisted context item shared by all runs in a session.
+///
+/// Session context stores stable prompt material, such as the system prompt and
+/// tool definitions. It is separate from run steps so the same context can be
+/// reused across multiple user requests.
 pub struct SessionContextItem {
     pub session_id: SessionId,
     pub sequence: u64,
@@ -81,12 +95,14 @@ impl SessionContextItem {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Type tag for a session context item.
 pub enum SessionContextKind {
     SystemPrompt,
     ToolDefinition,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// Strongly typed payload for session-level context.
 pub enum SessionContextPayload {
     SystemPrompt {
         content: String,
@@ -99,6 +115,11 @@ pub enum SessionContextPayload {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// One execution of a user request.
+///
+/// A run starts in [`RunStatus::Running`], records ordered steps as the agent
+/// loop progresses, and eventually becomes completed or failed. A run belongs
+/// to a session through its hierarchical [`RunId`].
 pub struct Run {
     pub id: RunId,
     pub request: String,
@@ -128,6 +149,10 @@ impl Run {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Lifecycle state of a run.
+///
+/// The current state model is intentionally small: a run is either actively
+/// executing, completed with an answer, or failed with an error step.
 pub enum RunStatus {
     Running,
     Completed,
@@ -135,6 +160,11 @@ pub enum RunStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// Ordered persisted event within a run.
+///
+/// Steps are the audit trail and the replay source for LLM history. Only steps
+/// marked visible by [`Step::visible_to_llm`] are converted back into chat
+/// messages for later LLM calls.
 pub struct Step {
     pub id: StepId,
     pub kind: StepKind,
@@ -167,6 +197,7 @@ impl Step {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Type tag for a persisted run step.
 pub enum StepKind {
     UserMessage,
     AssistantResponse,
@@ -175,6 +206,7 @@ pub enum StepKind {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// Strongly typed payload for a run step.
 pub enum StepPayload {
     UserMessage {
         content: String,
@@ -195,6 +227,7 @@ pub enum StepPayload {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+/// Token usage reported by an LLM completion.
 pub struct LlmUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -204,6 +237,10 @@ pub struct LlmUsage {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// One item inside an assistant response.
+///
+/// A response can contain visible text, hidden reasoning that is recorded but
+/// not sent back to the model, and tool calls that the run loop can execute.
 pub enum AssistantResponseItem {
     Text {
         content: String,
