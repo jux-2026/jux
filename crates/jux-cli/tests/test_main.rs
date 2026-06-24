@@ -404,6 +404,106 @@ fn run_command_can_disable_auto_skill_matching() {
 }
 
 #[test]
+fn run_command_waits_for_human_input_and_resumes_latest_run() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock_sequence([
+        DeepseekMockResponse::tool_call(
+            "call_1",
+            "human_input",
+            serde_json::json!({
+                "prompt": "Choose an action",
+                "options": [{ "id": "continue", "label": "Continue" }],
+                "allow_free_text": false
+            }),
+        ),
+        DeepseekMockResponse::text("Continued after human input"),
+    ]);
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Ask a human",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Waiting for human input"))
+        .stdout(predicate::str::contains("Choose an action"))
+        .stdout(predicate::str::contains("continue"))
+        .stdout(predicate::str::contains("Continue"));
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "continue",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Continued after human input"));
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("continue"));
+}
+
+#[test]
+fn run_command_rejects_invalid_human_input_option() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock_sequence([DeepseekMockResponse::tool_call(
+        "call_1",
+        "human_input",
+        serde_json::json!({
+            "prompt": "Choose an action",
+            "options": [{ "id": "continue", "label": "Continue" }],
+            "allow_free_text": false
+        }),
+    )]);
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Ask a human",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success();
+    assert_eq!(mock.join().len(), 1);
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "different",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            "http://127.0.0.1:1",
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "human input must match one of the option ids",
+        ));
+}
+
+#[test]
 fn run_command_streams_active_skill_selection() {
     let workspace = TempDir::new().expect("temp workspace exists");
     let mock = start_deepseek_mock("Streamed skill answer");

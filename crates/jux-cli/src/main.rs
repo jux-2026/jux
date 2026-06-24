@@ -2,12 +2,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventKind, AgentEventSink, InstructionDocument,
-    InstructionResolver, Run, RunLoop, RunLoopOutput, Session, SessionContextItem,
+    InstructionResolver, Run, RunLoop, RunLoopOutput, RunStatus, Session, SessionContextItem,
     SessionContextPayload, SessionId, SkillCatalog, SkillDefinition, SkillResolver,
     SqliteWorkspaceStore, Step, StepPayload, Workspace, match_auto_skills, select_explicit_skills,
 };
 use rig::{client::CompletionClient, completion::CompletionModel, providers::deepseek};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
 use tokio::runtime::Builder;
@@ -222,6 +222,8 @@ fn print_run_output(output: &RunLoopOutput, output_format: OutputFormat) -> Resu
         OutputFormat::Text => {
             if let Some(answer) = &output.answer {
                 println!("{answer}");
+            } else if output.run.status == RunStatus::WaitingForHumanInput {
+                print_human_input_request(output);
             }
         }
         OutputFormat::Json => {
@@ -239,6 +241,25 @@ fn print_run_output(output: &RunLoopOutput, output_format: OutputFormat) -> Resu
     }
 
     Ok(())
+}
+
+fn print_human_input_request(output: &RunLoopOutput) {
+    println!("Waiting for human input");
+    if let Some(input) = latest_human_input_request(&output.steps) {
+        println!("prompt: {}", input.prompt);
+        if let Some(reason) = input.reason {
+            println!("reason: {reason}");
+        }
+        if !input.options.is_empty() {
+            println!("options:");
+            for option in input.options {
+                println!("  {} {}", option.id, option.label);
+            }
+        }
+        if !input.allow_free_text {
+            println!("reply with one of the option ids");
+        }
+    }
 }
 
 fn print_skills_list_output(output: &SkillsListOutput, output_format: OutputFormat) -> Result<()> {
@@ -529,6 +550,7 @@ struct RunCommandOutput {
     request: String,
     status: String,
     answer: Option<String>,
+    human_input: Option<HumanInputOutput>,
     created_at: u128,
     updated_at: u128,
     steps: Vec<RunStepOutput>,
@@ -560,11 +582,29 @@ impl From<&RunLoopOutput> for RunCommandOutput {
             request: output.run.request.clone(),
             status: format!("{:?}", output.run.status),
             answer: output.answer.clone(),
+            human_input: latest_human_input_request(&output.steps),
             created_at: output.run.created_at,
             updated_at: output.run.updated_at,
             steps: output.steps.iter().map(RunStepOutput::from).collect(),
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HumanInputOutput {
+    prompt: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    options: Vec<HumanInputOptionOutput>,
+    #[serde(default)]
+    allow_free_text: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HumanInputOptionOutput {
+    id: String,
+    label: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -574,6 +614,25 @@ struct RunStepOutput {
     payload: StepPayload,
     created_at: u128,
     updated_at: u128,
+}
+
+fn latest_human_input_request(steps: &[Step]) -> Option<HumanInputOutput> {
+    steps.iter().rev().find_map(|step| {
+        let StepPayload::AssistantResponse { items, .. } = &step.payload else {
+            return None;
+        };
+        items.iter().rev().find_map(|item| {
+            let jux_core::AssistantResponseItem::ToolCall {
+                name, arguments, ..
+            } = item
+            else {
+                return None;
+            };
+            (name == "human_input")
+                .then(|| serde_json::from_value(arguments.clone()).ok())
+                .flatten()
+        })
+    })
 }
 
 impl From<&Step> for RunStepOutput {

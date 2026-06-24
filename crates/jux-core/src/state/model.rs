@@ -152,9 +152,11 @@ impl Run {
 /// Lifecycle state of a run.
 ///
 /// The current state model is intentionally small: a run is either actively
-/// executing, completed with an answer, or failed with an error step.
+/// executing, waiting for a human-provided tool result, completed with an
+/// answer, or failed with an error step.
 pub enum RunStatus {
     Running,
+    WaitingForHumanInput,
     Completed,
     Failed,
 }

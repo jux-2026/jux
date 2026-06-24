@@ -8,9 +8,12 @@
 //!
 //! Concrete tool families live in submodules such as `lua` and `wasm`.
 
+mod human_input;
 pub(crate) mod lua;
 pub(crate) mod wasm;
 
+pub(crate) use self::human_input::HUMAN_INPUT_TOOL_NAME;
+use self::human_input::human_input_tool;
 use self::lua::lua_tool;
 use self::wasm::exec_tool;
 use crate::RuntimePolicy;
@@ -52,5 +55,9 @@ pub(crate) fn execute_tool(
 }
 
 fn tools() -> Vec<Box<dyn JuxTool>> {
-    vec![Box::new(exec_tool()), Box::new(lua_tool())]
+    vec![
+        Box::new(exec_tool()),
+        Box::new(lua_tool()),
+        Box::new(human_input_tool()),
+    ]
 }

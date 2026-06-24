@@ -42,7 +42,7 @@ fn run_loop_records_successful_llm_run_steps() {
     let context_items = store
         .load_session_context_items(&output.session.id)
         .expect("session context loads");
-    assert_eq!(context_items.len(), 3);
+    assert_eq!(context_items.len(), 4);
     assert_eq!(context_items[0].sequence, 1);
     assert_eq!(context_items[0].kind, SessionContextKind::SystemPrompt);
     assert_eq!(
@@ -55,6 +55,8 @@ fn run_loop_records_successful_llm_run_steps() {
     assert_eq!(context_items[1].payload.to_tool_name(), Some("exec"));
     assert_eq!(context_items[2].sequence, 3);
     assert_eq!(context_items[2].payload.to_tool_name(), Some("lua"));
+    assert_eq!(context_items[3].sequence, 4);
+    assert_eq!(context_items[3].payload.to_tool_name(), Some("human_input"));
     assert_eq!(requests.len(), 1);
     assert!(requests[0].contains("You are Jux"));
     assert!(requests[0].contains("Explain this project"));
@@ -181,7 +183,7 @@ fn run_loop_uses_session_history_when_calling_llm() {
     let context_items = store
         .load_session_context_items(&store.load_active_session().expect("session loads").id)
         .expect("session context loads");
-    assert_eq!(context_items.len(), 3);
+    assert_eq!(context_items.len(), 4);
 }
 
 #[test]
@@ -328,6 +330,87 @@ fn run_loop_executes_lua_tool_call_and_continues_until_final_answer() {
     assert!(requests[0].contains("You are Jux"));
     assert!(requests[0].contains("Use the lua tool"));
     assert!(requests[1].contains("hello from lua"));
+}
+
+#[test]
+fn run_loop_waits_for_human_input_and_resumes_same_run() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "human_input",
+            serde_json::json!({
+                "prompt": "Choose an action",
+                "options": [{ "id": "continue", "label": "Continue" }],
+                "allow_free_text": false
+            }),
+        ))]),
+        Ok(vec![AssistantContent::text("Continued after human input")]),
+    ]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
+
+    let waiting_output = futures::executor::block_on(run_loop.run("Ask a human".to_owned()))
+        .expect("run loop waits for human input");
+    let resumed_output = futures::executor::block_on(run_loop.run("continue".to_owned()))
+        .expect("run loop resumes with human input");
+    let requests = model.recorded_requests();
+
+    assert_eq!(waiting_output.run.status, RunStatus::WaitingForHumanInput);
+    assert_eq!(resumed_output.run.id, waiting_output.run.id);
+    assert_eq!(resumed_output.run.status, RunStatus::Completed);
+    assert_eq!(
+        resumed_output.answer.as_deref(),
+        Some("Continued after human input")
+    );
+    assert_eq!(
+        resumed_output
+            .steps
+            .iter()
+            .map(|step| step.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            StepKind::UserMessage,
+            StepKind::AssistantResponse,
+            StepKind::ToolResult,
+            StepKind::AssistantResponse,
+        ]
+    );
+    assert!(
+        resumed_output.steps[2]
+            .payload
+            .to_tool_result_content()
+            .is_some_and(|content| content["input"] == "continue")
+    );
+    assert!(requests[0].contains("\"name\":\"human_input\""));
+    assert!(requests[1].contains("continue"));
+}
+
+#[test]
+fn run_loop_rejects_invalid_human_input_option() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([Ok(vec![AssistantContent::ToolCall(test_tool_call(
+        "call_1",
+        "human_input",
+        serde_json::json!({
+            "prompt": "Choose an action",
+            "options": [{ "id": "continue", "label": "Continue" }],
+            "allow_free_text": false
+        }),
+    ))])]);
+    let run_loop = RunLoop::new(store.clone(), model.clone());
+
+    let waiting_output = futures::executor::block_on(run_loop.run("Ask a human".to_owned()))
+        .expect("run loop waits for human input");
+    let error = futures::executor::block_on(run_loop.run("different".to_owned()))
+        .expect_err("invalid human input fails");
+
+    assert_eq!(waiting_output.run.status, RunStatus::WaitingForHumanInput);
+    assert!(
+        error
+            .to_string()
+            .contains("must match one of the option ids")
+    );
+    assert_eq!(model.recorded_requests().len(), 1);
 }
 
 #[test]

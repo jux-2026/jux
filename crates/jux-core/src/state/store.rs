@@ -596,6 +596,7 @@ fn parse_timestamp(value: String) -> u128 {
 fn encode_run_status(status: &RunStatus) -> &'static str {
     match status {
         RunStatus::Running => "running",
+        RunStatus::WaitingForHumanInput => "waiting_for_human_input",
         RunStatus::Completed => "completed",
         RunStatus::Failed => "failed",
     }
@@ -604,6 +605,7 @@ fn encode_run_status(status: &RunStatus) -> &'static str {
 fn decode_run_status(status: String) -> Result<RunStatus, StoreError> {
     match status.as_str() {
         "running" => Ok(RunStatus::Running),
+        "waiting_for_human_input" => Ok(RunStatus::WaitingForHumanInput),
         "completed" => Ok(RunStatus::Completed),
         "failed" => Ok(RunStatus::Failed),
         _ => Err(StoreError::InvalidStatus(status)),

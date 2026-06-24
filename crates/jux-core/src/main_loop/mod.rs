@@ -22,7 +22,7 @@ use crate::state::{
     SessionContextPayload, Step, StepKind, StepPayload, Workspace,
 };
 use crate::state::{SqliteWorkspaceStore, StoreError};
-use crate::tools::{execute_tool, tool_definitions};
+use crate::tools::{HUMAN_INPUT_TOOL_NAME, execute_tool, tool_definitions};
 use rig::OneOrMany;
 use rig::completion::{
     CompletionError, CompletionModel, CompletionResponse, ToolDefinition, Usage,
@@ -30,6 +30,7 @@ use rig::completion::{
 use rig::message::{
     AssistantContent, Message, ToolCall, ToolFunction, ToolResult, ToolResultContent,
 };
+use serde::Deserialize;
 use serde_json::json;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -78,10 +79,22 @@ where
         request: String,
         events: &mut impl AgentEventSink,
     ) -> Result<RunLoopOutput, RunLoopError> {
+        if let Some(run) = self.latest_waiting_run()? {
+            let run = self.resume_waiting_run(run, request)?;
+            return self.continue_run(run, events).await;
+        }
+
         let run = self.start_run(request)?;
         self.emit_run_started(events, &run.request);
         self.emit_skills_selected(events);
+        self.continue_run(run, events).await
+    }
 
+    async fn continue_run(
+        &self,
+        run: Run,
+        events: &mut impl AgentEventSink,
+    ) -> Result<RunLoopOutput, RunLoopError> {
         for iteration_index in 1..=MAX_LOOP_ITERATIONS {
             self.emit_iteration_started(events, iteration_index);
             let response = self
@@ -106,6 +119,11 @@ where
                 items,
             )?;
 
+            if let Some(tool_call) = human_input_tool_call(&tool_calls) {
+                self.emit_iteration_completed(events, iteration_index);
+                return self.wait_for_human_input(run, tool_call, events);
+            }
+
             if tool_calls.is_empty() {
                 self.emit_iteration_completed(events, iteration_index);
                 return self.complete_run(run, final_answer, events);
@@ -122,6 +140,52 @@ where
             "run loop reached the maximum number of iterations".to_owned(),
             events,
         )
+    }
+
+    fn latest_waiting_run(&self) -> Result<Option<Run>, RunLoopError> {
+        let session = match self.context.store.load_active_session() {
+            Ok(session) => session,
+            Err(StoreError::MissingWorkspace) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(run) = self
+            .context
+            .store
+            .load_session_runs(&session.id)?
+            .into_iter()
+            .last()
+        else {
+            return Ok(None);
+        };
+        Ok((run.status == RunStatus::WaitingForHumanInput).then_some(run))
+    }
+
+    fn resume_waiting_run(&self, run: Run, input: String) -> Result<Run, RunLoopError> {
+        let steps = self.context.store.load_run_steps(&run.id)?;
+        let tool_call =
+            latest_pending_human_input_call(&steps).ok_or_else(|| RunLoopError::Runtime {
+                run: Box::new(run.clone()),
+                message: "waiting run has no pending human_input tool call".to_owned(),
+            })?;
+        validate_human_input(&tool_call.arguments, &input).map_err(|message| {
+            RunLoopError::Runtime {
+                run: Box::new(run.clone()),
+                message,
+            }
+        })?;
+        self.context.store.append_step(
+            &run.id,
+            StepKind::ToolResult,
+            StepPayload::ToolResult {
+                id: tool_call.id,
+                call_id: tool_call.call_id,
+                content: json!({ "input": input }),
+            },
+        )?;
+        Ok(self
+            .context
+            .store
+            .update_run_status(&run.id, RunStatus::Running)?)
     }
 
     async fn complete_llm_call(
@@ -325,6 +389,28 @@ where
             },
         ));
         json!({ "success": false, "error": error })
+    }
+
+    fn wait_for_human_input(
+        &self,
+        run: Run,
+        _tool_call: &AssistantResponseItem,
+        _events: &mut impl AgentEventSink,
+    ) -> Result<RunLoopOutput, RunLoopError> {
+        let run = self
+            .context
+            .store
+            .update_run_status(&run.id, RunStatus::WaitingForHumanInput)?;
+        let workspace = self.context.store.load_workspace()?;
+        let session = self.context.store.load_session(&run.id.session_id())?;
+        let steps = self.context.store.load_run_steps(&run.id)?;
+        Ok(RunLoopOutput {
+            workspace,
+            session,
+            run,
+            steps,
+            answer: None,
+        })
     }
 
     fn complete_run(
@@ -550,6 +636,77 @@ impl ToolCallRequest {
             arguments: arguments.clone(),
         })
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct HumanInputArgs {
+    #[allow(dead_code)]
+    prompt: String,
+    #[serde(default)]
+    options: Vec<HumanInputOption>,
+    #[serde(default)]
+    allow_free_text: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HumanInputOption {
+    id: String,
+    #[allow(dead_code)]
+    label: String,
+}
+
+fn human_input_tool_call(tool_calls: &[AssistantResponseItem]) -> Option<&AssistantResponseItem> {
+    tool_calls.iter().find(|item| {
+        matches!(
+            item,
+            AssistantResponseItem::ToolCall { name, .. } if name == HUMAN_INPUT_TOOL_NAME
+        )
+    })
+}
+
+fn latest_pending_human_input_call(steps: &[Step]) -> Option<ToolCallRequest> {
+    let resolved_ids = steps.iter().filter_map(tool_result_id).collect::<Vec<_>>();
+    steps.iter().rev().find_map(|step| {
+        let StepPayload::AssistantResponse { items, .. } = &step.payload else {
+            return None;
+        };
+        latest_unresolved_human_input_call(items, &resolved_ids)
+    })
+}
+
+fn latest_unresolved_human_input_call(
+    items: &[AssistantResponseItem],
+    resolved_ids: &[&str],
+) -> Option<ToolCallRequest> {
+    items.iter().rev().find_map(|item| {
+        let tool_call = ToolCallRequest::from_assistant_item(item)?;
+        (tool_call.name == HUMAN_INPUT_TOOL_NAME && !resolved_ids.contains(&tool_call.id.as_str()))
+            .then_some(tool_call)
+    })
+}
+
+fn tool_result_id(step: &Step) -> Option<&str> {
+    match &step.payload {
+        StepPayload::ToolResult { id, .. } => Some(id.as_str()),
+        _ => None,
+    }
+}
+
+fn validate_human_input(arguments: &serde_json::Value, input: &str) -> Result<(), String> {
+    let args = serde_json::from_value::<HumanInputArgs>(arguments.clone())
+        .map_err(|error| format!("invalid human_input tool arguments: {error}"))?;
+    if args.allow_free_text || args.options.iter().any(|option| option.id == input) {
+        return Ok(());
+    }
+    let option_ids = args
+        .options
+        .iter()
+        .map(|option| option.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "human input must match one of the option ids: {option_ids}"
+    ))
 }
 
 fn assistant_turn_from_response(
