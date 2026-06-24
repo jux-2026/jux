@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 const SKILLS_DIRECTORY: &str = ".jux/skills";
 const SKILL_FILE_NAME: &str = "SKILL.md";
+pub const MAX_SKILL_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// One discovered skill.
@@ -22,6 +23,21 @@ pub struct SkillDefinition {
     pub content: String,
     pub scope: SkillScope,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Resolved skill catalog with active skills and override metadata.
+pub struct SkillCatalog {
+    pub skills: Vec<SkillDefinition>,
+    pub overrides: Vec<SkillOverride>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Records that one skill definition replaced another with the same name.
+pub struct SkillOverride {
+    pub name: String,
+    pub overridden: SkillDefinition,
+    pub active: SkillDefinition,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,20 +78,30 @@ impl SkillResolver {
     }
 
     pub fn resolve(&self) -> Result<Vec<SkillDefinition>, SkillError> {
+        Ok(self.resolve_catalog()?.skills)
+    }
+
+    pub fn resolve_catalog(&self) -> Result<SkillCatalog, SkillError> {
         let mut skills = BTreeMap::new();
+        let mut overrides = Vec::new();
         if let Some(user_home) = &self.user_home {
             discover_skills(
                 &mut skills,
+                &mut overrides,
                 SkillScope::User,
                 &user_home.join(SKILLS_DIRECTORY),
             )?;
         }
         discover_skills(
             &mut skills,
+            &mut overrides,
             SkillScope::Project,
             &self.workspace_root.join(SKILLS_DIRECTORY),
         )?;
-        Ok(skills.into_values().collect())
+        Ok(SkillCatalog {
+            skills: skills.into_values().collect(),
+            overrides,
+        })
     }
 }
 
@@ -171,6 +197,7 @@ pub fn match_auto_skills(
 
 fn discover_skills(
     skills: &mut BTreeMap<String, SkillDefinition>,
+    overrides: &mut Vec<SkillOverride>,
     scope: SkillScope,
     directory: &Path,
 ) -> Result<(), SkillError> {
@@ -191,13 +218,14 @@ fn discover_skills(
                 directory.display()
             ))
         })?;
-        insert_skill(skills, scope, entry.path())?;
+        insert_skill(skills, overrides, scope, entry.path())?;
     }
     Ok(())
 }
 
 fn insert_skill(
     skills: &mut BTreeMap<String, SkillDefinition>,
+    overrides: &mut Vec<SkillOverride>,
     scope: SkillScope,
     path: PathBuf,
 ) -> Result<(), SkillError> {
@@ -209,7 +237,13 @@ fn insert_skill(
         return Ok(());
     }
     let skill = parse_skill_file(name, scope, skill_file)?;
-    skills.insert(skill.name.clone(), skill);
+    if let Some(overridden) = skills.insert(skill.name.clone(), skill.clone()) {
+        overrides.push(SkillOverride {
+            name: skill.name.clone(),
+            overridden,
+            active: skill,
+        });
+    }
     Ok(())
 }
 
@@ -225,6 +259,7 @@ fn parse_skill_file(
     scope: SkillScope,
     path: PathBuf,
 ) -> Result<SkillDefinition, SkillError> {
+    reject_oversized_skill_file(&path)?;
     let raw = fs::read_to_string(&path).map_err(|error| {
         SkillError::new(format!(
             "failed to read skill file {}: {error}",
@@ -289,6 +324,22 @@ fn required_field(value: Option<String>, field: &str, path: &Path) -> Result<Str
         )));
     }
     Ok(value)
+}
+
+fn reject_oversized_skill_file(path: &Path) -> Result<(), SkillError> {
+    let size = fs::metadata(path).map_err(|error| {
+        SkillError::new(format!(
+            "failed to read skill file metadata {}: {error}",
+            path.display()
+        ))
+    })?;
+    if size.len() > MAX_SKILL_FILE_BYTES {
+        return Err(SkillError::new(format!(
+            "skill file {} exceeds maximum skill file size of {MAX_SKILL_FILE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn skill_matches_request(skill: &SkillDefinition, request: &str) -> bool {

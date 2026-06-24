@@ -1,6 +1,6 @@
 use jux_core::{
-    SkillDefinition, SkillResolver, SkillScope, match_auto_skills, render_active_skills,
-    render_skill_index, select_explicit_skills,
+    MAX_SKILL_FILE_BYTES, SkillDefinition, SkillResolver, SkillScope, match_auto_skills,
+    render_active_skills, render_skill_index, select_explicit_skills,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -143,6 +143,26 @@ fn skill_resolver_rejects_empty_skill_file() {
         .expect_err("empty skill fails");
 
     assert!(error.to_string().contains("empty skill file"));
+    remove_temp_dir(home);
+    remove_temp_dir(workspace);
+}
+
+#[test]
+fn skill_resolver_rejects_oversized_skill_file() {
+    let home = unique_temp_dir("jux-skills-oversized-home");
+    let workspace = unique_temp_dir("jux-skills-oversized-workspace");
+    let body = "x".repeat(MAX_SKILL_FILE_BYTES as usize + 1);
+    write_raw_skill(&home, "review", &body);
+
+    let error = SkillResolver::new(home.clone(), workspace.clone())
+        .resolve()
+        .expect_err("oversized skill fails");
+
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds maximum skill file size")
+    );
     remove_temp_dir(home);
     remove_temp_dir(workspace);
 }

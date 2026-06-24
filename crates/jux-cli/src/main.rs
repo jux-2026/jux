@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventKind, AgentEventSink, InstructionDocument,
     InstructionResolver, Run, RunLoop, RunLoopOutput, Session, SessionContextItem,
-    SessionContextPayload, SessionId, SkillDefinition, SkillResolver, SqliteWorkspaceStore, Step,
-    StepPayload, Workspace, match_auto_skills, select_explicit_skills,
+    SessionContextPayload, SessionId, SkillCatalog, SkillDefinition, SkillResolver,
+    SqliteWorkspaceStore, Step, StepPayload, Workspace, match_auto_skills, select_explicit_skills,
 };
 use rig::{client::CompletionClient, completion::CompletionModel, providers::deepseek};
 use serde::Serialize;
@@ -35,14 +35,45 @@ struct Cli {
 enum Command {
     #[command(about = "Run a request through the local Jux agent loop.")]
     Run(RunArgs),
+    #[command(about = "Inspect available Jux skills.")]
+    Skills(SkillsCommand),
     #[command(about = "Inspect local session state.")]
     Session(SessionCommand),
+}
+
+#[derive(Debug, Parser)]
+struct SkillsCommand {
+    #[command(subcommand)]
+    command: SkillsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillsSubcommand {
+    #[command(about = "List available skills.")]
+    List(SkillsListArgs),
+    #[command(about = "Show a skill definition.")]
+    Show(SkillsShowArgs),
 }
 
 #[derive(Debug, Parser)]
 struct SessionCommand {
     #[command(subcommand)]
     command: SessionSubcommand,
+}
+
+#[derive(Debug, Parser)]
+struct SkillsListArgs {
+    #[arg(long, default_value = ".", help = "Workspace root directory.")]
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+struct SkillsShowArgs {
+    #[arg(help = "Skill name.")]
+    name: String,
+
+    #[arg(long, default_value = ".", help = "Workspace root directory.")]
+    workspace: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -109,9 +140,32 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Run(args)) => handle_run(args, cli.output),
+        Some(Command::Skills(command)) => handle_skills(command, cli.output),
         Some(Command::Session(command)) => handle_session(command, cli.output),
         None => Ok(()),
     }
+}
+
+fn handle_skills(command: SkillsCommand, output_format: OutputFormat) -> Result<()> {
+    match command.command {
+        SkillsSubcommand::List(args) => handle_skills_list(args, output_format),
+        SkillsSubcommand::Show(args) => handle_skills_show(args, output_format),
+    }
+}
+
+fn handle_skills_list(args: SkillsListArgs, output_format: OutputFormat) -> Result<()> {
+    let catalog = load_skill_catalog(&args.workspace)?;
+    print_skills_list_output(&SkillsListOutput::from(catalog), output_format)
+}
+
+fn handle_skills_show(args: SkillsShowArgs, output_format: OutputFormat) -> Result<()> {
+    let catalog = load_skill_catalog(&args.workspace)?;
+    let skill = catalog
+        .skills
+        .iter()
+        .find(|skill| skill.name == args.name)
+        .with_context(|| format!("skill not found: {}", args.name))?;
+    print_skill_show_output(&SkillShowOutput::from(skill), output_format)
 }
 
 fn handle_session(command: SessionCommand, output_format: OutputFormat) -> Result<()> {
@@ -187,6 +241,50 @@ fn print_run_output(output: &RunLoopOutput, output_format: OutputFormat) -> Resu
     Ok(())
 }
 
+fn print_skills_list_output(output: &SkillsListOutput, output_format: OutputFormat) -> Result<()> {
+    match output_format {
+        OutputFormat::Text => print_skills_list_text(output),
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(output)?),
+        OutputFormat::Yaml => print!("{}", serde_yaml::to_string(output)?),
+    }
+    Ok(())
+}
+
+fn print_skills_list_text(output: &SkillsListOutput) {
+    println!("Skills");
+    println!("Project skills override user skills with the same name.");
+    for skill in &output.skills {
+        println!(
+            "- {} [{}] {} ({})",
+            skill.name, skill.scope, skill.description, skill.path
+        );
+    }
+    for skill_override in &output.overrides {
+        println!(
+            "- {} overrides {} skill at {}",
+            skill_override.name, skill_override.overridden_scope, skill_override.overridden_path
+        );
+    }
+}
+
+fn print_skill_show_output(output: &SkillShowOutput, output_format: OutputFormat) -> Result<()> {
+    match output_format {
+        OutputFormat::Text => print_skill_show_text(output),
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(output)?),
+        OutputFormat::Yaml => print!("{}", serde_yaml::to_string(output)?),
+    }
+    Ok(())
+}
+
+fn print_skill_show_text(output: &SkillShowOutput) {
+    println!("{}", output.name);
+    println!("scope: {}", output.scope);
+    println!("path: {}", output.path);
+    println!("description: {}", output.description);
+    println!();
+    println!("{}", output.content);
+}
+
 fn print_session_show_output(
     output: &SessionShowOutput,
     output_format: OutputFormat,
@@ -225,6 +323,96 @@ fn print_session_show_output(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct SkillsListOutput {
+    skills: Vec<SkillListItemOutput>,
+    overrides: Vec<SkillOverrideOutput>,
+}
+
+impl From<SkillCatalog> for SkillsListOutput {
+    fn from(catalog: SkillCatalog) -> Self {
+        let skills = catalog
+            .skills
+            .iter()
+            .map(SkillListItemOutput::from)
+            .collect();
+        let overrides = catalog
+            .overrides
+            .iter()
+            .map(SkillOverrideOutput::from)
+            .collect();
+        Self { skills, overrides }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SkillListItemOutput {
+    name: String,
+    description: String,
+    scope: String,
+    path: String,
+}
+
+impl From<&SkillDefinition> for SkillListItemOutput {
+    fn from(skill: &SkillDefinition) -> Self {
+        Self {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            scope: skill_scope_label(skill).to_owned(),
+            path: skill.path.display().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SkillOverrideOutput {
+    name: String,
+    overridden_scope: String,
+    overridden_path: String,
+    active_scope: String,
+    active_path: String,
+}
+
+impl From<&jux_core::SkillOverride> for SkillOverrideOutput {
+    fn from(skill_override: &jux_core::SkillOverride) -> Self {
+        Self {
+            name: skill_override.name.clone(),
+            overridden_scope: skill_scope_label(&skill_override.overridden).to_owned(),
+            overridden_path: skill_override.overridden.path.display().to_string(),
+            active_scope: skill_scope_label(&skill_override.active).to_owned(),
+            active_path: skill_override.active.path.display().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SkillShowOutput {
+    name: String,
+    description: String,
+    scope: String,
+    path: String,
+    content: String,
+}
+
+impl From<&SkillDefinition> for SkillShowOutput {
+    fn from(skill: &SkillDefinition) -> Self {
+        Self {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            scope: skill_scope_label(skill).to_owned(),
+            path: skill.path.display().to_string(),
+            content: skill.content.clone(),
+        }
+    }
+}
+
+fn skill_scope_label(skill: &SkillDefinition) -> &'static str {
+    match skill.scope {
+        jux_core::SkillScope::User => "user",
+        jux_core::SkillScope::Project => "project",
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -483,11 +671,16 @@ fn windows_home_drive_path() -> Option<PathBuf> {
 }
 
 fn load_skill_definitions(workspace_root: &std::path::Path) -> Result<Vec<SkillDefinition>> {
+    let catalog = load_skill_catalog(workspace_root)?;
+    Ok(catalog.skills)
+}
+
+fn load_skill_catalog(workspace_root: &std::path::Path) -> Result<SkillCatalog> {
     let resolver = match user_home_dir_from_env() {
         Some(home) => SkillResolver::new(home, workspace_root),
         None => SkillResolver::project_only(workspace_root),
     };
-    Ok(resolver.resolve()?)
+    Ok(resolver.resolve_catalog()?)
 }
 
 struct StdoutAgentEventSink;
@@ -522,6 +715,7 @@ fn event_message(data: &AgentEventData) -> String {
         AgentEventData::RunStarted { request } => format!("request={request:?}"),
         AgentEventData::RunCompleted { answer } => format!("answer={answer:?}"),
         AgentEventData::RunFailed { error } => format!("error={error:?}"),
+        AgentEventData::SkillsSelected { skills } => format!("skills={skills:?}"),
         AgentEventData::IterationStarted { index } => format!("index={index}"),
         AgentEventData::IterationCompleted { index } => format!("index={index}"),
         AgentEventData::LlmStarted => "llm".to_owned(),

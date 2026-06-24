@@ -20,6 +20,11 @@ impl AgentEventId {
     }
 
     #[must_use]
+    pub fn skills() -> Self {
+        Self("run.skills".to_owned())
+    }
+
+    #[must_use]
     pub fn llm(iteration_index: usize, llm_index: usize) -> Self {
         Self(format!("run.iteration.{iteration_index}.llm.{llm_index}"))
     }
@@ -79,6 +84,9 @@ pub enum AgentEventData {
     },
     RunFailed {
         error: String,
+    },
+    SkillsSelected {
+        skills: Vec<String>,
     },
     IterationStarted {
         index: usize,

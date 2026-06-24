@@ -80,6 +80,7 @@ where
     ) -> Result<RunLoopOutput, RunLoopError> {
         let run = self.start_run(request)?;
         self.emit_run_started(events, &run.request);
+        self.emit_skills_selected(events);
 
         for iteration_index in 1..=MAX_LOOP_ITERATIONS {
             self.emit_iteration_started(events, iteration_index);
@@ -481,6 +482,23 @@ where
             AgentEventData::RunStarted {
                 request: request.to_owned(),
             },
+        ));
+    }
+
+    fn emit_skills_selected(&self, events: &mut impl AgentEventSink) {
+        if self.context.active_skills.is_empty() {
+            return;
+        }
+        let skills = self
+            .context
+            .active_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect();
+        events.emit(AgentEvent::new(
+            AgentEventId::skills(),
+            AgentEventKind::Output,
+            AgentEventData::SkillsSelected { skills },
         ));
     }
 

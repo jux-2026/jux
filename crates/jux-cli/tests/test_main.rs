@@ -24,6 +24,7 @@ fn cli_exposes_foundation_commands() {
         ))
         .stdout(predicate::str::contains("--output"))
         .stdout(predicate::str::contains("run"))
+        .stdout(predicate::str::contains("skills"))
         .stdout(predicate::str::contains("session"));
 
     Command::cargo_bin("jux")
@@ -34,6 +35,108 @@ fn cli_exposes_foundation_commands() {
         .stdout(predicate::str::contains("--stream"))
         .stdout(predicate::str::contains("--skill"))
         .stdout(predicate::str::contains("--no-auto-skills"));
+}
+
+#[test]
+fn skills_list_outputs_available_skills_with_sources() {
+    let home = TempDir::new().expect("temp home exists");
+    let workspace = TempDir::new().expect("temp workspace exists");
+    write_skill(home.path(), "format", "Format code", "Format body.");
+    write_skill(workspace.path(), "review", "Review code", "Review body.");
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "skills",
+            "list",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+        ])
+        .env("HOME", home.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("format"))
+        .stdout(predicate::str::contains("user"))
+        .stdout(predicate::str::contains("Format code"))
+        .stdout(predicate::str::contains("review"))
+        .stdout(predicate::str::contains("project"))
+        .stdout(predicate::str::contains("Review code"))
+        .stdout(predicate::str::contains(
+            "Project skills override user skills",
+        ));
+}
+
+#[test]
+fn skills_list_outputs_override_hints() {
+    let home = TempDir::new().expect("temp home exists");
+    let workspace = TempDir::new().expect("temp workspace exists");
+    write_skill(home.path(), "review", "User review", "User review body.");
+    write_skill(
+        workspace.path(),
+        "review",
+        "Project review",
+        "Project review body.",
+    );
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "skills",
+            "list",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+        ])
+        .env("HOME", home.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("review"))
+        .stdout(predicate::str::contains("Project review"))
+        .stdout(predicate::str::contains("overrides user skill"));
+}
+
+#[test]
+fn skills_show_outputs_skill_body_and_source() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    write_skill(
+        workspace.path(),
+        "review",
+        "Review code",
+        "Full review instructions.",
+    );
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "skills",
+            "show",
+            "review",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("review"))
+        .stdout(predicate::str::contains("Review code"))
+        .stdout(predicate::str::contains("project"))
+        .stdout(predicate::str::contains("Full review instructions."));
+}
+
+#[test]
+fn skills_show_reports_missing_skill() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "skills",
+            "show",
+            "missing",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("skill not found: missing"));
 }
 
 #[test]
@@ -298,6 +401,39 @@ fn run_command_can_disable_auto_skill_matching() {
     assert!(request.contains("## Available Skills"));
     assert!(!request.contains("## Active Skills"));
     assert!(!request.contains("Full automatic review instructions."));
+}
+
+#[test]
+fn run_command_streams_active_skill_selection() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock("Streamed skill answer");
+    write_skill(
+        workspace.path(),
+        "review",
+        "Review code changes",
+        "Full streamed review instructions.",
+    );
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Please review this patch",
+            "--stream",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run.skills output"))
+        .stdout(predicate::str::contains("review"))
+        .stdout(predicate::str::contains("Streamed skill answer"));
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 1);
 }
 
 #[test]
