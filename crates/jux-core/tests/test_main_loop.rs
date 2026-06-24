@@ -133,6 +133,32 @@ fn run_loop_sends_available_skill_index_to_llm_without_full_skill_body() {
 }
 
 #[test]
+fn run_loop_sends_active_skill_body_to_llm() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::fixed_text("Active skill answer");
+    let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let skill = SkillDefinition {
+        name: "review".to_owned(),
+        description: "Review code changes".to_owned(),
+        content: "Full active review instructions.".to_owned(),
+        scope: SkillScope::Project,
+        path: "/workspace/.jux/skills/review/SKILL.md".into(),
+    };
+    let context = RunLoopContext::new(store.clone(), model.clone(), policy)
+        .with_skills(vec![skill.clone()])
+        .with_active_skills(vec![skill]);
+    let run_loop = RunLoop::with_context(context);
+
+    futures::executor::block_on(run_loop.run("Use active skill".to_owned()))
+        .expect("run loop succeeds");
+    let request = model.recorded_requests().remove(0);
+
+    assert!(request.contains("## Available Skills"));
+    assert!(request.contains("## Active Skills"));
+    assert!(request.contains("Full active review instructions."));
+}
+
+#[test]
 fn run_loop_uses_session_history_when_calling_llm() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
     let model = TestModel::text_responses(["First answer", "Second answer"]);

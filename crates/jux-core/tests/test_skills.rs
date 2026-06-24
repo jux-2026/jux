@@ -1,4 +1,7 @@
-use jux_core::{SkillDefinition, SkillResolver, SkillScope, render_skill_index};
+use jux_core::{
+    SkillDefinition, SkillResolver, SkillScope, match_auto_skills, render_active_skills,
+    render_skill_index, select_explicit_skills,
+};
 use std::fs;
 use std::path::PathBuf;
 
@@ -160,6 +163,67 @@ fn skill_index_renders_available_skill_names_and_descriptions() {
     assert!(index.contains("- review: Review code"));
     assert!(index.contains("Project skills override user skills with the same name."));
     assert!(!index.contains("Full review instructions stay out of the index."));
+}
+
+#[test]
+fn explicit_skill_selection_returns_full_skill_content() {
+    let skills = test_skills();
+
+    let selected = select_explicit_skills(&skills, &["review".to_owned()])
+        .expect("explicit skill selection succeeds");
+    let rendered = render_active_skills(&selected);
+
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].name, "review");
+    assert!(rendered.contains("## Active Skills"));
+    assert!(rendered.contains("### review"));
+    assert!(rendered.contains("Full review instructions."));
+}
+
+#[test]
+fn explicit_skill_selection_reports_missing_skill() {
+    let error = select_explicit_skills(&test_skills(), &["missing".to_owned()])
+        .expect_err("missing explicit skill fails");
+
+    assert!(error.to_string().contains("skill not found: missing"));
+}
+
+#[test]
+fn auto_skill_matching_uses_request_name_and_description() {
+    let skills = test_skills();
+
+    let selected = match_auto_skills(&skills, "Please review this patch", 3);
+
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].name, "review");
+}
+
+#[test]
+fn auto_skill_matching_respects_limit() {
+    let skills = test_skills();
+
+    let selected = match_auto_skills(&skills, "Please review and format this patch", 1);
+
+    assert_eq!(selected.len(), 1);
+}
+
+fn test_skills() -> Vec<SkillDefinition> {
+    vec![
+        SkillDefinition {
+            name: "review".to_owned(),
+            description: "Review code changes".to_owned(),
+            content: "Full review instructions.".to_owned(),
+            scope: SkillScope::Project,
+            path: "/workspace/.jux/skills/review/SKILL.md".into(),
+        },
+        SkillDefinition {
+            name: "format".to_owned(),
+            description: "Format code".to_owned(),
+            content: "Full format instructions.".to_owned(),
+            scope: SkillScope::User,
+            path: "/home/user/.jux/skills/format/SKILL.md".into(),
+        },
+    ]
 }
 
 fn write_skill(root: &std::path::Path, name: &str, description: &str, content: &str) {

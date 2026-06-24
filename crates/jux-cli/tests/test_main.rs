@@ -31,7 +31,9 @@ fn cli_exposes_foundation_commands() {
         .args(["run", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--stream"));
+        .stdout(predicate::str::contains("--stream"))
+        .stdout(predicate::str::contains("--skill"))
+        .stdout(predicate::str::contains("--no-auto-skills"));
 }
 
 #[test]
@@ -174,6 +176,128 @@ fn run_command_loads_available_skill_index() {
     assert!(request.contains("## Available Skills"));
     assert!(request.contains("- review: Review code changes"));
     assert!(!request.contains("Full review skill body should not be sent in the index."));
+}
+
+#[test]
+fn run_command_can_activate_explicit_skill() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock("Explicit skill answer");
+    write_skill(
+        workspace.path(),
+        "review",
+        "Review code changes",
+        "Full explicit review instructions.",
+    );
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Use explicit skill",
+            "--skill",
+            "review",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Explicit skill answer"));
+
+    let requests = mock.join();
+    let request = requests.first().expect("mock receives one request");
+    assert!(request.contains("## Active Skills"));
+    assert!(request.contains("Full explicit review instructions."));
+}
+
+#[test]
+fn run_command_reports_missing_explicit_skill() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Use missing skill",
+            "--skill",
+            "missing",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            "http://127.0.0.1:1",
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("skill not found: missing"));
+}
+
+#[test]
+fn run_command_auto_matches_skill_by_request() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock("Auto skill answer");
+    write_skill(
+        workspace.path(),
+        "review",
+        "Review code changes",
+        "Full automatic review instructions.",
+    );
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Please review this patch",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Auto skill answer"));
+
+    let requests = mock.join();
+    let request = requests.first().expect("mock receives one request");
+    assert!(request.contains("## Active Skills"));
+    assert!(request.contains("Full automatic review instructions."));
+}
+
+#[test]
+fn run_command_can_disable_auto_skill_matching() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock("No auto skill answer");
+    write_skill(
+        workspace.path(),
+        "review",
+        "Review code changes",
+        "Full automatic review instructions.",
+    );
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Please review this patch",
+            "--no-auto-skills",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No auto skill answer"));
+
+    let requests = mock.join();
+    let request = requests.first().expect("mock receives one request");
+    assert!(request.contains("## Available Skills"));
+    assert!(!request.contains("## Active Skills"));
+    assert!(!request.contains("Full automatic review instructions."));
 }
 
 #[test]

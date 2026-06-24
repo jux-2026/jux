@@ -4,7 +4,7 @@ use jux_core::{
     AgentEvent, AgentEventData, AgentEventKind, AgentEventSink, InstructionDocument,
     InstructionResolver, Run, RunLoop, RunLoopOutput, Session, SessionContextItem,
     SessionContextPayload, SessionId, SkillDefinition, SkillResolver, SqliteWorkspaceStore, Step,
-    StepPayload, Workspace,
+    StepPayload, Workspace, match_auto_skills, select_explicit_skills,
 };
 use rig::{client::CompletionClient, completion::CompletionModel, providers::deepseek};
 use serde::Serialize;
@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-chat";
+const MAX_AUTO_SKILLS: usize = 3;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -79,6 +80,12 @@ struct RunArgs {
         help = "Stream hierarchical run events while the request executes."
     )]
     stream: bool,
+
+    #[arg(long = "skill", help = "Activate a skill by name.")]
+    skills: Vec<String>,
+
+    #[arg(long, help = "Disable automatic skill matching.")]
+    no_auto_skills: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -139,8 +146,9 @@ fn handle_run(args: RunArgs, output_format: OutputFormat) -> Result<()> {
 
     let output = match args.provider {
         LlmProviderName::Deepseek => {
+            let options = RunCommandOptions::from(&args);
             let model = deepseek_model(args.deepseek_base_url, args.deepseek_model)?;
-            run_with_model(args.workspace, model, args.request, args.stream)?
+            run_with_model(args.workspace, model, args.request, options)?
         }
     };
     print_run_output(&output, output_format)?;
@@ -338,6 +346,23 @@ struct RunCommandOutput {
     steps: Vec<RunStepOutput>,
 }
 
+#[derive(Clone, Debug)]
+struct RunCommandOptions {
+    stream: bool,
+    explicit_skills: Vec<String>,
+    auto_skills: bool,
+}
+
+impl From<&RunArgs> for RunCommandOptions {
+    fn from(args: &RunArgs) -> Self {
+        Self {
+            stream: args.stream,
+            explicit_skills: args.skills.clone(),
+            auto_skills: !args.no_auto_skills,
+        }
+    }
+}
+
 impl From<&RunLoopOutput> for RunCommandOutput {
     fn from(output: &RunLoopOutput) -> Self {
         Self {
@@ -379,7 +404,7 @@ fn run_with_model<M>(
     workspace: PathBuf,
     model: M,
     request: String,
-    stream: bool,
+    options: RunCommandOptions,
 ) -> Result<jux_core::RunLoopOutput>
 where
     M: CompletionModel,
@@ -388,17 +413,41 @@ where
     let store = SqliteWorkspaceStore::new(workspace);
     let instructions = load_instruction_documents(store.root())?;
     let skills = load_skill_definitions(store.root())?;
+    let active_skills = select_run_skills(
+        &skills,
+        &request,
+        &options.explicit_skills,
+        options.auto_skills,
+    )?;
     let policy = jux_core::RuntimePolicy::workspace_default(store.root().to_path_buf());
     let context = jux_core::RunLoopContext::new(store, model, policy)
         .with_instructions(instructions)
-        .with_skills(skills);
+        .with_skills(skills)
+        .with_active_skills(active_skills);
     let run_loop = RunLoop::with_context(context);
-    if stream {
+    if options.stream {
         let mut events = StdoutAgentEventSink;
         Ok(runtime.block_on(run_loop.run_with_events(request, &mut events))?)
     } else {
         Ok(runtime.block_on(run_loop.run(request))?)
     }
+}
+
+fn select_run_skills(
+    skills: &[SkillDefinition],
+    request: &str,
+    explicit_skill_names: &[String],
+    auto_skills_enabled: bool,
+) -> Result<Vec<SkillDefinition>> {
+    let mut selected = select_explicit_skills(skills, explicit_skill_names)?;
+    if auto_skills_enabled {
+        for skill in match_auto_skills(skills, request, MAX_AUTO_SKILLS) {
+            if !selected.iter().any(|selected| selected.name == skill.name) {
+                selected.push(skill);
+            }
+        }
+    }
+    Ok(selected)
 }
 
 fn load_instruction_documents(

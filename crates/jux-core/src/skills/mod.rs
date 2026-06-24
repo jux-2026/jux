@@ -114,6 +114,61 @@ pub fn render_skill_index(skills: &[SkillDefinition]) -> String {
     output
 }
 
+#[must_use]
+/// Renders active skill bodies for inclusion in the system prompt.
+pub fn render_active_skills(skills: &[SkillDefinition]) -> String {
+    let mut output = String::from("## Active Skills\n\n");
+    for skill in skills {
+        output.push_str(&format!(
+            "### {}\nSource: {}\nScope: {}\n\n{}\n\n",
+            skill.name,
+            skill.path.display(),
+            skill.scope.label(),
+            skill.content
+        ));
+    }
+    output
+}
+
+/// Selects explicitly requested skills by name.
+pub fn select_explicit_skills(
+    skills: &[SkillDefinition],
+    names: &[String],
+) -> Result<Vec<SkillDefinition>, SkillError> {
+    let mut selected = Vec::new();
+    for name in names {
+        let Some(skill) = skills.iter().find(|skill| skill.name == *name) else {
+            return Err(SkillError::new(format!("skill not found: {name}")));
+        };
+        if !selected
+            .iter()
+            .any(|selected: &SkillDefinition| selected.name == skill.name)
+        {
+            selected.push(skill.clone());
+        }
+    }
+    Ok(selected)
+}
+
+#[must_use]
+/// Matches skills by request text using skill name and description tokens.
+pub fn match_auto_skills(
+    skills: &[SkillDefinition],
+    request: &str,
+    limit: usize,
+) -> Vec<SkillDefinition> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let request = request.to_lowercase();
+    skills
+        .iter()
+        .filter(|skill| skill_matches_request(skill, &request))
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
 fn discover_skills(
     skills: &mut BTreeMap<String, SkillDefinition>,
     scope: SkillScope,
@@ -234,4 +289,28 @@ fn required_field(value: Option<String>, field: &str, path: &Path) -> Result<Str
         )));
     }
     Ok(value)
+}
+
+fn skill_matches_request(skill: &SkillDefinition, request: &str) -> bool {
+    request.contains(&skill.name.to_lowercase())
+        || description_words(&skill.description)
+            .iter()
+            .any(|word| request.contains(word))
+}
+
+fn description_words(description: &str) -> Vec<String> {
+    description
+        .split(|char: char| !char.is_ascii_alphanumeric())
+        .filter(|word| word.len() >= 4)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+impl SkillScope {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Project => "project",
+        }
+    }
 }

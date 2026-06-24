@@ -30,7 +30,10 @@ pub use policy::{
     WasmHttpMatchKind, WasmHttpMethod, WasmHttpRule, WasmHttpRuleEffect, WasmNetworkPolicy,
     WasmPackageRule, WasmPackageSource, WasmSandboxPolicy,
 };
-pub use skills::{SkillDefinition, SkillError, SkillResolver, SkillScope, render_skill_index};
+pub use skills::{
+    SkillDefinition, SkillError, SkillResolver, SkillScope, match_auto_skills,
+    render_active_skills, render_skill_index, select_explicit_skills,
+};
 pub use state::{
     AssistantResponseItem, LlmUsage, Run, RunId, RunStatus, Session, SessionContextItem,
     SessionContextKind, SessionContextPayload, SessionId, SqliteWorkspaceStore, Step, StepId,

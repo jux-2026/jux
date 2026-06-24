@@ -186,8 +186,11 @@ where
     fn start_run(&self, request: String) -> Result<Run, RunLoopError> {
         let run = self.context.store.create_run(request.clone())?;
         tracing::info!(run_id = %run.id, "created run");
-        let context_items =
-            default_session_context_items(&self.context.instructions, &self.context.skills);
+        let context_items = default_session_context_items(
+            &self.context.instructions,
+            &self.context.skills,
+            &self.context.active_skills,
+        );
         self.context
             .store
             .ensure_session_context_items(&run.id.session_id(), context_items)?;
@@ -672,12 +675,13 @@ fn session_context_item_to_tool_definition(
 fn default_session_context_items(
     instructions: &[crate::InstructionDocument],
     skills: &[crate::SkillDefinition],
+    active_skills: &[crate::SkillDefinition],
 ) -> Vec<(SessionContextKind, SessionContextPayload)> {
     let mut items = Vec::new();
     items.push((
         SessionContextKind::SystemPrompt,
         SessionContextPayload::SystemPrompt {
-            content: system_prompt_with_context(instructions, skills),
+            content: system_prompt_with_context(instructions, skills, active_skills),
         },
     ));
 
@@ -698,8 +702,9 @@ fn default_session_context_items(
 fn system_prompt_with_context(
     instructions: &[crate::InstructionDocument],
     skills: &[crate::SkillDefinition],
+    active_skills: &[crate::SkillDefinition],
 ) -> String {
-    if instructions.is_empty() && skills.is_empty() {
+    if instructions.is_empty() && skills.is_empty() && active_skills.is_empty() {
         return SYSTEM_PROMPT.to_owned();
     }
     let mut prompt = SYSTEM_PROMPT.to_owned();
@@ -710,6 +715,10 @@ fn system_prompt_with_context(
     if !skills.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(&crate::render_skill_index(skills));
+    }
+    if !active_skills.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&crate::render_active_skills(active_skills));
     }
     prompt
 }
