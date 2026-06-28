@@ -204,6 +204,7 @@ pub enum StepKind {
     UserMessage,
     AssistantResponse,
     ToolResult,
+    SkillExecution,
     Error,
 }
 
@@ -219,6 +220,26 @@ pub enum StepPayload {
         items: Vec<AssistantResponseItem>,
     },
     ToolResult {
+        id: String,
+        call_id: Option<String>,
+        content: serde_json::Value,
+    },
+    SkillsRequested {
+        names: Vec<String>,
+    },
+    SkillStarted {
+        invocation_id: String,
+        call_id: Option<String>,
+        skill_name: String,
+        task: String,
+    },
+    SkillAssistantResponse {
+        invocation_id: String,
+        message_id: Option<String>,
+        items: Vec<AssistantResponseItem>,
+    },
+    SkillToolResult {
+        invocation_id: String,
         id: String,
         call_id: Option<String>,
         content: serde_json::Value,

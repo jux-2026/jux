@@ -1,6 +1,6 @@
 use jux_core::{
-    MAX_SKILL_FILE_BYTES, SkillDefinition, SkillResolver, SkillScope, match_auto_skills,
-    render_active_skills, render_skill_index, select_explicit_skills,
+    MAX_SKILL_FILE_BYTES, SkillDefinition, SkillResolver, SkillScope, render_active_skills,
+    render_skill_index, select_explicit_skills,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -206,25 +206,6 @@ fn explicit_skill_selection_reports_missing_skill() {
         .expect_err("missing explicit skill fails");
 
     assert!(error.to_string().contains("skill not found: missing"));
-}
-
-#[test]
-fn auto_skill_matching_uses_request_name_and_description() {
-    let skills = test_skills();
-
-    let selected = match_auto_skills(&skills, "Please review this patch", 3);
-
-    assert_eq!(selected.len(), 1);
-    assert_eq!(selected[0].name, "review");
-}
-
-#[test]
-fn auto_skill_matching_respects_limit() {
-    let skills = test_skills();
-
-    let selected = match_auto_skills(&skills, "Please review and format this patch", 1);
-
-    assert_eq!(selected.len(), 1);
 }
 
 fn test_skills() -> Vec<SkillDefinition> {

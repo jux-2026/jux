@@ -21,6 +21,7 @@ pub struct RunLoopContext<M> {
     pub policy: RuntimePolicy,
     pub instructions: Vec<InstructionDocument>,
     pub skills: Vec<SkillDefinition>,
+    pub requested_skills: Vec<SkillDefinition>,
     pub active_skills: Vec<SkillDefinition>,
 }
 
@@ -33,6 +34,7 @@ impl<M> RunLoopContext<M> {
             policy,
             instructions: Vec::new(),
             skills: Vec::new(),
+            requested_skills: Vec::new(),
             active_skills: Vec::new(),
         }
     }
@@ -46,6 +48,12 @@ impl<M> RunLoopContext<M> {
     #[must_use]
     pub fn with_skills(mut self, skills: Vec<SkillDefinition>) -> Self {
         self.skills = skills;
+        self
+    }
+
+    #[must_use]
+    pub fn with_requested_skills(mut self, requested_skills: Vec<SkillDefinition>) -> Self {
+        self.requested_skills = requested_skills;
         self
     }
 

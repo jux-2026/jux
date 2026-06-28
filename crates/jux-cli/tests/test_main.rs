@@ -284,7 +284,10 @@ fn run_command_loads_available_skill_index() {
 #[test]
 fn run_command_can_activate_explicit_skill() {
     let workspace = TempDir::new().expect("temp workspace exists");
-    let mock = start_deepseek_mock("Explicit skill answer");
+    let mock = start_deepseek_mock_sequence([
+        DeepseekMockResponse::text("Explicit skill result"),
+        DeepseekMockResponse::text("Explicit parent answer"),
+    ]);
     write_skill(
         workspace.path(),
         "review",
@@ -307,12 +310,51 @@ fn run_command_can_activate_explicit_skill() {
         .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Explicit skill answer"));
+        .stdout(predicate::str::contains("Explicit parent answer"));
 
     let requests = mock.join();
-    let request = requests.first().expect("mock receives one request");
-    assert!(request.contains("## Active Skills"));
-    assert!(request.contains("Full explicit review instructions."));
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("Full explicit review instructions."));
+    assert!(requests[1].contains("Explicit skill result"));
+    assert!(!requests[1].contains("Full explicit review instructions."));
+}
+
+#[test]
+fn run_command_json_hides_internal_skill_transcript() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock_sequence([
+        DeepseekMockResponse::text("Hidden skill result"),
+        DeepseekMockResponse::text("Visible parent answer"),
+    ]);
+    write_skill(
+        workspace.path(),
+        "review",
+        "Review code changes",
+        "Private full skill instructions.",
+    );
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "--output",
+            "json",
+            "run",
+            "Use explicit skill",
+            "--skill",
+            "review",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Visible parent answer"))
+        .stdout(predicate::str::contains("SkillExecution").not())
+        .stdout(predicate::str::contains("Private full skill instructions.").not());
+
+    assert_eq!(mock.join().len(), 2);
 }
 
 #[test]
@@ -338,7 +380,7 @@ fn run_command_reports_missing_explicit_skill() {
 }
 
 #[test]
-fn run_command_auto_matches_skill_by_request() {
+fn run_command_does_not_auto_activate_skill_by_request_text() {
     let workspace = TempDir::new().expect("temp workspace exists");
     let mock = start_deepseek_mock("Auto skill answer");
     write_skill(
@@ -365,8 +407,10 @@ fn run_command_auto_matches_skill_by_request() {
 
     let requests = mock.join();
     let request = requests.first().expect("mock receives one request");
-    assert!(request.contains("## Active Skills"));
-    assert!(request.contains("Full automatic review instructions."));
+    assert!(request.contains("## Available Skills"));
+    assert!(request.contains("\"name\":\"call_skill\""));
+    assert!(!request.contains("## Active Skills"));
+    assert!(!request.contains("Full automatic review instructions."));
 }
 
 #[test]
@@ -458,6 +502,141 @@ fn run_command_waits_for_human_input_and_resumes_latest_run() {
 }
 
 #[test]
+fn run_command_resumes_human_input_inside_skill() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock_sequence([
+        DeepseekMockResponse::tool_call(
+            "skill_call",
+            "call_skill",
+            serde_json::json!({
+                "name": "review",
+                "task": "Review current changes"
+            }),
+        ),
+        DeepseekMockResponse::tool_call(
+            "human_call",
+            "human_input",
+            serde_json::json!({
+                "prompt": "Choose review depth",
+                "options": [{ "id": "deep", "label": "Deep review" }],
+                "allow_free_text": false
+            }),
+        ),
+        DeepseekMockResponse::text("Skill completed a deep review"),
+        DeepseekMockResponse::text("Parent received resumed skill result"),
+    ]);
+    write_skill(
+        workspace.path(),
+        "review",
+        "Review code changes",
+        "Ask for review depth before reviewing.",
+    );
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Use review skill",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Waiting for human input"))
+        .stdout(predicate::str::contains("Choose review depth"))
+        .stdout(predicate::str::contains("deep"))
+        .stdout(predicate::str::contains("Deep review"));
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "deep",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Parent received resumed skill result",
+        ));
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2].contains("deep"));
+    assert!(requests[3].contains("Skill completed a deep review"));
+}
+
+#[test]
+fn run_command_resumes_human_input_inside_explicit_skill() {
+    let workspace = TempDir::new().expect("temp workspace exists");
+    let mock = start_deepseek_mock_sequence([
+        DeepseekMockResponse::tool_call(
+            "human_call",
+            "human_input",
+            serde_json::json!({
+                "prompt": "Choose review depth",
+                "options": [{ "id": "deep", "label": "Deep review" }],
+                "allow_free_text": false
+            }),
+        ),
+        DeepseekMockResponse::text("Explicit skill completed"),
+        DeepseekMockResponse::text("Parent received explicit skill result"),
+    ]);
+    write_skill(
+        workspace.path(),
+        "review",
+        "Review code changes",
+        "Ask for review depth before reviewing.",
+    );
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "Use review skill",
+            "--skill",
+            "review",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Choose review depth"));
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "run",
+            "deep",
+            "--workspace",
+            workspace.path().to_str().expect("workspace path is utf-8"),
+            "--deepseek-base-url",
+            &mock.base_url,
+        ])
+        .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Parent received explicit skill result",
+        ));
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].contains("deep"));
+    assert!(requests[2].contains("Explicit skill completed"));
+}
+
+#[test]
 fn run_command_rejects_invalid_human_input_option() {
     let workspace = TempDir::new().expect("temp workspace exists");
     let mock = start_deepseek_mock_sequence([DeepseekMockResponse::tool_call(
@@ -504,7 +683,7 @@ fn run_command_rejects_invalid_human_input_option() {
 }
 
 #[test]
-fn run_command_streams_active_skill_selection() {
+fn run_command_streams_with_available_skill_tool() {
     let workspace = TempDir::new().expect("temp workspace exists");
     let mock = start_deepseek_mock("Streamed skill answer");
     write_skill(
@@ -528,12 +707,13 @@ fn run_command_streams_active_skill_selection() {
         .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
         .assert()
         .success()
-        .stdout(predicate::str::contains("run.skills output"))
-        .stdout(predicate::str::contains("review"))
         .stdout(predicate::str::contains("Streamed skill answer"));
 
     let requests = mock.join();
     assert_eq!(requests.len(), 1);
+    let request = requests.first().expect("mock receives one request");
+    assert!(request.contains("\"name\":\"call_skill\""));
+    assert!(!request.contains("Full streamed review instructions."));
 }
 
 #[test]

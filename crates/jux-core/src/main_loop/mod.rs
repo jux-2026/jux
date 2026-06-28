@@ -32,6 +32,7 @@ use rig::message::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::{self, Display};
 
@@ -79,15 +80,37 @@ where
         request: String,
         events: &mut impl AgentEventSink,
     ) -> Result<RunLoopOutput, RunLoopError> {
+        self.refresh_active_session_context()?;
         if let Some(run) = self.latest_waiting_run()? {
-            let run = self.resume_waiting_run(run, request)?;
-            return self.continue_run(run, events).await;
+            return match self.resume_waiting_run(run, request)? {
+                ResumeTarget::Main(run) => self.continue_run(run, events).await,
+                ResumeTarget::Skill { run, invocation } => {
+                    self.continue_resumed_skill(run, invocation, events).await
+                }
+            };
         }
 
         let run = self.start_run(request)?;
         self.emit_run_started(events, &run.request);
         self.emit_skills_selected(events);
-        self.continue_run(run, events).await
+        self.continue_requested_skills(run, events).await
+    }
+
+    fn refresh_active_session_context(&self) -> Result<(), RunLoopError> {
+        let session = match self.context.store.load_active_session() {
+            Ok(session) => session,
+            Err(StoreError::MissingWorkspace) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        self.context.store.replace_session_context_items(
+            &session.id,
+            default_session_context_items(
+                &self.context.instructions,
+                &self.context.skills,
+                &self.context.active_skills,
+            ),
+        )?;
+        Ok(())
     }
 
     async fn continue_run(
@@ -119,9 +142,9 @@ where
                 items,
             )?;
 
-            if let Some(tool_call) = human_input_tool_call(&tool_calls) {
+            if human_input_tool_call(&tool_calls).is_some() {
                 self.emit_iteration_completed(events, iteration_index);
-                return self.wait_for_human_input(run, tool_call, events);
+                return self.wait_for_human_input(run, events);
             }
 
             if tool_calls.is_empty() {
@@ -130,7 +153,13 @@ where
             }
 
             for (tool_index, tool_call) in tool_calls.iter().enumerate() {
-                self.execute_tool_call(&run, tool_call, events, iteration_index, tool_index + 1)?;
+                let outcome = self
+                    .execute_tool_call(&run, tool_call, events, iteration_index, tool_index + 1)
+                    .await?;
+                if outcome == ToolCallOutcome::WaitingForHumanInput {
+                    self.emit_iteration_completed(events, iteration_index);
+                    return self.wait_for_human_input(run, events);
+                }
             }
             self.emit_iteration_completed(events, iteration_index);
         }
@@ -160,32 +189,48 @@ where
         Ok((run.status == RunStatus::WaitingForHumanInput).then_some(run))
     }
 
-    fn resume_waiting_run(&self, run: Run, input: String) -> Result<Run, RunLoopError> {
+    fn resume_waiting_run(&self, run: Run, input: String) -> Result<ResumeTarget, RunLoopError> {
         let steps = self.context.store.load_run_steps(&run.id)?;
-        let tool_call =
-            latest_pending_human_input_call(&steps).ok_or_else(|| RunLoopError::Runtime {
-                run: Box::new(run.clone()),
-                message: "waiting run has no pending human_input tool call".to_owned(),
-            })?;
+        let pending = latest_pending_human_input(&steps).ok_or_else(|| RunLoopError::Runtime {
+            run: Box::new(run.clone()),
+            message: "waiting run has no pending human_input tool call".to_owned(),
+        })?;
+        let tool_call = pending.tool_call();
         validate_human_input(&tool_call.arguments, &input).map_err(|message| {
             RunLoopError::Runtime {
                 run: Box::new(run.clone()),
                 message,
             }
         })?;
-        self.context.store.append_step(
-            &run.id,
-            StepKind::ToolResult,
-            StepPayload::ToolResult {
-                id: tool_call.id,
-                call_id: tool_call.call_id,
+        let payload = match &pending {
+            PendingHumanInput::Main { tool_call } => StepPayload::ToolResult {
+                id: tool_call.id.clone(),
+                call_id: tool_call.call_id.clone(),
                 content: json!({ "input": input }),
             },
-        )?;
-        Ok(self
+            PendingHumanInput::Skill {
+                invocation,
+                tool_call,
+            } => StepPayload::SkillToolResult {
+                invocation_id: invocation.id.clone(),
+                id: tool_call.id.clone(),
+                call_id: tool_call.call_id.clone(),
+                content: json!({ "input": input }),
+            },
+        };
+        let kind = match pending {
+            PendingHumanInput::Main { .. } => StepKind::ToolResult,
+            PendingHumanInput::Skill { .. } => StepKind::SkillExecution,
+        };
+        self.context.store.append_step(&run.id, kind, payload)?;
+        let run = self
             .context
             .store
-            .update_run_status(&run.id, RunStatus::Running)?)
+            .update_run_status(&run.id, RunStatus::Running)?;
+        Ok(match pending {
+            PendingHumanInput::Main { .. } => ResumeTarget::Main(run),
+            PendingHumanInput::Skill { invocation, .. } => ResumeTarget::Skill { run, invocation },
+        })
     }
 
     async fn complete_llm_call(
@@ -258,14 +303,69 @@ where
         );
         self.context
             .store
-            .ensure_session_context_items(&run.id.session_id(), context_items)?;
+            .replace_session_context_items(&run.id.session_id(), context_items)?;
         self.context.store.append_step(
             &run.id,
             StepKind::UserMessage,
             StepPayload::UserMessage { content: request },
         )?;
+        if !self.context.requested_skills.is_empty() {
+            self.context.store.append_step(
+                &run.id,
+                StepKind::SkillExecution,
+                StepPayload::SkillsRequested {
+                    names: self
+                        .context
+                        .requested_skills
+                        .iter()
+                        .map(|skill| skill.name.clone())
+                        .collect(),
+                },
+            )?;
+        }
 
         Ok(run)
+    }
+
+    async fn continue_requested_skills(
+        &self,
+        run: Run,
+        events: &mut impl AgentEventSink,
+    ) -> Result<RunLoopOutput, RunLoopError> {
+        let steps = self.context.store.load_run_steps(&run.id)?;
+        let Some(names) = requested_skill_names(&steps) else {
+            return self.continue_run(run, events).await;
+        };
+
+        for (index, name) in names.iter().enumerate() {
+            let invocation_id = explicit_skill_invocation_id(index);
+            if has_tool_result(&steps, &invocation_id) {
+                continue;
+            }
+            let tool_call = AssistantResponseItem::ToolCall {
+                id: invocation_id,
+                call_id: None,
+                name: crate::CALL_SKILL_TOOL_NAME.to_owned(),
+                arguments: json!({
+                    "name": name,
+                    "task": run.request.clone(),
+                }),
+            };
+            self.record_assistant_response(
+                &run,
+                None,
+                LlmUsage::default(),
+                vec![tool_call.clone()],
+            )?;
+            let outcome = self
+                .execute_tool_call(&run, &tool_call, events, 0, index + 1)
+                .await?;
+            if outcome == ToolCallOutcome::WaitingForHumanInput {
+                return self.wait_for_human_input(run, events);
+            }
+        }
+
+        self.continue_run(run, events).await
     }
 
     fn record_assistant_response(
@@ -287,16 +387,16 @@ where
         Ok(())
     }
 
-    fn execute_tool_call(
+    async fn execute_tool_call(
         &self,
         run: &Run,
         tool_call: &AssistantResponseItem,
         events: &mut impl AgentEventSink,
         iteration_index: usize,
         tool_index: usize,
-    ) -> Result<(), StoreError> {
+    ) -> Result<ToolCallOutcome, StoreError> {
         let Some(tool_call) = ToolCallRequest::from_assistant_item(tool_call) else {
-            return Ok(());
+            return Ok(ToolCallOutcome::Completed);
         };
         tracing::info!(
             run_id = %run.id,
@@ -313,7 +413,19 @@ where
                 call_id: tool_call.call_id.clone(),
             },
         ));
-        let content = self.execute_tool_content(run, &tool_call, tool_id, events);
+        let content = if tool_call.name == crate::CALL_SKILL_TOOL_NAME {
+            match self.execute_skill_call(run, &tool_call).await {
+                Ok(SkillSubflowOutcome::Completed(output)) => {
+                    self.record_tool_output(&tool_call, tool_id, events, output)
+                }
+                Ok(SkillSubflowOutcome::WaitingForHumanInput) => {
+                    return Ok(ToolCallOutcome::WaitingForHumanInput);
+                }
+                Err(error) => self.record_tool_failure(run, &tool_call, tool_id, events, error),
+            }
+        } else {
+            self.execute_tool_content(run, &tool_call, tool_id, events)
+        };
         self.context.store.append_step(
             &run.id,
             StepKind::ToolResult,
@@ -323,7 +435,7 @@ where
                 content,
             },
         )?;
-        Ok(())
+        Ok(ToolCallOutcome::Completed)
     }
 
     fn execute_tool_content(
@@ -337,6 +449,212 @@ where
             Ok(output) => self.record_tool_output(tool_call, tool_id, events, output),
             Err(error) => self.record_tool_failure(run, tool_call, tool_id, events, error),
         }
+    }
+
+    async fn execute_skill_call(
+        &self,
+        run: &Run,
+        tool_call: &ToolCallRequest,
+    ) -> Result<SkillSubflowOutcome, String> {
+        let args = serde_json::from_value::<SkillCallArgs>(tool_call.arguments.clone())
+            .map_err(|error| format!("invalid call_skill tool arguments: {error}"))?;
+        let skill = self
+            .context
+            .skills
+            .iter()
+            .find(|skill| skill.name == args.name)
+            .ok_or_else(|| format!("skill not found: {}", args.name))?;
+        let invocation = SkillInvocation {
+            id: tool_call.id.clone(),
+            call_id: tool_call.call_id.clone(),
+            skill_name: skill.name.clone(),
+            task: args.task,
+        };
+        self.context
+            .store
+            .append_step(
+                &run.id,
+                StepKind::SkillExecution,
+                StepPayload::SkillStarted {
+                    invocation_id: invocation.id.clone(),
+                    call_id: invocation.call_id.clone(),
+                    skill_name: invocation.skill_name.clone(),
+                    task: invocation.task.clone(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let messages = invocation.initial_messages(self.skill_system_prompt(skill));
+        self.run_skill_subflow(run, &invocation, messages, 0).await
+    }
+
+    async fn run_skill_subflow(
+        &self,
+        run: &Run,
+        invocation: &SkillInvocation,
+        mut messages: Vec<Message>,
+        completed_iterations: usize,
+    ) -> Result<SkillSubflowOutcome, String> {
+        for _ in completed_iterations..MAX_LOOP_ITERATIONS {
+            let Some((prompt, history)) = messages.split_last() else {
+                return Err("skill subflow has no message for the LLM".to_owned());
+            };
+            let response = self
+                .context
+                .model
+                .completion(
+                    self.context
+                        .model
+                        .completion_request(prompt.clone())
+                        .messages(history.to_vec())
+                        .tools(tool_definitions())
+                        .build(),
+                )
+                .await
+                .map_err(|error| format!("skill subflow completion failed: {error}"))?;
+            let message_id = response.message_id.clone();
+            let assistant_turn = assistant_turn_from_response(response.choice)
+                .map_err(|message| format!("skill subflow returned invalid response: {message}"))?;
+            self.context
+                .store
+                .append_step(
+                    &run.id,
+                    StepKind::SkillExecution,
+                    StepPayload::SkillAssistantResponse {
+                        invocation_id: invocation.id.clone(),
+                        message_id,
+                        items: assistant_turn.items.clone(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+
+            if assistant_turn.tool_calls.is_empty() {
+                return Ok(SkillSubflowOutcome::Completed(skill_result(
+                    invocation,
+                    assistant_turn.final_answer,
+                )));
+            }
+
+            if human_input_tool_call(&assistant_turn.tool_calls).is_some() {
+                if assistant_turn.tool_calls.len() != 1 {
+                    return Err(
+                        "human_input must be the only tool call in a skill response".to_owned()
+                    );
+                }
+                return Ok(SkillSubflowOutcome::WaitingForHumanInput);
+            }
+
+            let assistant_message =
+                assistant_response_to_chat_message(&None, &assistant_turn.items)
+                    .ok_or_else(|| "skill subflow returned no assistant message".to_owned())?;
+            messages.push(assistant_message);
+
+            for tool_call in &assistant_turn.tool_calls {
+                let Some(tool_call) = ToolCallRequest::from_assistant_item(tool_call) else {
+                    continue;
+                };
+                if tool_call.name == crate::CALL_SKILL_TOOL_NAME {
+                    return Err("skill subflows cannot call other skills".to_owned());
+                }
+                let output = execute_tool(&self.context, &tool_call.name, &tool_call.arguments)
+                    .unwrap_or_else(|error| json!({ "success": false, "error": error }));
+                self.context
+                    .store
+                    .append_step(
+                        &run.id,
+                        StepKind::SkillExecution,
+                        StepPayload::SkillToolResult {
+                            invocation_id: invocation.id.clone(),
+                            id: tool_call.id.clone(),
+                            call_id: tool_call.call_id.clone(),
+                            content: output.clone(),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                messages.push(tool_result_chat_message(&tool_call, output));
+            }
+        }
+
+        Err("skill subflow reached the maximum number of iterations".to_owned())
+    }
+
+    fn skill_system_prompt(&self, skill: &crate::SkillDefinition) -> String {
+        let mut prompt = SYSTEM_PROMPT.to_owned();
+        if !self.context.instructions.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&crate::render_instruction_documents(
+                &self.context.instructions,
+            ));
+        }
+        prompt.push_str("\n\n");
+        prompt.push_str(&crate::render_skill_execution_prompt(skill));
+        prompt
+    }
+
+    async fn continue_resumed_skill(
+        &self,
+        run: Run,
+        invocation: SkillInvocation,
+        events: &mut impl AgentEventSink,
+    ) -> Result<RunLoopOutput, RunLoopError> {
+        let steps = self.context.store.load_run_steps(&run.id)?;
+        let Some(skill) = self
+            .context
+            .skills
+            .iter()
+            .find(|skill| skill.name == invocation.skill_name)
+        else {
+            self.append_skill_tool_result(
+                &run,
+                &invocation,
+                json!({
+                    "success": false,
+                    "error": format!("skill not found while resuming: {}", invocation.skill_name),
+                }),
+            )?;
+            return self.continue_requested_skills(run, events).await;
+        };
+        let messages = skill_messages(&invocation, &steps, self.skill_system_prompt(skill))
+            .map_err(|message| RunLoopError::Runtime {
+                run: Box::new(run.clone()),
+                message,
+            })?;
+        let completed_iterations = skill_iteration_count(&steps, &invocation.id);
+        match self
+            .run_skill_subflow(&run, &invocation, messages, completed_iterations)
+            .await
+        {
+            Ok(SkillSubflowOutcome::Completed(content)) => {
+                self.append_skill_tool_result(&run, &invocation, content)?;
+                self.continue_requested_skills(run, events).await
+            }
+            Ok(SkillSubflowOutcome::WaitingForHumanInput) => self.wait_for_human_input(run, events),
+            Err(error) => {
+                self.append_skill_tool_result(
+                    &run,
+                    &invocation,
+                    json!({ "success": false, "error": error }),
+                )?;
+                self.continue_requested_skills(run, events).await
+            }
+        }
+    }
+
+    fn append_skill_tool_result(
+        &self,
+        run: &Run,
+        invocation: &SkillInvocation,
+        content: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        self.context.store.append_step(
+            &run.id,
+            StepKind::ToolResult,
+            StepPayload::ToolResult {
+                id: invocation.id.clone(),
+                call_id: invocation.call_id.clone(),
+                content,
+            },
+        )?;
+        Ok(())
     }
 
     fn record_tool_output(
@@ -394,7 +712,6 @@ where
     fn wait_for_human_input(
         &self,
         run: Run,
-        _tool_call: &AssistantResponseItem,
         _events: &mut impl AgentEventSink,
     ) -> Result<RunLoopOutput, RunLoopError> {
         let run = self
@@ -611,6 +928,61 @@ struct AssistantTurn {
     items: Vec<AssistantResponseItem>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolCallOutcome {
+    Completed,
+    WaitingForHumanInput,
+}
+
+enum SkillSubflowOutcome {
+    Completed(serde_json::Value),
+    WaitingForHumanInput,
+}
+
+struct SkillInvocation {
+    id: String,
+    call_id: Option<String>,
+    skill_name: String,
+    task: String,
+}
+
+impl SkillInvocation {
+    fn initial_messages(&self, system_prompt: String) -> Vec<Message> {
+        vec![
+            Message::System {
+                content: system_prompt,
+            },
+            Message::user(self.task.clone()),
+        ]
+    }
+}
+
+enum PendingHumanInput {
+    Main {
+        tool_call: ToolCallRequest,
+    },
+    Skill {
+        invocation: SkillInvocation,
+        tool_call: ToolCallRequest,
+    },
+}
+
+impl PendingHumanInput {
+    fn tool_call(&self) -> &ToolCallRequest {
+        match self {
+            Self::Main { tool_call } | Self::Skill { tool_call, .. } => tool_call,
+        }
+    }
+}
+
+enum ResumeTarget {
+    Main(Run),
+    Skill {
+        run: Run,
+        invocation: SkillInvocation,
+    },
+}
+
 struct ToolCallRequest {
     id: String,
     call_id: Option<String>,
@@ -639,6 +1011,12 @@ impl ToolCallRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct SkillCallArgs {
+    name: String,
+    task: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct HumanInputArgs {
     #[allow(dead_code)]
     prompt: String,
@@ -664,32 +1042,159 @@ fn human_input_tool_call(tool_calls: &[AssistantResponseItem]) -> Option<&Assist
     })
 }
 
-fn latest_pending_human_input_call(steps: &[Step]) -> Option<ToolCallRequest> {
-    let resolved_ids = steps.iter().filter_map(tool_result_id).collect::<Vec<_>>();
-    steps.iter().rev().find_map(|step| {
-        let StepPayload::AssistantResponse { items, .. } = &step.payload else {
-            return None;
-        };
-        latest_unresolved_human_input_call(items, &resolved_ids)
+fn latest_pending_human_input(steps: &[Step]) -> Option<PendingHumanInput> {
+    let mut resolved_main_ids = HashSet::new();
+    let mut resolved_skill_ids = HashSet::new();
+    for step in steps {
+        match &step.payload {
+            StepPayload::ToolResult { id, .. } => {
+                resolved_main_ids.insert(id.clone());
+            }
+            StepPayload::SkillToolResult {
+                invocation_id, id, ..
+            } => {
+                resolved_skill_ids.insert((invocation_id.clone(), id.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    steps.iter().rev().find_map(|step| match &step.payload {
+        StepPayload::AssistantResponse { items, .. } => {
+            unresolved_human_input_call(items, |id| resolved_main_ids.contains(id))
+                .map(|tool_call| PendingHumanInput::Main { tool_call })
+        }
+        StepPayload::SkillAssistantResponse {
+            invocation_id,
+            items,
+            ..
+        } => {
+            let tool_call = unresolved_human_input_call(items, |id| {
+                resolved_skill_ids.contains(&(invocation_id.clone(), id.to_owned()))
+            })?;
+            let invocation = skill_invocation(steps, invocation_id)?;
+            Some(PendingHumanInput::Skill {
+                invocation,
+                tool_call,
+            })
+        }
+        _ => None,
     })
 }
 
-fn latest_unresolved_human_input_call(
+fn unresolved_human_input_call(
     items: &[AssistantResponseItem],
-    resolved_ids: &[&str],
+    is_resolved: impl Fn(&str) -> bool,
 ) -> Option<ToolCallRequest> {
     items.iter().rev().find_map(|item| {
         let tool_call = ToolCallRequest::from_assistant_item(item)?;
-        (tool_call.name == HUMAN_INPUT_TOOL_NAME && !resolved_ids.contains(&tool_call.id.as_str()))
+        (tool_call.name == HUMAN_INPUT_TOOL_NAME && !is_resolved(&tool_call.id))
             .then_some(tool_call)
     })
 }
 
-fn tool_result_id(step: &Step) -> Option<&str> {
-    match &step.payload {
-        StepPayload::ToolResult { id, .. } => Some(id.as_str()),
-        _ => None,
+fn skill_invocation(steps: &[Step], invocation_id: &str) -> Option<SkillInvocation> {
+    steps.iter().find_map(|step| {
+        let StepPayload::SkillStarted {
+            invocation_id: id,
+            call_id,
+            skill_name,
+            task,
+        } = &step.payload
+        else {
+            return None;
+        };
+        (id == invocation_id).then(|| SkillInvocation {
+            id: id.clone(),
+            call_id: call_id.clone(),
+            skill_name: skill_name.clone(),
+            task: task.clone(),
+        })
+    })
+}
+
+fn skill_messages(
+    invocation: &SkillInvocation,
+    steps: &[Step],
+    system_prompt: String,
+) -> Result<Vec<Message>, String> {
+    let mut messages = invocation.initial_messages(system_prompt);
+    for step in steps {
+        match &step.payload {
+            StepPayload::SkillAssistantResponse {
+                invocation_id,
+                message_id,
+                items,
+            } if invocation_id == &invocation.id => {
+                let message = assistant_response_to_chat_message(message_id, items)
+                    .ok_or_else(|| "skill subflow has an empty assistant response".to_owned())?;
+                messages.push(message);
+            }
+            StepPayload::SkillToolResult {
+                invocation_id,
+                id,
+                call_id,
+                content,
+            } if invocation_id == &invocation.id => {
+                messages.push(tool_result_chat_message(
+                    &ToolCallRequest {
+                        id: id.clone(),
+                        call_id: call_id.clone(),
+                        name: String::new(),
+                        arguments: serde_json::Value::Null,
+                    },
+                    content.clone(),
+                ));
+            }
+            _ => {}
+        }
     }
+    Ok(messages)
+}
+
+fn skill_iteration_count(steps: &[Step], invocation_id: &str) -> usize {
+    steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                &step.payload,
+                StepPayload::SkillAssistantResponse {
+                    invocation_id: id,
+                    ..
+                } if id == invocation_id
+            )
+        })
+        .count()
+}
+
+fn requested_skill_names(steps: &[Step]) -> Option<Vec<String>> {
+    steps.iter().find_map(|step| {
+        let StepPayload::SkillsRequested { names } = &step.payload else {
+            return None;
+        };
+        Some(names.clone())
+    })
+}
+
+fn explicit_skill_invocation_id(index: usize) -> String {
+    format!("jux_explicit_skill_{index}")
+}
+
+fn has_tool_result(steps: &[Step], tool_call_id: &str) -> bool {
+    steps.iter().any(|step| {
+        matches!(
+            &step.payload,
+            StepPayload::ToolResult { id, .. } if id == tool_call_id
+        )
+    })
+}
+
+fn skill_result(invocation: &SkillInvocation, summary: String) -> serde_json::Value {
+    json!({
+        "success": true,
+        "skill": invocation.skill_name,
+        "summary": summary,
+    })
 }
 
 fn validate_human_input(arguments: &serde_json::Value, input: &str) -> Result<(), String> {
@@ -775,7 +1280,21 @@ fn step_to_chat_message(step: &Step) -> Option<Message> {
                 content: rig::OneOrMany::one(ToolResultContent::text(content.to_string())),
             })),
         }),
-        StepPayload::Error { .. } => None,
+        StepPayload::SkillsRequested { .. }
+        | StepPayload::SkillStarted { .. }
+        | StepPayload::SkillAssistantResponse { .. }
+        | StepPayload::SkillToolResult { .. }
+        | StepPayload::Error { .. } => None,
+    }
+}
+
+fn tool_result_chat_message(tool_call: &ToolCallRequest, content: serde_json::Value) -> Message {
+    Message::User {
+        content: rig::OneOrMany::one(rig::message::UserContent::ToolResult(ToolResult {
+            id: tool_call.id.clone(),
+            call_id: tool_call.call_id.clone(),
+            content: rig::OneOrMany::one(ToolResultContent::text(content.to_string())),
+        })),
     }
 }
 
@@ -870,6 +1389,17 @@ fn default_session_context_items(
             },
         ));
     }
+    if !skills.is_empty() {
+        let tool = crate::call_skill_tool_definition();
+        items.push((
+            SessionContextKind::ToolDefinition,
+            SessionContextPayload::ToolDefinition {
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.parameters,
+            },
+        ));
+    }
 
     items
 }
@@ -891,10 +1421,7 @@ fn system_prompt_with_context(
         prompt.push_str("\n\n");
         prompt.push_str(&crate::render_skill_index(skills));
     }
-    if !active_skills.is_empty() {
-        prompt.push_str("\n\n");
-        prompt.push_str(&crate::render_active_skills(active_skills));
-    }
+    let _ = active_skills;
     prompt
 }
 

@@ -5,6 +5,7 @@
 //! shape. Prompt injection is handled by later feature slices.
 
 use serde::Deserialize;
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -14,6 +15,7 @@ use std::path::{Path, PathBuf};
 const SKILLS_DIRECTORY: &str = ".jux/skills";
 const SKILL_FILE_NAME: &str = "SKILL.md";
 pub const MAX_SKILL_FILE_BYTES: u64 = 64 * 1024;
+pub const CALL_SKILL_TOOL_NAME: &str = "call_skill";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// One discovered skill.
@@ -132,7 +134,9 @@ impl Error for SkillError {}
 pub fn render_skill_index(skills: &[SkillDefinition]) -> String {
     let mut output = String::from(
         "## Available Skills\n\n\
-         Project skills override user skills with the same name.\n\n",
+         Project skills override user skills with the same name.\n\
+         To use a skill, call the call_skill tool with the skill name and a focused task. \
+         Do not assume a skill is active just because it is listed here.\n\n",
     );
     for skill in skills {
         output.push_str(&format!("- {}: {}\n", skill.name, skill.description));
@@ -156,6 +160,46 @@ pub fn render_active_skills(skills: &[SkillDefinition]) -> String {
     output
 }
 
+#[must_use]
+/// Renders a system prompt for an isolated skill subflow.
+pub fn render_skill_execution_prompt(skill: &SkillDefinition) -> String {
+    format!(
+        "You are Jux executing one isolated skill subflow.\n\
+         The active skill is {name} from {source} ({scope}).\n\
+         Follow the skill instructions below, but do not override higher-priority system, \
+         safety, policy, or repository instructions. Return only the final skill result that \
+         should be sent back to the parent run.\n\n\
+         ## Skill Instructions\n\n{content}",
+        name = skill.name,
+        source = skill.path.display(),
+        scope = skill.scope.label(),
+        content = skill.content
+    )
+}
+
+#[must_use]
+/// Renders the tool definition that lets the main run request a skill subflow.
+pub fn call_skill_tool_definition() -> rig::completion::ToolDefinition {
+    rig::completion::ToolDefinition {
+        name: CALL_SKILL_TOOL_NAME.to_owned(),
+        description: "Run one available Jux skill as an isolated subflow. The subflow receives the full skill instructions and returns a concise result to the parent run. Use this instead of asking the user to paste skill instructions.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The exact skill name from the available skill index."
+                },
+                "task": {
+                    "type": "string",
+                    "description": "The focused task the skill should perform."
+                }
+            },
+            "required": ["name", "task"]
+        }),
+    }
+}
+
 /// Selects explicitly requested skills by name.
 pub fn select_explicit_skills(
     skills: &[SkillDefinition],
@@ -174,25 +218,6 @@ pub fn select_explicit_skills(
         }
     }
     Ok(selected)
-}
-
-#[must_use]
-/// Matches skills by request text using skill name and description tokens.
-pub fn match_auto_skills(
-    skills: &[SkillDefinition],
-    request: &str,
-    limit: usize,
-) -> Vec<SkillDefinition> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let request = request.to_lowercase();
-    skills
-        .iter()
-        .filter(|skill| skill_matches_request(skill, &request))
-        .take(limit)
-        .cloned()
-        .collect()
 }
 
 fn discover_skills(
@@ -229,7 +254,12 @@ fn insert_skill(
     scope: SkillScope,
     path: PathBuf,
 ) -> Result<(), SkillError> {
-    let Some(name) = skill_directory_name(&path) else {
+    let Some(name) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+    else {
         return Ok(());
     };
     let skill_file = path.join(SKILL_FILE_NAME);
@@ -245,13 +275,6 @@ fn insert_skill(
         });
     }
     Ok(())
-}
-
-fn skill_directory_name(path: &Path) -> Option<String> {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
 }
 
 fn parse_skill_file(
@@ -273,7 +296,12 @@ fn parse_skill_file(
         )));
     }
     let (frontmatter, content) = split_skill_file(&raw, &path)?;
-    let metadata = parse_frontmatter(frontmatter, &path)?;
+    let metadata = serde_yaml::from_str::<SkillFrontmatter>(frontmatter).map_err(|error| {
+        SkillError::new(format!(
+            "failed to parse skill frontmatter {}: {error}",
+            path.display()
+        ))
+    })?;
     let name = required_field(metadata.name, "name", &path)?;
     let description = required_field(metadata.description, "description", &path)?;
     if name != expected_name {
@@ -306,15 +334,6 @@ fn split_skill_file<'a>(raw: &'a str, path: &Path) -> Result<(&'a str, &'a str),
     Ok((frontmatter, content.trim_start_matches(['\r', '\n'])))
 }
 
-fn parse_frontmatter(frontmatter: &str, path: &Path) -> Result<SkillFrontmatter, SkillError> {
-    serde_yaml::from_str(frontmatter).map_err(|error| {
-        SkillError::new(format!(
-            "failed to parse skill frontmatter {}: {error}",
-            path.display()
-        ))
-    })
-}
-
 fn required_field(value: Option<String>, field: &str, path: &Path) -> Result<String, SkillError> {
     let value = value.unwrap_or_default();
     if value.trim().is_empty() {
@@ -340,21 +359,6 @@ fn reject_oversized_skill_file(path: &Path) -> Result<(), SkillError> {
         )));
     }
     Ok(())
-}
-
-fn skill_matches_request(skill: &SkillDefinition, request: &str) -> bool {
-    request.contains(&skill.name.to_lowercase())
-        || description_words(&skill.description)
-            .iter()
-            .any(|word| request.contains(word))
-}
-
-fn description_words(description: &str) -> Vec<String> {
-    description
-        .split(|char: char| !char.is_ascii_alphanumeric())
-        .filter(|word| word.len() >= 4)
-        .map(str::to_lowercase)
-        .collect()
 }
 
 impl SkillScope {

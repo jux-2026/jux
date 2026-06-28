@@ -4,7 +4,7 @@ use jux_core::{
     AgentEvent, AgentEventData, AgentEventKind, AgentEventSink, InstructionDocument,
     InstructionResolver, Run, RunLoop, RunLoopOutput, RunStatus, Session, SessionContextItem,
     SessionContextPayload, SessionId, SkillCatalog, SkillDefinition, SkillResolver,
-    SqliteWorkspaceStore, Step, StepPayload, Workspace, match_auto_skills, select_explicit_skills,
+    SqliteWorkspaceStore, Step, StepKind, StepPayload, Workspace, select_explicit_skills,
 };
 use rig::{client::CompletionClient, completion::CompletionModel, providers::deepseek};
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,6 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-chat";
-const MAX_AUTO_SKILLS: usize = 3;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -115,7 +114,10 @@ struct RunArgs {
     #[arg(long = "skill", help = "Activate a skill by name.")]
     skills: Vec<String>,
 
-    #[arg(long, help = "Disable automatic skill matching.")]
+    #[arg(
+        long,
+        help = "Disable automatic skill matching. Automatic matching is currently disabled."
+    )]
     no_auto_skills: bool,
 }
 
@@ -462,6 +464,7 @@ impl SessionShowOutput {
                 let run_steps = steps
                     .iter()
                     .filter(|step| step.id.run_id() == run.id)
+                    .filter(|step| step.kind != StepKind::SkillExecution)
                     .map(SessionStepOutput::from)
                     .collect();
                 SessionRunOutput::new(run, run_steps)
@@ -560,7 +563,6 @@ struct RunCommandOutput {
 struct RunCommandOptions {
     stream: bool,
     explicit_skills: Vec<String>,
-    auto_skills: bool,
 }
 
 impl From<&RunArgs> for RunCommandOptions {
@@ -568,7 +570,6 @@ impl From<&RunArgs> for RunCommandOptions {
         Self {
             stream: args.stream,
             explicit_skills: args.skills.clone(),
-            auto_skills: !args.no_auto_skills,
         }
     }
 }
@@ -585,7 +586,12 @@ impl From<&RunLoopOutput> for RunCommandOutput {
             human_input: latest_human_input_request(&output.steps),
             created_at: output.run.created_at,
             updated_at: output.run.updated_at,
-            steps: output.steps.iter().map(RunStepOutput::from).collect(),
+            steps: output
+                .steps
+                .iter()
+                .filter(|step| step.kind != StepKind::SkillExecution)
+                .map(RunStepOutput::from)
+                .collect(),
         }
     }
 }
@@ -618,8 +624,10 @@ struct RunStepOutput {
 
 fn latest_human_input_request(steps: &[Step]) -> Option<HumanInputOutput> {
     steps.iter().rev().find_map(|step| {
-        let StepPayload::AssistantResponse { items, .. } = &step.payload else {
-            return None;
+        let items = match &step.payload {
+            StepPayload::AssistantResponse { items, .. }
+            | StepPayload::SkillAssistantResponse { items, .. } => items,
+            _ => return None,
         };
         items.iter().rev().find_map(|item| {
             let jux_core::AssistantResponseItem::ToolCall {
@@ -659,18 +667,14 @@ where
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     let store = SqliteWorkspaceStore::new(workspace);
     let instructions = load_instruction_documents(store.root())?;
-    let skills = load_skill_definitions(store.root())?;
-    let active_skills = select_run_skills(
-        &skills,
-        &request,
-        &options.explicit_skills,
-        options.auto_skills,
-    )?;
+    let skill_catalog = load_skill_catalog(store.root())?;
+    let skills = skill_catalog.skills;
+    let requested_skills = select_explicit_skills(&skills, &options.explicit_skills)?;
     let policy = jux_core::RuntimePolicy::workspace_default(store.root().to_path_buf());
     let context = jux_core::RunLoopContext::new(store, model, policy)
         .with_instructions(instructions)
         .with_skills(skills)
-        .with_active_skills(active_skills);
+        .with_requested_skills(requested_skills);
     let run_loop = RunLoop::with_context(context);
     if options.stream {
         let mut events = StdoutAgentEventSink;
@@ -678,23 +682,6 @@ where
     } else {
         Ok(runtime.block_on(run_loop.run(request))?)
     }
-}
-
-fn select_run_skills(
-    skills: &[SkillDefinition],
-    request: &str,
-    explicit_skill_names: &[String],
-    auto_skills_enabled: bool,
-) -> Result<Vec<SkillDefinition>> {
-    let mut selected = select_explicit_skills(skills, explicit_skill_names)?;
-    if auto_skills_enabled {
-        for skill in match_auto_skills(skills, request, MAX_AUTO_SKILLS) {
-            if !selected.iter().any(|selected| selected.name == skill.name) {
-                selected.push(skill);
-            }
-        }
-    }
-    Ok(selected)
 }
 
 fn load_instruction_documents(
@@ -727,11 +714,6 @@ fn windows_home_drive_path() -> Option<PathBuf> {
         drive.to_string_lossy(),
         path.to_string_lossy()
     )))
-}
-
-fn load_skill_definitions(workspace_root: &std::path::Path) -> Result<Vec<SkillDefinition>> {
-    let catalog = load_skill_catalog(workspace_root)?;
-    Ok(catalog.skills)
 }
 
 fn load_skill_catalog(workspace_root: &std::path::Path) -> Result<SkillCatalog> {

@@ -179,6 +179,27 @@ impl SqliteWorkspaceStore {
         Ok(items)
     }
 
+    pub fn replace_session_context_items(
+        &self,
+        session_id: &SessionId,
+        replacements: Vec<(SessionContextKind, SessionContextPayload)>,
+    ) -> Result<Vec<SessionContextItem>, StoreError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "delete from session_context_items where session_id = ?1",
+            params![session_id.as_str()],
+        )?;
+        let mut items = Vec::with_capacity(replacements.len());
+        for (index, (kind, payload)) in replacements.into_iter().enumerate() {
+            let item = SessionContextItem::new(session_id.clone(), index as u64 + 1, kind, payload);
+            insert_session_context_item(&transaction, &item)?;
+            items.push(item);
+        }
+        transaction.commit()?;
+        Ok(items)
+    }
+
     pub fn load_session_context_items(
         &self,
         session_id: &SessionId,
@@ -617,6 +638,7 @@ fn encode_step_kind(kind: &StepKind) -> &'static str {
         StepKind::UserMessage => "user_message",
         StepKind::AssistantResponse => "assistant_response",
         StepKind::ToolResult => "tool_result",
+        StepKind::SkillExecution => "skill_execution",
         StepKind::Error => "error",
     }
 }
@@ -626,6 +648,7 @@ fn decode_step_kind(kind: String) -> Result<StepKind, StoreError> {
         "user_message" => Ok(StepKind::UserMessage),
         "assistant_response" => Ok(StepKind::AssistantResponse),
         "tool_result" => Ok(StepKind::ToolResult),
+        "skill_execution" => Ok(StepKind::SkillExecution),
         "error" => Ok(StepKind::Error),
         _ => Err(StoreError::InvalidStepKind(kind)),
     }

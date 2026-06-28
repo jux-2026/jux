@@ -131,33 +131,287 @@ fn run_loop_sends_available_skill_index_to_llm_without_full_skill_body() {
 
     assert!(request.contains("## Available Skills"));
     assert!(request.contains("- review: Review code changes"));
+    assert!(request.contains("\"name\":\"call_skill\""));
     assert!(!request.contains("Full review skill body should not be in the index."));
 }
 
 #[test]
-fn run_loop_sends_active_skill_body_to_llm() {
+fn run_loop_executes_skill_as_isolated_tool_subflow() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
-    let model = TestModel::fixed_text("Active skill answer");
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "call_skill",
+            serde_json::json!({
+                "name": "review",
+                "task": "Review current changes"
+            }),
+        ))]),
+        Ok(vec![AssistantContent::text("Skill found one issue")]),
+        Ok(vec![AssistantContent::text("Parent received skill result")]),
+    ]);
     let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
     let skill = SkillDefinition {
         name: "review".to_owned(),
         description: "Review code changes".to_owned(),
-        content: "Full active review instructions.".to_owned(),
+        content: "Full isolated review instructions.".to_owned(),
         scope: SkillScope::Project,
         path: "/workspace/.jux/skills/review/SKILL.md".into(),
     };
-    let context = RunLoopContext::new(store.clone(), model.clone(), policy)
-        .with_skills(vec![skill.clone()])
-        .with_active_skills(vec![skill]);
+    let context =
+        RunLoopContext::new(store.clone(), model.clone(), policy).with_skills(vec![skill]);
     let run_loop = RunLoop::with_context(context);
 
-    futures::executor::block_on(run_loop.run("Use active skill".to_owned()))
+    let output = futures::executor::block_on(run_loop.run("Use review skill".to_owned()))
         .expect("run loop succeeds");
-    let request = model.recorded_requests().remove(0);
+    let requests = model.recorded_requests();
+    let skill_result = output
+        .steps
+        .iter()
+        .find_map(|step| step.payload.to_tool_result_content())
+        .expect("skill tool result exists");
 
-    assert!(request.contains("## Available Skills"));
-    assert!(request.contains("## Active Skills"));
-    assert!(request.contains("Full active review instructions."));
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[0].contains("Full isolated review instructions."));
+    assert!(requests[1].contains("Full isolated review instructions."));
+    assert!(!requests[1].contains("\"name\":\"call_skill\""));
+    assert_eq!(skill_result["success"], true);
+    assert_eq!(skill_result["skill"], "review");
+    assert_eq!(skill_result["summary"], "Skill found one issue");
+    assert!(requests[2].contains("Skill found one issue"));
+}
+
+#[test]
+fn skill_subflow_inherits_instruction_documents() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "skill_call",
+            "call_skill",
+            serde_json::json!({
+                "name": "review",
+                "task": "Review current changes"
+            }),
+        ))]),
+        Ok(vec![AssistantContent::text("Skill followed instructions")]),
+        Ok(vec![AssistantContent::text("Parent answer")]),
+    ]);
+    let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let context = RunLoopContext::new(store.clone(), model.clone(), policy)
+        .with_instructions(vec![InstructionDocument {
+            scope: InstructionScope::Project,
+            path: "/workspace/AGENTS.md".into(),
+            content: "Project skill instruction must be visible.".to_owned(),
+        }])
+        .with_skills(vec![test_skill(
+            "review",
+            "Review code changes",
+            "Review carefully.",
+        )]);
+    let run_loop = RunLoop::with_context(context);
+
+    futures::executor::block_on(run_loop.run("Use review skill".to_owned()))
+        .expect("run loop succeeds");
+    let requests = model.recorded_requests();
+
+    assert!(requests[1].contains("Project skill instruction must be visible."));
+}
+
+#[test]
+fn run_loop_refreshes_skill_index_between_runs_in_same_session() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let first_model = TestModel::fixed_text("First answer");
+    let first_policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let first_context =
+        RunLoopContext::new(store.clone(), first_model, first_policy).with_skills(vec![
+            test_skill("review", "Review code changes", "Review carefully."),
+        ]);
+    futures::executor::block_on(
+        RunLoop::with_context(first_context).run("First request".to_owned()),
+    )
+    .expect("first run succeeds");
+
+    let second_model = TestModel::fixed_text("Second answer");
+    let second_policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let second_context = RunLoopContext::new(store, second_model.clone(), second_policy)
+        .with_skills(vec![test_skill(
+            "diagnose",
+            "Diagnose failing behavior",
+            "Diagnose carefully.",
+        )]);
+    futures::executor::block_on(
+        RunLoop::with_context(second_context).run("Second request".to_owned()),
+    )
+    .expect("second run succeeds");
+    let request = second_model.recorded_requests().remove(0);
+
+    assert!(request.contains("- diagnose: Diagnose failing behavior"));
+    assert!(!request.contains("- review: Review code changes"));
+}
+
+#[test]
+fn skill_subflow_rejects_human_input_mixed_with_other_tool_calls() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "skill_call",
+            "call_skill",
+            serde_json::json!({
+                "name": "review",
+                "task": "Review current changes"
+            }),
+        ))]),
+        Ok(vec![
+            AssistantContent::ToolCall(test_tool_call(
+                "human_call",
+                "human_input",
+                serde_json::json!({
+                    "prompt": "Choose review depth",
+                    "allow_free_text": true
+                }),
+            )),
+            AssistantContent::ToolCall(test_tool_call(
+                "lua_call",
+                "lua",
+                serde_json::json!({ "code": "return 'unexpected'" }),
+            )),
+        ]),
+        Ok(vec![AssistantContent::text(
+            "Parent handled invalid skill response",
+        )]),
+    ]);
+    let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let context =
+        RunLoopContext::new(store.clone(), model.clone(), policy).with_skills(vec![test_skill(
+            "review",
+            "Review code changes",
+            "Review carefully.",
+        )]);
+    let run_loop = RunLoop::with_context(context);
+
+    let output = futures::executor::block_on(run_loop.run("Use review skill".to_owned()))
+        .expect("invalid skill response is returned to parent");
+    let requests = model.recorded_requests();
+
+    assert_eq!(output.run.status, RunStatus::Completed);
+    assert_eq!(
+        output.answer.as_deref(),
+        Some("Parent handled invalid skill response")
+    );
+    assert!(requests[2].contains("human_input must be the only tool call"));
+}
+
+#[test]
+fn run_loop_resumes_human_input_inside_skill_subflow() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "skill_call",
+            "call_skill",
+            serde_json::json!({
+                "name": "review",
+                "task": "Review current changes"
+            }),
+        ))]),
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "human_call",
+            "human_input",
+            serde_json::json!({
+                "prompt": "Choose review depth",
+                "options": [{ "id": "deep", "label": "Deep review" }],
+                "allow_free_text": false
+            }),
+        ))]),
+        Ok(vec![AssistantContent::text(
+            "Skill completed a deep review",
+        )]),
+        Ok(vec![AssistantContent::text(
+            "Parent received resumed skill result",
+        )]),
+    ]);
+    let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let skill = SkillDefinition {
+        name: "review".to_owned(),
+        description: "Review code changes".to_owned(),
+        content: "Ask for review depth before reviewing.".to_owned(),
+        scope: SkillScope::Project,
+        path: "/workspace/.jux/skills/review/SKILL.md".into(),
+    };
+    let context =
+        RunLoopContext::new(store.clone(), model.clone(), policy).with_skills(vec![skill]);
+    let run_loop = RunLoop::with_context(context);
+
+    let waiting_output = futures::executor::block_on(run_loop.run("Use review skill".to_owned()))
+        .expect("skill subflow waits for human input");
+    let resumed_output = futures::executor::block_on(run_loop.run("deep".to_owned()))
+        .expect("skill subflow resumes and completes");
+    let requests = model.recorded_requests();
+
+    assert_eq!(waiting_output.run.status, RunStatus::WaitingForHumanInput);
+    assert_eq!(resumed_output.run.id, waiting_output.run.id);
+    assert_eq!(resumed_output.run.status, RunStatus::Completed);
+    assert_eq!(
+        resumed_output.answer.as_deref(),
+        Some("Parent received resumed skill result")
+    );
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2].contains("deep"));
+    assert!(requests[3].contains("Skill completed a deep review"));
+    assert!(!requests[3].contains("Ask for review depth before reviewing."));
+    assert!(
+        resumed_output
+            .steps
+            .iter()
+            .any(|step| step.kind == StepKind::SkillExecution)
+    );
+}
+
+#[test]
+fn skill_subflow_iteration_limit_spans_human_input_resumes() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let mut responses = vec![Ok(vec![AssistantContent::ToolCall(test_tool_call(
+        "skill_call",
+        "call_skill",
+        serde_json::json!({
+            "name": "review",
+            "task": "Review current changes"
+        }),
+    ))])];
+    for index in 1..=8 {
+        responses.push(Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            &format!("human_call_{index}"),
+            "human_input",
+            serde_json::json!({
+                "prompt": format!("Input {index}"),
+                "allow_free_text": true
+            }),
+        ))]));
+    }
+    responses.push(Ok(vec![AssistantContent::text("Parent saw skill limit")]));
+    responses.push(Ok(vec![AssistantContent::text(
+        "Unexpected extra response",
+    )]));
+    let model = TestModel::responses(responses);
+    let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let context =
+        RunLoopContext::new(store.clone(), model.clone(), policy).with_skills(vec![test_skill(
+            "review",
+            "Review code changes",
+            "Review carefully.",
+        )]);
+    let run_loop = RunLoop::with_context(context);
+
+    let mut output = futures::executor::block_on(run_loop.run("Use review skill".to_owned()))
+        .expect("skill asks for first input");
+    for index in 1..=8 {
+        assert_eq!(output.run.status, RunStatus::WaitingForHumanInput);
+        output = futures::executor::block_on(run_loop.run(format!("answer {index}")))
+            .expect("skill resume succeeds");
+    }
+
+    assert_eq!(output.run.status, RunStatus::Completed);
+    assert_eq!(output.answer.as_deref(), Some("Parent saw skill limit"));
+    assert_eq!(model.recorded_requests().len(), 10);
 }
 
 #[test]
@@ -813,6 +1067,16 @@ impl CompletionModel for TestModel {
 
 fn test_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
     ToolCall::new(id.to_owned(), ToolFunction::new(name.to_owned(), arguments))
+}
+
+fn test_skill(name: &str, description: &str, content: &str) -> SkillDefinition {
+    SkillDefinition {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        content: content.to_owned(),
+        scope: SkillScope::Project,
+        path: format!("/workspace/.jux/skills/{name}/SKILL.md").into(),
+    }
 }
 
 fn temp_workspace_root() -> std::path::PathBuf {

@@ -31,9 +31,9 @@ pub use policy::{
     WasmPackageRule, WasmPackageSource, WasmSandboxPolicy,
 };
 pub use skills::{
-    MAX_SKILL_FILE_BYTES, SkillCatalog, SkillDefinition, SkillError, SkillOverride, SkillResolver,
-    SkillScope, match_auto_skills, render_active_skills, render_skill_index,
-    select_explicit_skills,
+    CALL_SKILL_TOOL_NAME, MAX_SKILL_FILE_BYTES, SkillCatalog, SkillDefinition, SkillError,
+    SkillOverride, SkillResolver, SkillScope, call_skill_tool_definition, render_active_skills,
+    render_skill_execution_prompt, render_skill_index, select_explicit_skills,
 };
 pub use state::{
     AssistantResponseItem, LlmUsage, Run, RunId, RunStatus, Session, SessionContextItem,
