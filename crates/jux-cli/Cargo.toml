@@ -13,7 +13,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 jux-core.workspace = true
+ratatui.workspace = true
 rig-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

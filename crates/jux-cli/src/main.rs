@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use jux_cli::tui::run_tui;
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventKind, AgentEventSink, InstructionDocument,
     InstructionResolver, Run, RunLoop, RunLoopOutput, RunStatus, Session, SessionContextItem,
@@ -143,21 +144,24 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Command::Run(args)) => handle_run(args, cli.output),
         Some(Command::Skills(command)) => handle_skills(command, cli.output),
-        Some(Command::Session(command)) => handle_session(command, cli.output),
-        None => Ok(()),
+        Some(Command::Session(command)) => match command.command {
+            SessionSubcommand::Show(args) => handle_session_show(args, cli.output),
+        },
+        None => {
+            let workspace = env::current_dir().context("failed to determine current workspace")?;
+            run_tui(workspace)
+        }
     }
 }
 
 fn handle_skills(command: SkillsCommand, output_format: OutputFormat) -> Result<()> {
     match command.command {
-        SkillsSubcommand::List(args) => handle_skills_list(args, output_format),
+        SkillsSubcommand::List(args) => {
+            let catalog = load_skill_catalog(&args.workspace)?;
+            print_skills_list_output(&SkillsListOutput::from(catalog), output_format)
+        }
         SkillsSubcommand::Show(args) => handle_skills_show(args, output_format),
     }
-}
-
-fn handle_skills_list(args: SkillsListArgs, output_format: OutputFormat) -> Result<()> {
-    let catalog = load_skill_catalog(&args.workspace)?;
-    print_skills_list_output(&SkillsListOutput::from(catalog), output_format)
 }
 
 fn handle_skills_show(args: SkillsShowArgs, output_format: OutputFormat) -> Result<()> {
@@ -168,12 +172,6 @@ fn handle_skills_show(args: SkillsShowArgs, output_format: OutputFormat) -> Resu
         .find(|skill| skill.name == args.name)
         .with_context(|| format!("skill not found: {}", args.name))?;
     print_skill_show_output(&SkillShowOutput::from(skill), output_format)
-}
-
-fn handle_session(command: SessionCommand, output_format: OutputFormat) -> Result<()> {
-    match command.command {
-        SessionSubcommand::Show(args) => handle_session_show(args, output_format),
-    }
 }
 
 fn handle_session_show(args: SessionShowArgs, output_format: OutputFormat) -> Result<()> {

@@ -137,13 +137,6 @@ impl Default for WasmerRuntime {
     }
 }
 
-fn load_wasm_asset(asset: &WasmAsset) -> Result<Vec<u8>, WasmRuntimeError> {
-    let package_path = asset
-        .ensure_local_file()
-        .map_err(|source| WasmRuntimeError::Run(source.to_string()))?;
-    fs::read(&package_path).map_err(|source| WasmRuntimeError::Io(source.to_string()))
-}
-
 fn load_wasi_package_session(
     asset: &WasmAsset,
     capabilities: &WasmerRuntimeCapabilities,
@@ -160,8 +153,15 @@ fn load_wasi_package_session_in_thread(
     asset: &WasmAsset,
     capabilities: &WasmerRuntimeCapabilities,
 ) -> Result<WasiPackageSession, WasmRuntimeError> {
-    let package_bytes = load_wasm_asset(asset)?;
-    let tokio_runtime = build_tokio_runtime()?;
+    let package_path = asset
+        .ensure_local_file()
+        .map_err(|source| WasmRuntimeError::Run(source.to_string()))?;
+    let package_bytes =
+        fs::read(&package_path).map_err(|source| WasmRuntimeError::Io(source.to_string()))?;
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WasmRuntimeError::Run(error.to_string()))?;
     let runtime = Arc::new(build_wasix_runtime(&tokio_runtime, capabilities)?);
     let package = load_webc_package(&tokio_runtime, package_bytes, runtime.as_ref())?;
 
@@ -214,9 +214,15 @@ fn run_webc_command_in_thread(
         read_virtual_file(&session.tokio_runtime, &mut stderr).map_err(WasmRuntimeError::Io)?;
     let exit_code = match result {
         Ok(()) => 0,
-        Err(error) => {
-            wasm_exit_code(&error).ok_or_else(|| WasmRuntimeError::Run(error_chain(&error)))?
-        }
+        Err(error) => wasm_exit_code(&error).ok_or_else(|| {
+            WasmRuntimeError::Run(
+                error
+                    .chain()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(": "),
+            )
+        })?,
     };
 
     Ok(WasiCommandResult {
@@ -224,13 +230,6 @@ fn run_webc_command_in_thread(
         stdout,
         stderr,
     })
-}
-
-fn build_tokio_runtime() -> Result<tokio::runtime::Runtime, WasmRuntimeError> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| WasmRuntimeError::Run(error.to_string()))
 }
 
 fn build_wasix_runtime(
@@ -365,14 +364,6 @@ fn wasm_exit_code(error: &anyhow::Error) -> Option<i32> {
             wasmer_wasix::WasiError::Exit(code) => code.raw(),
             _ => 1,
         })
-}
-
-fn error_chain(error: &anyhow::Error) -> String {
-    error
-        .chain()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(": ")
 }
 
 fn read_virtual_file(

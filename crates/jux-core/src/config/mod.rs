@@ -106,7 +106,9 @@ impl JuxConfig {
     }
 
     fn from_overlay_value(overlay: Value) -> Result<Self, ConfigError> {
-        let mut value = default_config_value()?;
+        let mut value = serde_json::to_value(JuxConfig::default()).map_err(|error| {
+            ConfigError::new(format!("failed to build default config: {error}"))
+        })?;
         reject_null_values(&overlay, "config")?;
         merge_value(&mut value, overlay);
         serde_json::from_value(value)
@@ -238,7 +240,13 @@ impl FilesystemConfig {
     fn resolve_workdirs(&self, workspace_root: &Path) -> Vec<PathBuf> {
         self.workdirs
             .iter()
-            .map(|workdir| resolve_config_path(workspace_root, workdir))
+            .map(|workdir| {
+                if workdir.is_absolute() {
+                    workdir.to_path_buf()
+                } else {
+                    workspace_root.join(workdir)
+                }
+            })
             .collect()
     }
 }
@@ -588,7 +596,11 @@ impl JuxConfigLoader {
         };
         let content = fs::read_to_string(&path)
             .map_err(|error| ConfigError::new(format!("failed to read config file: {error}")))?;
-        parse_config_file(&path, &content)
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("yaml" | "yml") => JuxConfig::from_yaml_str(&content),
+            Some("json" | "jsonc") => JuxConfig::from_jsonc_str(&content),
+            _ => Err(ConfigError::new("unsupported config file extension")),
+        }
     }
 
     fn find_config_path(&self) -> Option<PathBuf> {
@@ -623,19 +635,6 @@ impl Display for ConfigError {
 }
 
 impl Error for ConfigError {}
-
-fn parse_config_file(path: &Path, content: &str) -> Result<JuxConfig, ConfigError> {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("yaml" | "yml") => JuxConfig::from_yaml_str(content),
-        Some("json" | "jsonc") => JuxConfig::from_jsonc_str(content),
-        _ => Err(ConfigError::new("unsupported config file extension")),
-    }
-}
-
-fn default_config_value() -> Result<Value, ConfigError> {
-    serde_json::to_value(JuxConfig::default())
-        .map_err(|error| ConfigError::new(format!("failed to build default config: {error}")))
-}
 
 fn merge_value(base: &mut Value, overlay: Value) {
     match (base, overlay) {
@@ -763,14 +762,6 @@ where
         previous = char;
     }
     Err(ConfigError::new("unterminated JSONC block comment"))
-}
-
-fn resolve_config_path(workspace_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        workspace_root.join(path)
-    }
 }
 
 fn filesystem_permissions(read: bool, write: bool) -> WasmFilesystemPermissions {
