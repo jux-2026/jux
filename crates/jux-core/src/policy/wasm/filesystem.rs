@@ -38,6 +38,14 @@ impl WasmFilesystemPolicy {
     }
 
     #[must_use]
+    pub fn read_only_workdir(workdir: impl Into<PathBuf>) -> Self {
+        Self::new(
+            vec![workdir.into()],
+            vec![WasmFilesystemRule::allow_read("**")],
+        )
+    }
+
+    #[must_use]
     pub fn has_rules(&self) -> bool {
         !self.rules.is_empty()
     }

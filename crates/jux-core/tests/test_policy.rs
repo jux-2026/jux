@@ -17,7 +17,7 @@ fn runtime_policy_workspace_default_disables_native_commands() {
     assert_eq!(
         policy.wasm,
         WasmSandboxPolicy {
-            filesystem: WasmFilesystemPolicy::read_write_workdir(workspace_root.clone()),
+            filesystem: WasmFilesystemPolicy::read_only_workdir(workspace_root.clone()),
             environment: WasmEnvironmentPolicy::Isolated,
             network: WasmNetworkPolicy {
                 http_rules: Vec::new()
@@ -35,6 +35,22 @@ fn runtime_policy_workspace_default_disables_native_commands() {
             .allows_package("wasmer/coreutils", Some("1.0.25"))
     );
     assert!(!policy.wasm.allows_package("wasmer/python", None));
+    assert_eq!(
+        policy
+            .wasm
+            .filesystem
+            .decide_path_access("/workspace/src/lib.rs", WasmFilesystemAccess::Read)
+            .expect("read decision succeeds"),
+        WasmFilesystemDecision::Allow
+    );
+    assert_eq!(
+        policy
+            .wasm
+            .filesystem
+            .decide_path_access("/workspace/src/lib.rs", WasmFilesystemAccess::Write)
+            .expect("write decision succeeds"),
+        WasmFilesystemDecision::Deny
+    );
 }
 
 #[test]

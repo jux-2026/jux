@@ -1,8 +1,9 @@
 use jux_core::{
-    AgentEvent, AgentEventKind, AgentEventSink, AssistantResponseItem, InstructionDocument,
-    InstructionScope, LlmUsage, RunLoop, RunLoopContext, RunLoopError, RunStatus, RuntimePolicy,
-    SYSTEM_PROMPT, SessionContextKind, SessionContextPayload, SkillDefinition, SkillScope,
-    SqliteWorkspaceStore, StepKind, StepPayload,
+    AgentEvent, AgentEventKind, AgentEventSink, AssistantResponseItem, CodeChangeProposal,
+    InstructionDocument, InstructionScope, LlmUsage, RunCancellationHandle, RunLoop,
+    RunLoopContext, RunLoopError, RunStatus, RuntimePolicy, SYSTEM_PROMPT, SessionContextKind,
+    SessionContextPayload, SkillDefinition, SkillScope, SqliteWorkspaceStore, StepKind,
+    StepPayload, run_cancellation_pair,
 };
 use rig::OneOrMany;
 use rig::completion::{
@@ -42,7 +43,7 @@ fn run_loop_records_successful_llm_run_steps() {
     let context_items = store
         .load_session_context_items(&output.session.id)
         .expect("session context loads");
-    assert_eq!(context_items.len(), 4);
+    assert_eq!(context_items.len(), 5);
     assert_eq!(context_items[0].sequence, 1);
     assert_eq!(context_items[0].kind, SessionContextKind::SystemPrompt);
     assert_eq!(
@@ -57,6 +58,11 @@ fn run_loop_records_successful_llm_run_steps() {
     assert_eq!(context_items[2].payload.to_tool_name(), Some("lua"));
     assert_eq!(context_items[3].sequence, 4);
     assert_eq!(context_items[3].payload.to_tool_name(), Some("human_input"));
+    assert_eq!(context_items[4].sequence, 5);
+    assert_eq!(
+        context_items[4].payload.to_tool_name(),
+        Some("propose_code_change")
+    );
     assert_eq!(requests.len(), 1);
     assert!(requests[0].contains("You are Jux"));
     assert!(requests[0].contains("Explain this project"));
@@ -75,6 +81,27 @@ fn run_loop_records_successful_llm_run_steps() {
         output.steps[1].payload.to_assistant_usage(),
         Some(&LlmUsage::default())
     );
+}
+
+#[test]
+fn run_loop_cancellation_stops_and_persists_the_running_run() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let (handle, token) = run_cancellation_pair();
+    let model = TestModel::canceling(handle);
+    let run_loop = RunLoop::new(store.clone(), model);
+
+    let error = futures::executor::block_on(
+        run_loop.run_cancellable("Long-running request".to_owned(), token),
+    )
+    .expect_err("run is canceled");
+
+    assert!(matches!(error, RunLoopError::Canceled { .. }));
+    let session = store.load_active_session().expect("active session exists");
+    let runs = store
+        .load_session_runs(&session.id)
+        .expect("session runs load");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, RunStatus::Canceled);
 }
 
 #[test]
@@ -437,7 +464,7 @@ fn run_loop_uses_session_history_when_calling_llm() {
     let context_items = store
         .load_session_context_items(&store.load_active_session().expect("session loads").id)
         .expect("session context loads");
-    assert_eq!(context_items.len(), 4);
+    assert_eq!(context_items.len(), 5);
 }
 
 #[test]
@@ -543,6 +570,49 @@ fn run_loop_returns_exec_shell_syntax_errors_to_llm() {
             .is_some_and(|error| error.contains("shell syntax is not supported: >"))
     );
     assert!(requests[1].contains("shell syntax is not supported"));
+}
+
+#[test]
+fn run_loop_prepares_code_change_proposal_without_writing_files() {
+    let workspace = temp_workspace_root();
+    std::fs::write(workspace.join("README.md"), "old\n").expect("source file is written");
+    let store = SqliteWorkspaceStore::new(&workspace);
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "propose_code_change",
+            serde_json::json!({
+                "plan": {
+                    "summary": "Update README",
+                    "items": ["Replace the content"]
+                },
+                "files": [
+                    {
+                        "path": "README.md",
+                        "new_content": "new\n"
+                    }
+                ]
+            }),
+        ))]),
+        Ok(vec![AssistantContent::text("Proposal ready")]),
+    ]);
+    let run_loop = RunLoop::new(store, model);
+
+    let output = futures::executor::block_on(run_loop.run("Prepare a README change".to_owned()))
+        .expect("run succeeds");
+    let proposal = output
+        .steps
+        .iter()
+        .find_map(|step| step.payload.to_tool_result_content())
+        .and_then(|content| serde_json::from_value::<CodeChangeProposal>(content.clone()).ok())
+        .expect("code change proposal is returned");
+
+    assert_eq!(proposal.plan.summary, "Update README");
+    assert_eq!(proposal.files[0].path.as_str(), "README.md");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("README.md")).expect("source file loads"),
+        "old\n"
+    );
 }
 
 #[test]
@@ -868,7 +938,9 @@ fn run_loop_marks_run_failed_when_llm_fails() {
         .expect_err("run loop fails");
     let run = match error {
         RunLoopError::Prompt { run, .. } => *run,
-        RunLoopError::Store(_) | RunLoopError::Runtime { .. } => panic!("expected prompt error"),
+        RunLoopError::Store(_) | RunLoopError::Runtime { .. } | RunLoopError::Canceled { .. } => {
+            panic!("expected prompt error")
+        }
     };
     let steps = store.load_run_steps(&run.id).expect("steps load");
 
@@ -969,6 +1041,7 @@ impl AgentEventSink for VecAgentEventSink {
 struct TestModel {
     responses: Arc<Mutex<TestResponses>>,
     recorded_requests: Arc<Mutex<Vec<String>>>,
+    cancel_on_completion: Option<RunCancellationHandle>,
 }
 
 type TestResponses = Vec<Result<Vec<AssistantContent>, String>>;
@@ -992,6 +1065,7 @@ impl TestModel {
         Self {
             responses: Arc::new(Mutex::new(responses.into_iter().collect())),
             recorded_requests: Arc::new(Mutex::new(Vec::new())),
+            cancel_on_completion: None,
         }
     }
 
@@ -999,6 +1073,15 @@ impl TestModel {
         Self {
             responses: Arc::new(Mutex::new(vec![Err(message.into())])),
             recorded_requests: Arc::new(Mutex::new(Vec::new())),
+            cancel_on_completion: None,
+        }
+    }
+
+    fn canceling(handle: RunCancellationHandle) -> Self {
+        Self {
+            responses: Arc::new(Mutex::new(Vec::new())),
+            recorded_requests: Arc::new(Mutex::new(Vec::new())),
+            cancel_on_completion: Some(handle),
         }
     }
 
@@ -1037,6 +1120,11 @@ impl CompletionModel for TestModel {
             .lock()
             .expect("recorded requests lock is available")
             .push(request_json);
+
+        if let Some(handle) = &self.cancel_on_completion {
+            handle.cancel();
+            futures::future::pending().await
+        }
 
         let response = self
             .responses

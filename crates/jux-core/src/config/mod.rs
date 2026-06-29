@@ -151,7 +151,7 @@ pub struct ResolvedConfig {
 #[serde(default, deny_unknown_fields)]
 /// Model preference from the user config.
 pub struct ModelConfig {
-    /// Model provider identifier, for example `openai`.
+    /// Model provider identifier, for example `deepseek`.
     pub provider: String,
     /// Model name within the selected provider.
     pub name: String,
@@ -160,8 +160,8 @@ pub struct ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            provider: "openai".to_owned(),
-            name: "gpt-5".to_owned(),
+            provider: "deepseek".to_owned(),
+            name: "deepseek-chat".to_owned(),
         }
     }
 }
@@ -243,6 +243,8 @@ impl FilesystemConfig {
             .map(|workdir| {
                 if workdir.is_absolute() {
                     workdir.to_path_buf()
+                } else if workdir == Path::new(".") {
+                    workspace_root.to_path_buf()
                 } else {
                     workspace_root.join(workdir)
                 }
@@ -255,7 +257,7 @@ impl Default for FilesystemConfig {
     fn default() -> Self {
         Self {
             workdirs: vec![PathBuf::from(".")],
-            rules: vec![FilesystemRuleConfig::allow_read_write("**")],
+            rules: vec![FilesystemRuleConfig::allow_read("**")],
         }
     }
 }
@@ -283,17 +285,13 @@ pub struct FilesystemRuleConfig {
 }
 
 impl FilesystemRuleConfig {
-    fn allow_read_write(path: impl Into<String>) -> Self {
-        let permissions = vec![
-            FilesystemPermissionConfig::Read,
-            FilesystemPermissionConfig::Write,
-        ];
+    fn allow_read(path: impl Into<String>) -> Self {
         Self {
             effect: RuleEffect::Allow,
             base: FilesystemRuleBaseConfig::Workdir,
             match_kind: MatchKindConfig::Wildcard,
             path: path.into(),
-            permissions,
+            permissions: vec![FilesystemPermissionConfig::Read],
         }
     }
 
@@ -321,7 +319,7 @@ impl FilesystemRuleConfig {
 
 impl Default for FilesystemRuleConfig {
     fn default() -> Self {
-        Self::allow_read_write("**")
+        Self::allow_read("**")
     }
 }
 

@@ -302,6 +302,7 @@ fn run_command_can_activate_explicit_skill() {
             "Use explicit skill",
             "--skill",
             "review",
+            "--stream",
             "--workspace",
             workspace.path().to_str().expect("workspace path is utf-8"),
             "--deepseek-base-url",
@@ -310,6 +311,9 @@ fn run_command_can_activate_explicit_skill() {
         .env("JUX_DEEPSEEK_API_KEY", "test-api-key")
         .assert()
         .success()
+        .stdout(predicate::str::contains(
+            "run.skills output skills=[\"review\"]",
+        ))
         .stdout(predicate::str::contains("Explicit parent answer"));
 
     let requests = mock.join();

@@ -102,6 +102,7 @@ pub enum AgentEventData {
     ToolStarted {
         name: String,
         call_id: Option<String>,
+        arguments: serde_json::Value,
     },
     ToolOutput {
         name: String,

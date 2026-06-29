@@ -3,6 +3,7 @@ use crate::state::{
     StepId, StepKind, StepPayload, Workspace,
 };
 use crate::state::{RunId, SessionId, WorkspaceId};
+use crate::util::time::now_millis;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -92,6 +93,73 @@ impl SqliteWorkspaceStore {
             )
             .optional()?
             .ok_or_else(|| StoreError::MissingSession(session_id.to_string()))
+    }
+
+    pub fn load_sessions(&self) -> Result<Vec<Session>, StoreError> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(
+            "select id, name, created_at, updated_at
+             from sessions
+             order by id",
+        )?;
+        let rows = statement.query_map([], row_to_session)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn create_session(&self, name: Option<String>) -> Result<Session, StoreError> {
+        let workspace = self.init_workspace()?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prefix = format!("{}-%", workspace.id.as_str());
+        let session_count: u64 = transaction.query_row(
+            "select count(*) from sessions where id like ?1",
+            params![prefix],
+            |row| row.get(0),
+        )?;
+        let session = Session::new(SessionId::new(&workspace.id, session_count + 1), name);
+        insert_session(&transaction, &session)?;
+        transaction.commit()?;
+        Ok(session)
+    }
+
+    pub fn rename_session(
+        &self,
+        session_id: &SessionId,
+        name: Option<String>,
+    ) -> Result<Session, StoreError> {
+        let mut session = self.load_session(session_id)?;
+        session.name = name;
+        session.updated_at = now_millis();
+        let connection = self.connect()?;
+        connection.execute(
+            "update sessions set name = ?1, updated_at = ?2 where id = ?3",
+            params![
+                session.name,
+                session.updated_at.to_string(),
+                session.id.as_str(),
+            ],
+        )?;
+        Ok(session)
+    }
+
+    pub fn set_active_session(&self, session_id: &SessionId) -> Result<Workspace, StoreError> {
+        self.load_session(session_id)?;
+        let mut workspace = self.load_workspace()?;
+        workspace.active_session_id = session_id.clone();
+        workspace.updated_at = now_millis();
+        let connection = self.connect()?;
+        connection.execute(
+            "update workspaces
+             set active_session_id = ?1, updated_at = ?2
+             where id = ?3",
+            params![
+                workspace.active_session_id.as_str(),
+                workspace.updated_at.to_string(),
+                workspace.id.as_str(),
+            ],
+        )?;
+        Ok(workspace)
     }
 
     pub fn create_run(&self, request: String) -> Result<Run, StoreError> {
@@ -620,6 +688,7 @@ fn encode_run_status(status: &RunStatus) -> &'static str {
         RunStatus::WaitingForHumanInput => "waiting_for_human_input",
         RunStatus::Completed => "completed",
         RunStatus::Failed => "failed",
+        RunStatus::Canceled => "canceled",
     }
 }
 
@@ -629,6 +698,7 @@ fn decode_run_status(status: String) -> Result<RunStatus, StoreError> {
         "waiting_for_human_input" => Ok(RunStatus::WaitingForHumanInput),
         "completed" => Ok(RunStatus::Completed),
         "failed" => Ok(RunStatus::Failed),
+        "canceled" => Ok(RunStatus::Canceled),
         _ => Err(StoreError::InvalidStatus(status)),
     }
 }

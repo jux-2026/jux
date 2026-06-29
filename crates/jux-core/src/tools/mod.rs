@@ -8,12 +8,16 @@
 //!
 //! Concrete tool families live in submodules such as `lua` and `wasm`.
 
+mod code_change;
 mod human_input;
 pub(crate) mod lua;
 pub(crate) mod wasm;
 
-pub(crate) use self::human_input::HUMAN_INPUT_TOOL_NAME;
 use self::human_input::human_input_tool;
+pub use self::human_input::{
+    HUMAN_INPUT_TOOL_NAME, HumanInputKind, HumanInputOption, HumanInputRequest,
+    latest_human_input_request,
+};
 use self::lua::lua_tool;
 use self::wasm::exec_tool;
 use crate::RuntimePolicy;
@@ -59,5 +63,8 @@ fn tools() -> Vec<Box<dyn JuxTool>> {
         Box::new(exec_tool()),
         Box::new(lua_tool()),
         Box::new(human_input_tool()),
+        Box::new(ProposeCodeChangeTool),
     ]
 }
+pub use self::code_change::PROPOSE_CODE_CHANGE_TOOL_NAME;
+use self::code_change::ProposeCodeChangeTool;

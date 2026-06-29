@@ -66,6 +66,14 @@ logging:
         policy
             .wasm
             .filesystem
+            .decide_path_access("/workspace/project/src/main.rs", WasmFilesystemAccess::Read)
+            .expect("filesystem decision succeeds"),
+        WasmFilesystemDecision::Allow
+    );
+    assert_eq!(
+        policy
+            .wasm
+            .filesystem
             .decide_path_access(
                 "/workspace/project/src/main.rs",
                 WasmFilesystemAccess::ReadWrite
@@ -133,12 +141,20 @@ fn jsonc_config_supports_comments_and_default_policy() {
         policy
             .wasm
             .filesystem
+            .decide_path_access("/workspace/project/src/main.rs", WasmFilesystemAccess::Read)
+            .expect("filesystem decision succeeds"),
+        WasmFilesystemDecision::Allow
+    );
+    assert_eq!(
+        policy
+            .wasm
+            .filesystem
             .decide_path_access(
                 "/workspace/project/src/main.rs",
                 WasmFilesystemAccess::ReadWrite
             )
             .expect("filesystem decision succeeds"),
-        WasmFilesystemDecision::Allow
+        WasmFilesystemDecision::Deny
     );
     assert_eq!(
         policy

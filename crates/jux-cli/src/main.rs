@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use jux_cli::tui::run_tui;
+use jux_cli::tui::{AgentEventSender, RunResponse, TuiRuntimeInfo, TuiSandboxSummary, run_tui};
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventKind, AgentEventSink, InstructionDocument,
-    InstructionResolver, Run, RunLoop, RunLoopOutput, RunStatus, Session, SessionContextItem,
-    SessionContextPayload, SessionId, SkillCatalog, SkillDefinition, SkillResolver,
-    SqliteWorkspaceStore, Step, StepKind, StepPayload, Workspace, select_explicit_skills,
+    InstructionResolver, JuxConfig, JuxConfigLoader, Run, RunCancellationToken, RunLoop,
+    RunLoopOutput, RunStatus, RuntimePolicy, Session, SessionContextItem, SessionContextPayload,
+    SessionId, SkillCatalog, SkillDefinition, SkillResolver, SqliteWorkspaceStore, Step, StepKind,
+    StepPayload, Workspace, select_explicit_skills,
 };
 use rig::{client::CompletionClient, completion::CompletionModel, providers::deepseek};
 use serde::{Deserialize, Serialize};
@@ -149,7 +150,38 @@ fn main() -> Result<()> {
         },
         None => {
             let workspace = env::current_dir().context("failed to determine current workspace")?;
-            run_tui(workspace)
+            let skill_catalog = load_skill_catalog(&workspace)?;
+            let tui_configuration = load_tui_configuration(&workspace);
+            let run_workspace = workspace.clone();
+            let runtime_policy = tui_configuration.runtime_policy.clone();
+            let configured_model_name = tui_configuration.runtime_info.model_name.clone();
+            run_tui(
+                workspace,
+                skill_catalog,
+                tui_configuration.runtime_info,
+                move |request: jux_cli::tui::TuiRunRequest, cancellation, events| {
+                    let base_url = env::var("JUX_DEEPSEEK_BASE_URL")
+                        .unwrap_or_else(|_| DEFAULT_DEEPSEEK_BASE_URL.to_owned());
+                    let model_name = env::var("JUX_DEEPSEEK_MODEL")
+                        .unwrap_or_else(|_| configured_model_name.clone());
+                    let model = deepseek_model(base_url, model_name)
+                        .map_err(|error| format!("{error:#}"))?;
+                    let output = run_with_model(
+                        run_workspace.clone(),
+                        model,
+                        request.request,
+                        RunCommandOptions {
+                            stream: false,
+                            explicit_skills: request.explicit_skills,
+                        },
+                        Some(cancellation),
+                        Some(events),
+                        Some(runtime_policy.clone()),
+                    )
+                    .map_err(|error| format!("{error:#}"))?;
+                    Ok(RunResponse::from(output))
+                },
+            )
         }
     }
 }
@@ -202,7 +234,15 @@ fn handle_run(args: RunArgs, output_format: OutputFormat) -> Result<()> {
         LlmProviderName::Deepseek => {
             let options = RunCommandOptions::from(&args);
             let model = deepseek_model(args.deepseek_base_url, args.deepseek_model)?;
-            run_with_model(args.workspace, model, args.request, options)?
+            run_with_model(
+                args.workspace,
+                model,
+                args.request,
+                options,
+                None,
+                None,
+                None,
+            )?
         }
     };
     print_run_output(&output, output_format)?;
@@ -658,6 +698,9 @@ fn run_with_model<M>(
     model: M,
     request: String,
     options: RunCommandOptions,
+    cancellation: Option<RunCancellationToken>,
+    event_sender: Option<AgentEventSender>,
+    runtime_policy: Option<RuntimePolicy>,
 ) -> Result<jux_core::RunLoopOutput>
 where
     M: CompletionModel,
@@ -668,17 +711,49 @@ where
     let skill_catalog = load_skill_catalog(store.root())?;
     let skills = skill_catalog.skills;
     let requested_skills = select_explicit_skills(&skills, &options.explicit_skills)?;
-    let policy = jux_core::RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let policy = runtime_policy
+        .unwrap_or_else(|| RuntimePolicy::workspace_default(store.root().to_path_buf()));
     let context = jux_core::RunLoopContext::new(store, model, policy)
         .with_instructions(instructions)
         .with_skills(skills)
         .with_requested_skills(requested_skills);
     let run_loop = RunLoop::with_context(context);
-    if options.stream {
-        let mut events = StdoutAgentEventSink;
-        Ok(runtime.block_on(run_loop.run_with_events(request, &mut events))?)
-    } else {
-        Ok(runtime.block_on(run_loop.run(request))?)
+    if let Some(event_sender) = event_sender {
+        let mut events = ChannelAgentEventSink(event_sender);
+        return match cancellation {
+            Some(cancellation) => Ok(runtime.block_on(run_loop.run_with_events_cancellable(
+                request,
+                &mut events,
+                cancellation,
+            ))?),
+            None => Ok(runtime.block_on(run_loop.run_with_events(request, &mut events))?),
+        };
+    }
+    match (options.stream, cancellation) {
+        (true, Some(cancellation)) => {
+            let mut events = StdoutAgentEventSink;
+            Ok(runtime.block_on(run_loop.run_with_events_cancellable(
+                request,
+                &mut events,
+                cancellation,
+            ))?)
+        }
+        (true, None) => {
+            let mut events = StdoutAgentEventSink;
+            Ok(runtime.block_on(run_loop.run_with_events(request, &mut events))?)
+        }
+        (false, Some(cancellation)) => {
+            Ok(runtime.block_on(run_loop.run_cancellable(request, cancellation))?)
+        }
+        (false, None) => Ok(runtime.block_on(run_loop.run(request))?),
+    }
+}
+
+struct ChannelAgentEventSink(AgentEventSender);
+
+impl AgentEventSink for ChannelAgentEventSink {
+    fn emit(&mut self, event: AgentEvent) {
+        self.0.send(event);
     }
 }
 
@@ -722,6 +797,93 @@ fn load_skill_catalog(workspace_root: &std::path::Path) -> Result<SkillCatalog> 
     Ok(resolver.resolve_catalog()?)
 }
 
+struct TuiConfiguration {
+    runtime_info: TuiRuntimeInfo,
+    runtime_policy: RuntimePolicy,
+}
+
+fn load_tui_configuration(workspace_root: &std::path::Path) -> TuiConfiguration {
+    let resolved = match user_home_dir_from_env() {
+        Some(home) => JuxConfigLoader::new(home)
+            .load()
+            .and_then(|config| config.resolve(workspace_root)),
+        None => JuxConfig::default().resolve(workspace_root),
+    };
+    let (model_provider, model_name, runtime_policy, mut config_error) = match resolved {
+        Ok(config) => (
+            config.model.provider,
+            config.model.name,
+            config.runtime_policy,
+            None,
+        ),
+        Err(error) => (
+            "deepseek".to_owned(),
+            DEFAULT_DEEPSEEK_MODEL.to_owned(),
+            RuntimePolicy::workspace_default(workspace_root),
+            Some(error.to_string()),
+        ),
+    };
+    let (model_provider, model_name) = if model_provider.eq_ignore_ascii_case("deepseek") {
+        (
+            "deepseek".to_owned(),
+            env::var("JUX_DEEPSEEK_MODEL").unwrap_or(model_name),
+        )
+    } else {
+        config_error = Some(format!(
+            "unsupported TUI model provider: {model_provider}; using deepseek"
+        ));
+        (
+            "deepseek".to_owned(),
+            env::var("JUX_DEEPSEEK_MODEL").unwrap_or_else(|_| DEFAULT_DEEPSEEK_MODEL.to_owned()),
+        )
+    };
+    TuiConfiguration {
+        runtime_info: TuiRuntimeInfo {
+            workspace_id: None,
+            model_provider,
+            model_name,
+            sandbox: summarize_sandbox(&runtime_policy),
+            config_error,
+        },
+        runtime_policy,
+    }
+}
+
+fn summarize_sandbox(policy: &RuntimePolicy) -> TuiSandboxSummary {
+    let filesystem = if policy
+        .wasm
+        .filesystem
+        .rules
+        .iter()
+        .any(|rule| rule.permissions.write)
+    {
+        "custom (write enabled)"
+    } else {
+        "read-only"
+    };
+    let network = match policy.wasm.network.http_rules.len() {
+        0 => "deny by default".to_owned(),
+        count => format!("{count} HTTP rule(s)"),
+    };
+    let native_commands = if policy.native.enabled {
+        let commands = policy
+            .native
+            .allowed_commands
+            .iter()
+            .map(|rule| rule.program.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("enabled: {commands}")
+    } else {
+        "disabled".to_owned()
+    };
+    TuiSandboxSummary {
+        filesystem: filesystem.to_owned(),
+        network,
+        native_commands,
+    }
+}
+
 struct StdoutAgentEventSink;
 
 impl AgentEventSink for StdoutAgentEventSink {
@@ -760,7 +922,7 @@ fn event_message(data: &AgentEventData) -> String {
         AgentEventData::LlmStarted => "llm".to_owned(),
         AgentEventData::LlmCompleted => "llm".to_owned(),
         AgentEventData::LlmFailed { error } => format!("error={error:?}"),
-        AgentEventData::ToolStarted { name, call_id } => tool_message(name, call_id),
+        AgentEventData::ToolStarted { name, call_id, .. } => tool_message(name, call_id),
         AgentEventData::ToolOutput { name, content } => format!("tool={name:?} content={content}"),
         AgentEventData::ToolCompleted { name, call_id } => tool_message(name, call_id),
         AgentEventData::ToolFailed {

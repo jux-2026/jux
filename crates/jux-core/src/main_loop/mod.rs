@@ -9,9 +9,11 @@
 //! Lower-level modules receive narrower context traits so they can execute work
 //! without knowing about persistence, model calls, or the full agent runtime.
 
+mod cancellation;
 mod context;
 mod event;
 
+pub use self::cancellation::{RunCancellationHandle, RunCancellationToken, run_cancellation_pair};
 pub use self::context::RunLoopContext;
 pub use self::event::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AgentEventSink, NoopAgentEventSink,
@@ -23,6 +25,7 @@ use crate::state::{
 };
 use crate::state::{SqliteWorkspaceStore, StoreError};
 use crate::tools::{HUMAN_INPUT_TOOL_NAME, execute_tool, tool_definitions};
+use futures::future::Abortable;
 use rig::OneOrMany;
 use rig::completion::{
     CompletionError, CompletionModel, CompletionResponse, ToolDefinition, Usage,
@@ -73,6 +76,38 @@ where
     pub async fn run(&self, request: String) -> Result<RunLoopOutput, RunLoopError> {
         let mut events = NoopAgentEventSink;
         self.run_with_events(request, &mut events).await
+    }
+
+    pub async fn run_cancellable(
+        &self,
+        request: String,
+        cancellation: RunCancellationToken,
+    ) -> Result<RunLoopOutput, RunLoopError> {
+        let mut events = NoopAgentEventSink;
+        self.run_with_events_cancellable(request, &mut events, cancellation)
+            .await
+    }
+
+    pub async fn run_with_events_cancellable(
+        &self,
+        request: String,
+        events: &mut impl AgentEventSink,
+        cancellation: RunCancellationToken,
+    ) -> Result<RunLoopOutput, RunLoopError> {
+        match Abortable::new(
+            self.run_with_events(request, events),
+            cancellation.registration,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let run = self.cancel_latest_running_run()?;
+                Err(RunLoopError::Canceled {
+                    run: run.map(Box::new),
+                })
+            }
+        }
     }
 
     pub async fn run_with_events(
@@ -189,6 +224,31 @@ where
         Ok((run.status == RunStatus::WaitingForHumanInput).then_some(run))
     }
 
+    fn cancel_latest_running_run(&self) -> Result<Option<Run>, RunLoopError> {
+        let session = match self.context.store.load_active_session() {
+            Ok(session) => session,
+            Err(StoreError::MissingWorkspace) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(run) = self
+            .context
+            .store
+            .load_session_runs(&session.id)?
+            .into_iter()
+            .next_back()
+        else {
+            return Ok(None);
+        };
+        if run.status != RunStatus::Running {
+            return Ok(None);
+        }
+        let run = self
+            .context
+            .store
+            .update_run_status(&run.id, RunStatus::Canceled)?;
+        Ok(Some(run))
+    }
+
     fn resume_waiting_run(&self, run: Run, input: String) -> Result<ResumeTarget, RunLoopError> {
         let steps = self.context.store.load_run_steps(&run.id)?;
         let pending = latest_pending_human_input(&steps).ok_or_else(|| RunLoopError::Runtime {
@@ -290,6 +350,7 @@ where
                 self.fail_runtime(run.clone(), message, events)?;
                 unreachable!("fail_runtime always returns an error")
             }
+            Err(error @ RunLoopError::Canceled { .. }) => Err(error),
         }
     }
 
@@ -411,6 +472,7 @@ where
             AgentEventData::ToolStarted {
                 name: tool_call.name.clone(),
                 call_id: tool_call.call_id.clone(),
+                arguments: tool_call.arguments.clone(),
             },
         ));
         let content = if tool_call.name == crate::CALL_SKILL_TOOL_NAME {
@@ -889,15 +951,18 @@ where
     }
 
     fn emit_skills_selected(&self, events: &mut impl AgentEventSink) {
-        if self.context.active_skills.is_empty() {
-            return;
-        }
-        let skills = self
+        let mut skills = self
             .context
             .active_skills
             .iter()
+            .chain(&self.context.requested_skills)
             .map(|skill| skill.name.clone())
-            .collect();
+            .collect::<Vec<_>>();
+        skills.sort();
+        skills.dedup();
+        if skills.is_empty() {
+            return;
+        }
         events.emit(AgentEvent::new(
             AgentEventId::skills(),
             AgentEventKind::Output,
@@ -1014,23 +1079,6 @@ impl ToolCallRequest {
 struct SkillCallArgs {
     name: String,
     task: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HumanInputArgs {
-    #[allow(dead_code)]
-    prompt: String,
-    #[serde(default)]
-    options: Vec<HumanInputOption>,
-    #[serde(default)]
-    allow_free_text: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct HumanInputOption {
-    id: String,
-    #[allow(dead_code)]
-    label: String,
 }
 
 fn human_input_tool_call(tool_calls: &[AssistantResponseItem]) -> Option<&AssistantResponseItem> {
@@ -1198,20 +1246,7 @@ fn skill_result(invocation: &SkillInvocation, summary: String) -> serde_json::Va
 }
 
 fn validate_human_input(arguments: &serde_json::Value, input: &str) -> Result<(), String> {
-    let args = serde_json::from_value::<HumanInputArgs>(arguments.clone())
-        .map_err(|error| format!("invalid human_input tool arguments: {error}"))?;
-    if args.allow_free_text || args.options.iter().any(|option| option.id == input) {
-        return Ok(());
-    }
-    let option_ids = args
-        .options
-        .iter()
-        .map(|option| option.id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(format!(
-        "human input must match one of the option ids: {option_ids}"
-    ))
+    crate::HumanInputRequest::parse(arguments)?.validate(input)
 }
 
 fn assistant_turn_from_response(
@@ -1445,6 +1480,9 @@ pub enum RunLoopError {
         run: Box<Run>,
         message: String,
     },
+    Canceled {
+        run: Option<Box<Run>>,
+    },
 }
 
 impl Display for RunLoopError {
@@ -1453,6 +1491,7 @@ impl Display for RunLoopError {
             Self::Store(error) => write!(formatter, "run loop store error: {error}"),
             Self::Prompt { source, .. } => write!(formatter, "run loop prompt error: {source}"),
             Self::Runtime { message, .. } => write!(formatter, "run loop runtime error: {message}"),
+            Self::Canceled { .. } => formatter.write_str("run was canceled"),
         }
     }
 }
@@ -1463,6 +1502,7 @@ impl Error for RunLoopError {
             Self::Store(error) => Some(error),
             Self::Prompt { source, .. } => Some(source),
             Self::Runtime { .. } => None,
+            Self::Canceled { .. } => None,
         }
     }
 }

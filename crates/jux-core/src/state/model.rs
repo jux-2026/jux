@@ -159,6 +159,7 @@ pub enum RunStatus {
     WaitingForHumanInput,
     Completed,
     Failed,
+    Canceled,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

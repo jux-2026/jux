@@ -40,7 +40,7 @@ impl RuntimePolicy {
     pub fn workspace_default(workspace_root: impl Into<PathBuf>) -> Self {
         let workspace_root = workspace_root.into();
         let mut wasm = WasmSandboxPolicy::workspace_default();
-        wasm.filesystem = WasmFilesystemPolicy::read_write_workdir(workspace_root.clone());
+        wasm.filesystem = WasmFilesystemPolicy::read_only_workdir(workspace_root.clone());
         Self {
             workspace_root,
             wasm,

@@ -1,5 +1,6 @@
 //! Core library for the Jux agent runtime.
 
+mod code_change;
 mod config;
 mod instructions;
 mod main_loop;
@@ -9,6 +10,11 @@ mod state;
 mod tools;
 mod util;
 
+pub use code_change::{
+    CodeChangeError, CodeChangePlan, CodeChangeProposal, CodeChangeReview, PolicyDecision,
+    ProposedFileChange, ProposedFileContent, ReviewStatus, RiskLevel, RiskWarning,
+    WorkspaceRelativePath,
+};
 pub use config::{
     AgentConfig, ConfigError, FilesystemConfig, FilesystemPermissionConfig,
     FilesystemRuleBaseConfig, FilesystemRuleConfig, HttpConfig, HttpMethodConfig, HttpRuleConfig,
@@ -21,7 +27,8 @@ pub use instructions::{
 };
 pub use main_loop::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AgentEventSink, NoopAgentEventSink,
-    RunLoop, RunLoopContext, RunLoopError, RunLoopOutput, SYSTEM_PROMPT,
+    RunCancellationHandle, RunCancellationToken, RunLoop, RunLoopContext, RunLoopError,
+    RunLoopOutput, SYSTEM_PROMPT, run_cancellation_pair,
 };
 pub use policy::{
     MatchPattern, MatchPatternKind, NativeCommandPolicy, NativeCommandRule, RuntimePolicy,
@@ -46,6 +53,10 @@ pub use tools::wasm::{
     WasmNetworkCapability, WasmNetworkPermission, WasmPackageLoadingCapability, WasmPermissions,
     WasmRuntimeError, WasmStdioCapability, WasmerRuntime, WasmerRuntimeCapabilities,
     available_wasm_command_names, available_wasm_commands,
+};
+pub use tools::{
+    HUMAN_INPUT_TOOL_NAME, HumanInputKind, HumanInputOption, HumanInputRequest,
+    PROPOSE_CODE_CHANGE_TOOL_NAME, latest_human_input_request,
 };
 
 /// Returns the current workspace package version.

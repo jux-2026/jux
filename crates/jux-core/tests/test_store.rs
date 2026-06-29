@@ -4,6 +4,67 @@ use jux_core::{
 };
 
 #[test]
+fn sqlite_store_creates_and_lists_named_sessions() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let workspace = store.init_workspace().expect("workspace initializes");
+
+    let session = store
+        .create_session(Some("feature-a".to_owned()))
+        .expect("session is created");
+    let sessions = store.load_sessions().expect("sessions load");
+
+    assert_eq!(session.id.to_string(), format!("{}-0002", workspace.id));
+    assert_eq!(session.name.as_deref(), Some("feature-a"));
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].name.as_deref(), Some("default"));
+    assert_eq!(sessions[1], session);
+}
+
+#[test]
+fn sqlite_store_renames_a_session() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let session = store
+        .create_session(Some("old-name".to_owned()))
+        .expect("session is created");
+
+    let renamed = store
+        .rename_session(&session.id, Some("new-name".to_owned()))
+        .expect("session is renamed");
+
+    assert_eq!(renamed.id, session.id);
+    assert_eq!(renamed.name.as_deref(), Some("new-name"));
+    assert_eq!(
+        store
+            .load_session(&session.id)
+            .expect("session reloads")
+            .name
+            .as_deref(),
+        Some("new-name")
+    );
+}
+
+#[test]
+fn sqlite_store_switches_the_active_session() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let session = store
+        .create_session(Some("feature-a".to_owned()))
+        .expect("session is created");
+
+    let workspace = store
+        .set_active_session(&session.id)
+        .expect("active session is switched");
+
+    assert_eq!(workspace.active_session_id, session.id);
+    assert_eq!(
+        store
+            .load_active_session()
+            .expect("active session reloads")
+            .id,
+        session.id
+    );
+}
+
+#[test]
 fn sqlite_store_persists_workspace_session_run_and_ordered_steps() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
 
