@@ -4,7 +4,12 @@ use super::{
     load_active_session_history, render_app, update,
 };
 use anyhow::Result;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::Command;
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -12,10 +17,14 @@ use crossterm::terminal::{
 use jux_core::{SkillCatalog, SqliteWorkspaceStore, StoreError};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use std::fmt;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisableModifyOtherKeys;
 
 pub fn run_tui(
     workspace_root: PathBuf,
@@ -33,18 +42,38 @@ pub fn run_tui(
         Ok(()) | Err(StoreError::MissingWorkspace) => {}
         Err(error) => return Err(error.into()),
     }
-    let mut terminal = setup_terminal()?;
+    let (mut terminal, keyboard_enhancement_enabled) = setup_terminal()?;
     let run_result = run_app_loop(&mut terminal, &mut state, &store, Arc::new(run_handler));
-    restore_terminal(&mut terminal)?;
+    restore_terminal(&mut terminal, keyboard_enhancement_enabled)?;
     run_result
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    enable_raw_mode()?;
+fn setup_terminal() -> Result<(Terminal<CrosstermBackend<io::Stdout>>, bool)> {
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    enable_raw_mode()?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
+    // Enter the alternate screen before enabling enhanced keyboard reporting. Ghostty keeps
+    // keyboard mode state per screen, so entering it afterwards resets the requested flags and
+    // encodes Shift+Enter as xterm modifyOtherKeys (`ESC[27;2;13~`), which Crossterm 0.28 cannot
+    // parse. Pushing the flags here makes Ghostty emit the supported CSI-u form (`ESC[13;2u`).
+    let keyboard_enhancement_enabled = {
+        let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
+        let result = execute!(
+            stdout,
+            DisableModifyOtherKeys,
+            PushKeyboardEnhancementFlags(flags)
+        );
+        result.is_ok()
+    };
     let backend = CrosstermBackend::new(stdout);
-    Ok(Terminal::new(backend)?)
+    Ok((Terminal::new(backend)?, keyboard_enhancement_enabled))
 }
 
 fn run_app_loop(
@@ -73,7 +102,7 @@ fn run_app_loop(
         }
         if event::poll(Duration::from_millis(50))? {
             let action = match event::read()? {
-                Event::Key(key) => Some(AppAction::Key(key)),
+                Event::Key(key) if key.kind != KeyEventKind::Release => Some(AppAction::Key(key)),
                 Event::Mouse(event) => {
                     let size = terminal.size()?;
                     Some(AppAction::Mouse {
@@ -130,6 +159,25 @@ fn run_app_loop(
     Ok(())
 }
 
+impl Command for DisableModifyOtherKeys {
+    fn write_ansi(&self, formatter: &mut impl fmt::Write) -> fmt::Result {
+        formatter.write_str("\x1b[>4;0m")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "modifyOtherKeys reset is not implemented for the legacy Windows API",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        false
+    }
+}
+
 fn apply_run_result(state: &mut AppState, result: Result<RunResponse, String>) {
     match result {
         Ok(response) => {
@@ -141,10 +189,24 @@ fn apply_run_result(state: &mut AppState, result: Result<RunResponse, String>) {
     }
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+fn restore_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    keyboard_enhancement_enabled: bool,
+) -> Result<()> {
+    let keyboard_restore = if keyboard_enhancement_enabled {
+        execute!(
+            terminal.backend_mut(),
+            PopKeyboardEnhancementFlags,
+            DisableModifyOtherKeys
+        )
+    } else {
+        Ok(())
+    };
     disable_raw_mode()?;
+    keyboard_restore?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;

@@ -4,15 +4,18 @@ use super::{
 };
 use jux_core::{HumanInputKind, StepKind};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MAX_TIMELINE_DETAIL_CHARS: usize = 80;
 const CONVERSATION_BACKGROUND: Color = Color::Rgb(12, 18, 24);
 const SIDEBAR_BACKGROUND: Color = Color::Rgb(18, 24, 32);
 const DIVIDER_BACKGROUND: Color = Color::Rgb(24, 32, 42);
+const COMMAND_POPUP_BACKGROUND: Color = Color::Rgb(28, 36, 46);
+const USER_MESSAGE_BACKGROUND: Color = Color::Rgb(24, 34, 44);
 const CONVERSATION_PADDING: u16 = 1;
 const SIDEBAR_PADDING: u16 = 2;
 
@@ -22,7 +25,7 @@ pub fn render_app(frame: &mut Frame<'_>, state: &AppState) {
 
 fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: ratatui::layout::Rect) {
     if area.width < 60 {
-        frame.render_widget(prompt_panel(state), area);
+        frame.render_widget(prompt_panel(state, area.width.saturating_sub(2)), area);
         render_input_area(frame, state, area, true);
         return;
     }
@@ -35,9 +38,12 @@ fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: ratatui::layo
         area.height,
     );
     let conversation_focused = state.focused_panel() == FocusedPanel::Conversation;
-    frame.render_widget(prompt_panel(state), conversation_area);
+    frame.render_widget(
+        prompt_panel(state, conversation_area.width.saturating_sub(2)),
+        conversation_area,
+    );
     render_input_area(frame, state, conversation_area, conversation_focused);
-    render_divider(frame, divider_area);
+    render_divider(frame, divider_area, state.sidebar_visible());
     if !state.sidebar_visible() {
         return;
     }
@@ -64,12 +70,13 @@ fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: ratatui::layo
     }
 }
 
-fn render_divider(frame: &mut Frame<'_>, area: Rect) {
+fn render_divider(frame: &mut Frame<'_>, area: Rect, sidebar_visible: bool) {
     let arrow_row = area.height / 2;
     let lines = (0..area.height)
         .map(|row| {
             if row == arrow_row {
-                Line::styled("▶", Style::default().fg(Color::Cyan))
+                let arrow = if sidebar_visible { "▶" } else { "◀" };
+                Line::styled(arrow, Style::default().fg(Color::Cyan))
             } else {
                 Line::styled("│", Style::default().fg(Color::DarkGray))
             }
@@ -194,17 +201,38 @@ fn session_panel(state: &AppState) -> Paragraph<'_> {
         .wrap(Wrap { trim: true })
 }
 
-fn prompt_panel(state: &AppState) -> Paragraph<'_> {
+fn prompt_panel(state: &AppState, content_width: u16) -> Paragraph<'_> {
     let mut lines = vec![Line::from("What should Jux work on?"), Line::from("")];
     for message in state.messages() {
-        let (label, color) = match message.role {
-            MessageRole::User => ("You", Color::Cyan),
-            MessageRole::Assistant => ("Jux", Color::Cyan),
-            MessageRole::Error => ("Error", Color::Red),
-        };
-        lines.push(Line::styled(label, Style::default().fg(color)));
-        lines.extend(message.content.lines().map(Line::from));
-        lines.push(Line::from(""));
+        match message.role {
+            MessageRole::User => {
+                let background = Style::default().bg(USER_MESSAGE_BACKGROUND);
+                lines.push(full_width_line("", content_width, background));
+                lines.extend(padded_full_width_lines(
+                    "You",
+                    content_width,
+                    background.fg(Color::Cyan),
+                ));
+                lines.extend(
+                    message
+                        .content
+                        .split('\n')
+                        .flat_map(|line| padded_full_width_lines(line, content_width, background)),
+                );
+                lines.push(full_width_line("", content_width, background));
+                lines.push(Line::from(""));
+            }
+            MessageRole::Assistant | MessageRole::Error => {
+                let (label, color) = match message.role {
+                    MessageRole::Assistant => ("Jux", Color::Cyan),
+                    MessageRole::Error => ("Error", Color::Red),
+                    MessageRole::User => unreachable!(),
+                };
+                lines.push(Line::styled(label, Style::default().fg(color)));
+                lines.extend(message.content.lines().map(Line::from));
+                lines.push(Line::from(""));
+            }
+        }
     }
     for item in state.timeline() {
         let status = match item.status {
@@ -336,6 +364,43 @@ fn prompt_panel(state: &AppState) -> Paragraph<'_> {
         .wrap(Wrap { trim: false })
 }
 
+fn full_width_line(text: &str, width: u16, style: Style) -> Line<'static> {
+    let width = usize::from(width);
+    let text_width = UnicodeWidthStr::width(text);
+    let padding = if width == 0 {
+        0
+    } else if text_width == 0 {
+        width
+    } else if text_width.is_multiple_of(width) {
+        0
+    } else {
+        width - (text_width % width)
+    };
+    Line::styled(format!("{text}{}", "\u{00a0}".repeat(padding)), style)
+}
+
+fn padded_full_width_lines(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
+    let content_width = usize::from(width.saturating_sub(2));
+    if content_width == 0 {
+        return vec![full_width_line("", width, style)];
+    }
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_width = 0;
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or_default();
+        if !chunk.is_empty() && chunk_width + character_width > content_width {
+            chunks.push(full_width_line(&format!("\u{00a0}{chunk}"), width, style));
+            chunk.clear();
+            chunk_width = 0;
+        }
+        chunk.push(character);
+        chunk_width += character_width;
+    }
+    chunks.push(full_width_line(&format!("\u{00a0}{chunk}"), width, style));
+    chunks
+}
+
 fn truncate_timeline_detail(content: &str) -> String {
     if content.chars().count() <= MAX_TIMELINE_DETAIL_CHARS {
         return content.to_owned();
@@ -362,7 +427,10 @@ fn render_input_area(frame: &mut Frame<'_>, state: &AppState, panel_area: Rect, 
     if inner.is_empty() {
         return;
     }
-    let input_line_count = state.input_text().lines().count().max(1) as u16;
+    // `str::lines` drops a trailing empty line, but that line is where the cursor sits immediately
+    // after Shift+Enter. Count split segments so the bottom padding is reserved before more text is
+    // typed on the new line.
+    let input_line_count = state.input_text().split('\n').count().max(1) as u16;
     let height = input_line_count.saturating_add(2).min(inner.height);
     let area = Rect {
         x: inner.x,
@@ -370,6 +438,7 @@ fn render_input_area(frame: &mut Frame<'_>, state: &AppState, panel_area: Rect, 
         width: inner.width,
         height,
     };
+    render_slash_command_popup(frame, state, inner, area.y);
     let mut lines = Vec::new();
     if height >= 3 {
         lines.push(Line::from(""));
@@ -378,11 +447,78 @@ fn render_input_area(frame: &mut Frame<'_>, state: &AppState, panel_area: Rect, 
     if height >= 3 {
         lines.push(Line::from(""));
     }
+    let (cursor_line, cursor_column) = state.input_cursor_line_column();
+    let cursor_line = cursor_line.saturating_add(u16::from(height >= 3));
+    let vertical_scroll = cursor_line.saturating_sub(height.saturating_sub(1));
     let style = active.then(input_line_style).unwrap_or_default();
     frame.render_widget(
         Paragraph::new(lines)
             .style(style)
+            .scroll((vertical_scroll, 0))
             .wrap(Wrap { trim: false }),
+        area,
+    );
+    if active {
+        let cursor_x = area
+            .x
+            .saturating_add(3)
+            .saturating_add(cursor_column)
+            .min(area.x.saturating_add(area.width.saturating_sub(1)));
+        let cursor_y = area
+            .y
+            .saturating_add(cursor_line.saturating_sub(vertical_scroll))
+            .min(area.y.saturating_add(area.height.saturating_sub(1)));
+        frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    }
+}
+
+fn render_slash_command_popup(
+    frame: &mut Frame<'_>,
+    state: &AppState,
+    input_bounds: Rect,
+    input_top: u16,
+) {
+    let suggestions = state.slash_command_suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+    let available_height = input_top.saturating_sub(input_bounds.y);
+    let height = u16::try_from(suggestions.len())
+        .unwrap_or(available_height)
+        .saturating_add(2)
+        .min(available_height);
+    if height < 3 {
+        return;
+    }
+    let row_width = usize::from(input_bounds.width.saturating_sub(2));
+    let lines = suggestions
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| {
+            let style = if index == state.selected_slash_command() {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let content = format!("{:<10} {}", definition.name, definition.description);
+            let content = content.chars().take(row_width).collect::<String>();
+            Line::styled(format!("{content:<row_width$}"), style)
+        })
+        .collect::<Vec<_>>();
+    let area = Rect::new(
+        input_bounds.x,
+        input_top.saturating_sub(height),
+        input_bounds.width,
+        height,
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .style(Style::default().bg(COMMAND_POPUP_BACKGROUND))
+                    .padding(Padding::uniform(1)),
+            )
+            .style(Style::default().bg(COMMAND_POPUP_BACKGROUND)),
         area,
     );
 }
@@ -390,6 +526,7 @@ fn render_input_area(frame: &mut Frame<'_>, state: &AppState, panel_area: Rect, 
 fn input_lines(state: &AppState) -> Vec<Line<'_>> {
     if state.input_text().is_empty() {
         return vec![Line::from(vec![
+            Span::raw(" "),
             Span::styled("> ", Style::default().fg(Color::Cyan)),
             Span::styled(
                 "Start typing in the next step",
@@ -399,12 +536,15 @@ fn input_lines(state: &AppState) -> Vec<Line<'_>> {
     }
     state
         .input_text()
-        .lines()
-        .map(|line| {
-            Line::from(vec![
-                Span::styled("> ", Style::default().fg(Color::Cyan)),
-                Span::raw(line),
-            ])
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix = if index == 0 {
+                Span::styled(" > ", Style::default().fg(Color::Cyan))
+            } else {
+                Span::raw("   ")
+            };
+            Line::from(vec![prefix, Span::raw(line)])
         })
         .collect()
 }
@@ -476,6 +616,8 @@ fn help_panel(state: &AppState) -> Paragraph<'static> {
         Line::from("/help  Show help"),
         Line::from("/clear Clear messages"),
         Line::from("/quit  Quit Jux"),
+        Line::from("/new   Start a new session"),
+        Line::from("/version Show the Jux version"),
         Line::from("/skills Browse and select skills"),
         Line::from("/logs   Show runtime logs"),
         Line::from(""),

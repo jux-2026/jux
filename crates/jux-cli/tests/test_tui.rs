@@ -1,9 +1,11 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use jux_cli::tui::{
-    AgentEventSender, AppAction, AppCommand, AppState, BackgroundRun, FocusedPanel, RunResponse,
-    SelectionPanel, TuiRunRequest, TuiRunStatus, TuiRuntimeInfo, TuiSandboxSummary, TuiViewport,
-    execute_code_change_command, execute_session_command, load_active_session_history, render_app,
-    update,
+    AgentEventSender, AppAction, AppCommand, AppState, BackgroundRun, FocusedPanel, Message,
+    MessageRole, RunResponse, SelectionPanel, TuiRunRequest, TuiRunStatus, TuiRuntimeInfo,
+    TuiSandboxSummary, TuiViewport, execute_code_change_command, execute_session_command,
+    load_active_session_history, render_app, update,
 };
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AssistantResponseItem,
@@ -14,6 +16,7 @@ use jux_core::{
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::layout::Position;
 use ratatui::style::Color;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
@@ -53,12 +56,53 @@ fn tui_accepts_multiline_text_input() {
         &mut state,
         AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
     );
+    let newline_buffer = render_to_buffer(&state, 80, 24);
+    let newline_cursor = render_cursor_position(&state, 80, 24);
+    let (first_line_row, _) =
+        find_fragment_position(&newline_buffer, "Fix").expect("first input line is rendered");
+    assert_row_has_background(
+        &newline_buffer,
+        first_line_row.saturating_sub(1),
+        1,
+        47,
+        input_background(),
+    );
+    assert_row_has_background(
+        &newline_buffer,
+        newline_cursor.y.saturating_add(1),
+        1,
+        47,
+        input_background(),
+    );
     type_text(&mut state, "query");
 
     assert_eq!(state.input_text(), "Fix\nquery");
     let buffer = render_to_buffer(&state, 80, 24);
     assert_buffer_contains(&buffer, "Fix");
     assert_buffer_contains(&buffer, "query");
+    let (_, first_line_column) =
+        find_fragment_position(&buffer, "Fix").expect("first input line is rendered");
+    let (_, continuation_column) =
+        find_fragment_position(&buffer, "query").expect("continued input line is rendered");
+    assert_eq!(continuation_column, first_line_column);
+    assert_buffer_does_not_contain(&buffer, "> query");
+}
+
+#[test]
+fn tui_ignores_shift_enter_key_release_events() {
+    let mut state = AppState::new("/workspace");
+    type_text(&mut state, "first");
+
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+            KeyEventKind::Release,
+        )),
+    );
+
+    assert_eq!(state.input_text(), "first");
 }
 
 #[test]
@@ -130,6 +174,24 @@ fn tui_moves_the_cursor_across_lines() {
 }
 
 #[test]
+fn tui_displays_the_input_cursor_at_the_editing_position() {
+    let mut state = AppState::new("/workspace");
+    type_text(&mut state, "你");
+
+    let single_line = render_to_buffer(&state, 80, 24);
+    assert_eq!(find_fragment_position(&single_line, "> 你"), Some((21, 2)));
+    assert_eq!(render_cursor_position(&state, 80, 24), Position::new(6, 21));
+
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+    );
+    type_text(&mut state, "a");
+
+    assert_eq!(render_cursor_position(&state, 80, 24), Position::new(5, 21));
+}
+
+#[test]
 fn tui_submits_input_as_a_new_run_request() {
     let mut state = AppState::new("/workspace");
     type_text(&mut state, "Fix the failing test");
@@ -181,16 +243,72 @@ fn tui_displays_the_submitted_user_request() {
 fn tui_displays_the_agent_response() {
     let mut state = AppState::new("/workspace");
 
+    type_text(&mut state, "User request");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+
     update(
         &mut state,
         AppAction::AssistantMessage {
             content: "The workspace contains two crates.".to_owned(),
         },
     );
+    update(
+        &mut state,
+        AppAction::AssistantMessage {
+            content: "The second response is separate.".to_owned(),
+        },
+    );
 
     let buffer = render_to_buffer(&state, 80, 24);
     assert_buffer_contains(&buffer, "Jux");
     assert_buffer_contains(&buffer, "The workspace contains two crates.");
+    let (user_row, _) =
+        find_fragment_position(&buffer, "User request").expect("user message is rendered");
+    let (first_response_row, _) =
+        find_fragment_position(&buffer, "The workspace contains two crates.")
+            .expect("first assistant response is rendered");
+    let (second_response_row, _) =
+        find_fragment_position(&buffer, "The second response is separate.")
+            .expect("second assistant response is rendered");
+    assert_eq!(
+        find_fragment_position(&buffer, "User request"),
+        Some((5, 2))
+    );
+    assert_eq!(
+        buffer.cell((1, user_row)).map(|cell| cell.symbol()),
+        Some("\u{00a0}")
+    );
+    assert_eq!(
+        buffer.cell((46, user_row)).map(|cell| cell.symbol()),
+        Some("\u{00a0}")
+    );
+    for row in user_row.saturating_sub(2)..=user_row.saturating_add(1) {
+        assert_row_has_background(&buffer, row, 1, 47, user_message_background());
+    }
+    assert_row_has_background(
+        &buffer,
+        user_row.saturating_add(2),
+        1,
+        47,
+        conversation_background(),
+    );
+    assert_row_has_background(
+        &buffer,
+        first_response_row,
+        1,
+        47,
+        conversation_background(),
+    );
+    assert_row_has_background(
+        &buffer,
+        second_response_row,
+        1,
+        47,
+        conversation_background(),
+    );
 }
 
 #[test]
@@ -216,7 +334,6 @@ fn tui_scrolls_through_messages_longer_than_the_viewport() {
         &mut state,
         AppAction::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
     );
-
     let scrolled = render_to_buffer(&state, 80, 24);
     assert_buffer_contains(&scrolled, "response-8");
 }
@@ -694,8 +811,99 @@ fn tui_help_command_displays_commands_and_shortcuts() {
     let buffer = render_to_buffer(&state, 80, 24);
     assert_buffer_contains(&buffer, "/clear");
     assert_buffer_contains(&buffer, "/quit");
+    assert_buffer_contains(&buffer, "/new");
+    assert_buffer_contains(&buffer, "/version");
     assert_buffer_contains(&buffer, "PageUp");
     assert_buffer_contains(&buffer, "Shift+Enter");
+}
+
+#[test]
+fn tui_shows_filters_and_dismisses_slash_command_suggestions() {
+    let mut state = AppState::new("/workspace");
+
+    type_text(&mut state, "/");
+    let initial = render_to_buffer(&state, 80, 24);
+    assert_buffer_contains(&initial, "/new");
+    assert_buffer_contains(&initial, "Start a new session");
+    assert_buffer_contains(&initial, "/version");
+    assert_eq!(find_fragment_position(&initial, "/new"), Some((17, 2)));
+    assert_buffer_fragment_has_fg_bg(&initial, "/new", Color::Black, Color::Cyan);
+    let (selected_row, selected_start) =
+        find_fragment_position(&initial, "/new").expect("selected command is rendered");
+    let (_, divider_column) = find_fragment_position(&initial, "▶").expect("divider is rendered");
+    assert_row_has_background(
+        &initial,
+        selected_row,
+        selected_start,
+        divider_column.saturating_sub(2),
+        Color::Cyan,
+    );
+
+    type_text(&mut state, "ver");
+    let filtered = render_to_buffer(&state, 80, 24);
+    assert_buffer_does_not_contain(&filtered, "Start a new session");
+    assert_buffer_contains(&filtered, "Show the Jux version");
+
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    );
+    let dismissed = render_to_buffer(&state, 80, 24);
+    assert_buffer_does_not_contain(&dismissed, "Show the Jux version");
+    assert_eq!(state.input_text(), "/ver");
+}
+
+#[test]
+fn tui_selects_and_executes_the_version_slash_command() {
+    let mut state = AppState::new("/workspace");
+    type_text(&mut state, "/");
+
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    );
+    let selected = render_to_buffer(&state, 80, 24);
+    assert_eq!(find_fragment_position(&selected, "/version"), Some((18, 2)));
+    assert_buffer_fragment_has_fg_bg(&selected, "/version", Color::Black, Color::Cyan);
+    let command = update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+
+    assert_eq!(command, None);
+    assert_eq!(state.input_text(), "");
+    assert_eq!(
+        state.messages().last(),
+        Some(&Message {
+            role: MessageRole::Assistant,
+            content: format!("Jux {}", jux_core::version()),
+        })
+    );
+}
+
+#[test]
+fn tui_new_slash_command_creates_an_unnamed_session() {
+    let workspace = assert_fs::TempDir::new().expect("temp workspace exists");
+    let store = SqliteWorkspaceStore::new(workspace.path());
+    let original_session = store
+        .init_workspace()
+        .expect("workspace initializes")
+        .active_session_id;
+    let mut state = AppState::new(workspace.path());
+    load_active_session_history(&mut state, &store).expect("history loads");
+    type_text(&mut state, "/new");
+
+    let command = update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    )
+    .expect("create command is emitted");
+    assert_eq!(command, AppCommand::CreateSession { name: None });
+    assert!(execute_session_command(&mut state, &store, &command).expect("session is created"));
+
+    let active_session = store.load_active_session().expect("active session loads");
+    assert_ne!(active_session.id, original_session);
+    assert_eq!(active_session.name, None);
 }
 
 #[test]
@@ -1794,7 +2002,7 @@ fn tui_toggles_the_sidebar_with_the_divider_arrow() {
     assert!(!state.sidebar_visible());
     let hidden = render_to_buffer(&state, 100, 24);
     assert_buffer_does_not_contain(&hidden, "Workspace: /workspace");
-    assert_eq!(find_fragment_position(&hidden, "▶"), Some((12, 99)));
+    assert_eq!(find_fragment_position(&hidden, "◀"), Some((12, 99)));
 
     update(
         &mut state,
@@ -1906,6 +2114,17 @@ fn render_to_buffer(state: &AppState, width: u16, height: u16) -> Buffer {
         .draw(|frame| render_app(frame, state))
         .expect("app renders");
     terminal.backend().buffer().clone()
+}
+
+fn render_cursor_position(state: &AppState, width: u16, height: u16) -> Position {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal is created");
+    terminal
+        .draw(|frame| render_app(frame, state))
+        .expect("app renders");
+    terminal
+        .get_cursor_position()
+        .expect("cursor position is available")
 }
 
 fn type_text(state: &mut AppState, text: &str) {
@@ -2030,6 +2249,15 @@ fn assert_buffer_fragment_has_background(buffer: &Buffer, expected: &str, backgr
     );
 }
 
+fn assert_row_has_background(buffer: &Buffer, y: u16, start: u16, end: u16, background: Color) {
+    assert!(
+        (start..end).all(|x| buffer
+            .cell((x, y))
+            .is_some_and(|cell| cell.bg == background)),
+        "row {y} does not have the expected background from {start} to {end}"
+    );
+}
+
 fn assert_buffer_fragment_has_fg_bg(buffer: &Buffer, expected: &str, fg: Color, bg: Color) {
     let mut found = false;
     let area = *buffer.area();
@@ -2139,4 +2367,12 @@ fn conversation_background() -> Color {
 
 fn sidebar_background() -> Color {
     Color::Rgb(18, 24, 32)
+}
+
+fn user_message_background() -> Color {
+    Color::Rgb(24, 34, 44)
+}
+
+fn input_background() -> Color {
+    Color::Rgb(20, 38, 48)
 }

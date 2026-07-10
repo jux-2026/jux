@@ -1,4 +1,6 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventKind, AssistantResponseItem, CALL_SKILL_TOOL_NAME,
     CodeChangeError, CodeChangeProposal, CodeChangeReview, HumanInputRequest,
@@ -8,12 +10,44 @@ use jux_core::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
+use unicode_width::UnicodeWidthStr;
 
 use super::RunResponse;
 
 const DEFAULT_CONVERSATION_WIDTH_PERCENT: u16 = 60;
 const MIN_PANEL_WIDTH: u16 = 20;
 const DIVIDER_WIDTH: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlashCommand {
+    NewSession,
+    Version,
+}
+
+enum SlashCommandExecution {
+    NotSelected,
+    Executed(Option<AppCommand>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SlashCommandDefinition {
+    command: SlashCommand,
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+const SLASH_COMMANDS: [SlashCommandDefinition; 2] = [
+    SlashCommandDefinition {
+        command: SlashCommand::NewSession,
+        name: "/new",
+        description: "Start a new session",
+    },
+    SlashCommandDefinition {
+        command: SlashCommand::Version,
+        name: "/version",
+        description: "Show the Jux version",
+    },
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppState {
@@ -58,6 +92,8 @@ pub struct AppState {
     sidebar_visible: bool,
     divider_dragging: bool,
     conversation_width_percent: u16,
+    selected_slash_command: usize,
+    slash_commands_dismissed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -246,12 +282,30 @@ impl AppState {
             sidebar_visible: true,
             divider_dragging: false,
             conversation_width_percent: DEFAULT_CONVERSATION_WIDTH_PERCENT,
+            selected_slash_command: 0,
+            slash_commands_dismissed: false,
         }
     }
 
     #[must_use]
     pub fn input_text(&self) -> &str {
         &self.input
+    }
+
+    #[must_use]
+    pub(super) fn input_cursor_line_column(&self) -> (u16, u16) {
+        let input_before_cursor = &self.input[..self.cursor];
+        let line = input_before_cursor
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let current_line = input_before_cursor
+            .rsplit_once('\n')
+            .map_or(input_before_cursor, |(_, line)| line);
+        (
+            u16::try_from(line).unwrap_or(u16::MAX),
+            u16::try_from(UnicodeWidthStr::width(current_line)).unwrap_or(u16::MAX),
+        )
     }
 
     #[must_use]
@@ -437,6 +491,29 @@ impl AppState {
     }
 
     #[must_use]
+    pub fn selected_slash_command(&self) -> usize {
+        self.selected_slash_command
+    }
+
+    #[must_use]
+    pub(super) fn slash_command_suggestions(&self) -> Vec<SlashCommandDefinition> {
+        if self.slash_commands_dismissed {
+            return Vec::new();
+        }
+        let Some(query) = self.input.strip_prefix('/') else {
+            return Vec::new();
+        };
+        if query.chars().any(char::is_whitespace) {
+            return Vec::new();
+        }
+        SLASH_COMMANDS
+            .iter()
+            .copied()
+            .filter(|definition| definition.name.trim_start_matches('/').starts_with(query))
+            .collect()
+    }
+
+    #[must_use]
     pub(super) fn conversation_panel_width(&self, viewport_width: u16) -> u16 {
         if viewport_width < 60 {
             return viewport_width;
@@ -477,11 +554,15 @@ impl AppState {
     fn clear_input(&mut self) {
         self.input.clear();
         self.cursor = 0;
+        self.selected_slash_command = 0;
+        self.slash_commands_dismissed = false;
     }
 
     fn insert(&mut self, character: char) {
         self.input.insert(self.cursor, character);
         self.cursor += character.len_utf8();
+        self.selected_slash_command = 0;
+        self.slash_commands_dismissed = false;
     }
 
     fn move_cursor_left(&mut self) {
@@ -534,6 +615,8 @@ impl AppState {
         };
         self.input.drain(index..self.cursor);
         self.cursor = index;
+        self.selected_slash_command = 0;
+        self.slash_commands_dismissed = false;
     }
 
     fn delete_at_cursor(&mut self) {
@@ -542,6 +625,8 @@ impl AppState {
         };
         self.input
             .drain(self.cursor..self.cursor + character.len_utf8());
+        self.selected_slash_command = 0;
+        self.slash_commands_dismissed = false;
     }
 
     fn panel_text_lines(&self, panel: SelectionPanel) -> Vec<String> {
@@ -594,7 +679,7 @@ pub fn execute_session_command(
 ) -> Result<bool, StoreError> {
     match command {
         AppCommand::CreateSession { name } => {
-            let session = store.create_session(Some(name.clone()))?;
+            let session = store.create_session(name.clone())?;
             store.set_active_session(&session.id)?;
         }
         AppCommand::RenameActiveSession { name } => {
@@ -874,7 +959,7 @@ pub enum AppAction {
 pub enum AppCommand {
     StartRun { request: String },
     CancelRun,
-    CreateSession { name: String },
+    CreateSession { name: Option<String> },
     RenameActiveSession { name: String },
     SwitchSession { session_id: SessionId },
     AcceptCodeChange,
@@ -886,6 +971,10 @@ pub enum AppCommand {
 pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
     match action {
         AppAction::Mouse { event, viewport } => handle_mouse_event(state, event, viewport),
+        AppAction::Key(KeyEvent {
+            kind: KeyEventKind::Release,
+            ..
+        }) => None,
         AppAction::CodeChangeProposed { proposal } => {
             append_proposal_audit(&mut state.audit_items, &proposal);
             state.code_change_review = Some(CodeChangeReview::new(proposal));
@@ -997,6 +1086,12 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 title: "Run canceled".to_owned(),
                 detail: state.run_id.clone(),
             });
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Esc, ..
+        }) if !state.slash_command_suggestions().is_empty() => {
+            state.slash_commands_dismissed = true;
             None
         }
         AppAction::Key(KeyEvent {
@@ -1114,6 +1209,24 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::Key(KeyEvent {
+            code: KeyCode::Up, ..
+        }) if !state.slash_command_suggestions().is_empty() => {
+            let command_count = state.slash_command_suggestions().len();
+            state.selected_slash_command = state
+                .selected_slash_command
+                .checked_sub(1)
+                .unwrap_or(command_count - 1);
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Down,
+            ..
+        }) if !state.slash_command_suggestions().is_empty() => {
+            let command_count = state.slash_command_suggestions().len();
+            state.selected_slash_command = (state.selected_slash_command + 1) % command_count;
+            None
+        }
+        AppAction::Key(KeyEvent {
             code: KeyCode::Left,
             ..
         }) if state.input.is_empty() && state.code_change_review.is_some() => {
@@ -1161,6 +1274,10 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             code: KeyCode::Enter,
             ..
         }) => {
+            if let SlashCommandExecution::Executed(command) = execute_selected_slash_command(state)
+            {
+                return command;
+            }
             if state.input.trim() == "/quit" {
                 state.clear_input();
                 state.should_quit = true;
@@ -1229,7 +1346,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             {
                 let name = name.to_owned();
                 state.clear_input();
-                return Some(AppCommand::CreateSession { name });
+                return Some(AppCommand::CreateSession { name: Some(name) });
             }
             if state.run_status != TuiRunStatus::Running
                 && let Some(name) = state.input.trim().strip_prefix("/session rename ")
@@ -1341,6 +1458,36 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::Key(_) => None,
+    }
+}
+
+fn execute_selected_slash_command(state: &mut AppState) -> SlashCommandExecution {
+    let Some(definition) = state
+        .slash_command_suggestions()
+        .get(state.selected_slash_command)
+        .copied()
+    else {
+        return SlashCommandExecution::NotSelected;
+    };
+    state.clear_input();
+    match definition.command {
+        SlashCommand::NewSession if state.run_status == TuiRunStatus::Running => {
+            state.messages.push(Message {
+                role: MessageRole::Error,
+                content: "Cannot create a session while a run is active.".to_owned(),
+            });
+            SlashCommandExecution::Executed(None)
+        }
+        SlashCommand::NewSession => {
+            SlashCommandExecution::Executed(Some(AppCommand::CreateSession { name: None }))
+        }
+        SlashCommand::Version => {
+            state.messages.push(Message {
+                role: MessageRole::Assistant,
+                content: format!("Jux {}", jux_core::version()),
+            });
+            SlashCommandExecution::Executed(None)
+        }
     }
 }
 
@@ -1611,14 +1758,25 @@ fn slice_chars(line: &str, start: usize, end: usize) -> String {
 fn conversation_text_lines(state: &AppState) -> Vec<String> {
     let mut lines = vec!["What should Jux work on?".to_owned(), String::new()];
     for message in state.messages() {
-        let label = match message.role {
-            MessageRole::User => "You",
-            MessageRole::Assistant => "Jux",
-            MessageRole::Error => "Error",
-        };
-        lines.push(label.to_owned());
-        lines.extend(message.content.lines().map(str::to_owned));
-        lines.push(String::new());
+        match message.role {
+            MessageRole::User => {
+                lines.push(String::new());
+                lines.push("You".to_owned());
+                lines.extend(message.content.split('\n').map(str::to_owned));
+                lines.push(String::new());
+                lines.push(String::new());
+            }
+            MessageRole::Assistant | MessageRole::Error => {
+                let label = match message.role {
+                    MessageRole::Assistant => "Jux",
+                    MessageRole::Error => "Error",
+                    MessageRole::User => unreachable!(),
+                };
+                lines.push(label.to_owned());
+                lines.extend(message.content.lines().map(str::to_owned));
+                lines.push(String::new());
+            }
+        }
     }
     for item in state.timeline() {
         let status = match item.status {
@@ -1652,6 +1810,8 @@ fn sidebar_text_lines(state: &AppState) -> Vec<String> {
             "/help  Show help".to_owned(),
             "/clear Clear messages".to_owned(),
             "/quit  Quit Jux".to_owned(),
+            "/new   Start a new session".to_owned(),
+            "/version Show the Jux version".to_owned(),
             "/skills Browse and select skills".to_owned(),
             "/logs   Show runtime logs".to_owned(),
         ];

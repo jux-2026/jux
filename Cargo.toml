@@ -15,7 +15,7 @@ rust-version = "1.91"
 [workspace.dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.39", features = ["derive", "env"] }
-crossterm = "0.28.1"
+crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 jux-core = { path = "crates/jux-core" }
 mlua = { version = "0.11.5", features = ["lua54", "vendored"] }
 rig-core = "0.36.0"
@@ -29,6 +29,7 @@ shlex = "2.0.1"
 tokio = { version = "1.51.1", features = ["rt", "rt-multi-thread"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+unicode-width = "0.2.0"
 uuid = { version = "=1.18.1", features = ["v4"] }
 wasmer = "7.1.0"
 assert_cmd = "2.1.1"
