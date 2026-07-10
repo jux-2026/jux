@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventKind, AssistantResponseItem, CALL_SKILL_TOOL_NAME,
     CodeChangeError, CodeChangeProposal, CodeChangeReview, HumanInputRequest,
@@ -10,6 +10,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::RunResponse;
+
+const DEFAULT_CONVERSATION_WIDTH_PERCENT: u16 = 60;
+const MIN_PANEL_WIDTH: u16 = 20;
+const DIVIDER_WIDTH: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppState {
@@ -48,6 +52,12 @@ pub struct AppState {
     runtime_info: TuiRuntimeInfo,
     runtime_logs: Vec<TuiRuntimeLog>,
     log_panel_visible: bool,
+    focused_panel: FocusedPanel,
+    text_selection: Option<TextSelection>,
+    text_selection_drag: Option<TextSelection>,
+    sidebar_visible: bool,
+    divider_dragging: bool,
+    conversation_width_percent: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +161,46 @@ pub enum TimelineStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FocusedPanel {
+    Conversation,
+    Sidebar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionPanel {
+    Conversation,
+    Sidebar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextSelectionPoint {
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextSelection {
+    pub panel: SelectionPanel,
+    pub anchor: TextSelectionPoint,
+    pub focus: TextSelectionPoint,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TuiViewport {
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PanelGeometry {
+    panel: SelectionPanel,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
 impl AppState {
     #[must_use]
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
@@ -190,6 +240,12 @@ impl AppState {
             runtime_info: TuiRuntimeInfo::default(),
             runtime_logs: Vec::new(),
             log_panel_visible: false,
+            focused_panel: FocusedPanel::Conversation,
+            text_selection: None,
+            text_selection_drag: None,
+            sidebar_visible: true,
+            divider_dragging: false,
+            conversation_width_percent: DEFAULT_CONVERSATION_WIDTH_PERCENT,
         }
     }
 
@@ -366,6 +422,49 @@ impl AppState {
     }
 
     #[must_use]
+    pub fn focused_panel(&self) -> FocusedPanel {
+        self.focused_panel
+    }
+
+    #[must_use]
+    pub fn text_selection(&self) -> Option<TextSelection> {
+        self.text_selection
+    }
+
+    #[must_use]
+    pub fn sidebar_visible(&self) -> bool {
+        self.sidebar_visible
+    }
+
+    #[must_use]
+    pub(super) fn conversation_panel_width(&self, viewport_width: u16) -> u16 {
+        if viewport_width < 60 {
+            return viewport_width;
+        }
+        if !self.sidebar_visible {
+            return viewport_width.saturating_sub(DIVIDER_WIDTH);
+        }
+        let maximum = viewport_width
+            .saturating_sub(DIVIDER_WIDTH)
+            .saturating_sub(MIN_PANEL_WIDTH);
+        viewport_width
+            .saturating_mul(self.conversation_width_percent)
+            .checked_div(100)
+            .unwrap_or_default()
+            .clamp(MIN_PANEL_WIDTH, maximum)
+    }
+
+    #[must_use]
+    pub fn conversation_text_lines(&self) -> Vec<String> {
+        conversation_text_lines(self)
+    }
+
+    #[must_use]
+    pub fn sidebar_text_lines(&self) -> Vec<String> {
+        sidebar_text_lines(self)
+    }
+
+    #[must_use]
     pub fn selected_human_option(&self) -> usize {
         self.selected_human_option
     }
@@ -444,6 +543,13 @@ impl AppState {
         self.input
             .drain(self.cursor..self.cursor + character.len_utf8());
     }
+
+    fn panel_text_lines(&self, panel: SelectionPanel) -> Vec<String> {
+        match panel {
+            SelectionPanel::Conversation => self.conversation_text_lines(),
+            SelectionPanel::Sidebar => self.sidebar_text_lines(),
+        }
+    }
 }
 
 pub fn load_active_session_history(
@@ -502,10 +608,12 @@ pub fn execute_session_command(
         | AppCommand::CancelRun
         | AppCommand::AcceptCodeChange
         | AppCommand::RejectCodeChange
-        | AppCommand::RequestCodeChanges { .. } => return Ok(false),
+        | AppCommand::RequestCodeChanges { .. }
+        | AppCommand::CopyText { .. } => return Ok(false),
     }
     load_active_session_history(state, store)?;
     state.session_panel_visible = true;
+    state.sidebar_visible = true;
     Ok(true)
 }
 
@@ -742,12 +850,24 @@ fn tui_run_status(status: &RunStatus) -> TuiRunStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppAction {
     Key(KeyEvent),
-    AssistantMessage { content: String },
-    RunFinished { response: RunResponse },
-    RunFailed { error: String },
+    Mouse {
+        event: MouseEvent,
+        viewport: TuiViewport,
+    },
+    AssistantMessage {
+        content: String,
+    },
+    RunFinished {
+        response: RunResponse,
+    },
+    RunFailed {
+        error: String,
+    },
     RunCanceled,
     AgentEvent(AgentEvent),
-    CodeChangeProposed { proposal: CodeChangeProposal },
+    CodeChangeProposed {
+        proposal: CodeChangeProposal,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -760,10 +880,12 @@ pub enum AppCommand {
     AcceptCodeChange,
     RejectCodeChange,
     RequestCodeChanges { feedback: String },
+    CopyText { content: String },
 }
 
 pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
     match action {
+        AppAction::Mouse { event, viewport } => handle_mouse_event(state, event, viewport),
         AppAction::CodeChangeProposed { proposal } => {
             append_proposal_audit(&mut state.audit_items, &proposal);
             state.code_change_review = Some(CodeChangeReview::new(proposal));
@@ -881,12 +1003,14 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             code: KeyCode::Esc, ..
         }) if state.log_panel_visible => {
             state.log_panel_visible = false;
+            state.focused_panel = FocusedPanel::Conversation;
             None
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Esc, ..
         }) if state.skill_panel_visible => {
             state.skill_panel_visible = false;
+            state.focused_panel = FocusedPanel::Conversation;
             None
         }
         AppAction::Key(KeyEvent {
@@ -1019,6 +1143,21 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::Key(KeyEvent {
+            code: KeyCode::Left,
+            ..
+        }) if state.input.is_empty() => {
+            state.focused_panel = FocusedPanel::Conversation;
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Right,
+            ..
+        }) if state.input.is_empty() => {
+            state.sidebar_visible = true;
+            state.focused_panel = FocusedPanel::Sidebar;
+            None
+        }
+        AppAction::Key(KeyEvent {
             code: KeyCode::Enter,
             ..
         }) => {
@@ -1036,26 +1175,36 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             if state.input.trim() == "/help" {
                 state.clear_input();
                 state.help_visible = true;
+                state.sidebar_visible = true;
+                state.focused_panel = FocusedPanel::Sidebar;
                 return None;
             }
             if state.input.trim() == "/sessions" {
                 state.clear_input();
                 state.session_panel_visible = true;
+                state.sidebar_visible = true;
+                state.focused_panel = FocusedPanel::Sidebar;
                 return None;
             }
             if state.input.trim() == "/audit" {
                 state.clear_input();
                 state.audit_panel_visible = true;
+                state.sidebar_visible = true;
+                state.focused_panel = FocusedPanel::Sidebar;
                 return None;
             }
             if state.input.trim() == "/skills" {
                 state.clear_input();
                 state.skill_panel_visible = true;
+                state.sidebar_visible = true;
+                state.focused_panel = FocusedPanel::Sidebar;
                 return None;
             }
             if state.input.trim() == "/logs" {
                 state.clear_input();
                 state.log_panel_visible = true;
+                state.sidebar_visible = true;
+                state.focused_panel = FocusedPanel::Sidebar;
                 return None;
             }
             if state.input.trim() == "/review accept" && state.code_change_review.is_some() {
@@ -1200,6 +1349,355 @@ fn byte_at_character_column(input: &str, start: usize, end: usize, column: usize
         .char_indices()
         .nth(column)
         .map_or(end, |(index, _)| start + index)
+}
+
+fn handle_mouse_event(
+    state: &mut AppState,
+    event: MouseEvent,
+    viewport: TuiViewport,
+) -> Option<AppCommand> {
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if divider_column(state, viewport) == Some(event.column) {
+                state.text_selection = None;
+                state.text_selection_drag = None;
+                if event.row == divider_arrow_row(viewport) {
+                    state.sidebar_visible = !state.sidebar_visible;
+                    state.divider_dragging = false;
+                    if !state.sidebar_visible {
+                        state.focused_panel = FocusedPanel::Conversation;
+                    }
+                } else {
+                    state.divider_dragging = state.sidebar_visible;
+                }
+                return None;
+            }
+            state.divider_dragging = false;
+            if let Some((panel, point)) = selection_point_for_event(state, event, viewport) {
+                state.focused_panel = match panel {
+                    SelectionPanel::Conversation => FocusedPanel::Conversation,
+                    SelectionPanel::Sidebar => FocusedPanel::Sidebar,
+                };
+                state.text_selection = None;
+                state.text_selection_drag = Some(TextSelection {
+                    panel,
+                    anchor: point,
+                    focus: point,
+                });
+            } else {
+                state.text_selection = None;
+                state.text_selection_drag = None;
+            }
+            None
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if state.divider_dragging {
+                resize_panels(state, event.column, viewport);
+                return None;
+            }
+            let selection = state.text_selection_drag?;
+            let point = selection_point_for_panel(state, event, viewport, selection.panel);
+            let selection = TextSelection {
+                focus: point,
+                ..selection
+            };
+            state.text_selection_drag = Some(selection);
+            state.text_selection = Some(selection);
+            None
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if state.divider_dragging {
+                resize_panels(state, event.column, viewport);
+                state.divider_dragging = false;
+                return None;
+            }
+            let selection = state.text_selection_drag.take()?;
+            let point = selection_point_for_panel(state, event, viewport, selection.panel);
+            let selection = TextSelection {
+                focus: point,
+                ..selection
+            };
+            let content = selected_text(state, selection);
+            if content.is_empty() {
+                state.text_selection = None;
+                None
+            } else {
+                state.text_selection = Some(selection);
+                Some(AppCommand::CopyText { content })
+            }
+        }
+        _ => None,
+    }
+}
+
+fn divider_column(state: &AppState, viewport: TuiViewport) -> Option<u16> {
+    (viewport.width >= 60).then(|| state.conversation_panel_width(viewport.width))
+}
+
+fn divider_arrow_row(viewport: TuiViewport) -> u16 {
+    viewport.height / 2
+}
+
+fn resize_panels(state: &mut AppState, column: u16, viewport: TuiViewport) {
+    let maximum = viewport
+        .width
+        .saturating_sub(DIVIDER_WIDTH)
+        .saturating_sub(MIN_PANEL_WIDTH);
+    let width = column.clamp(MIN_PANEL_WIDTH, maximum);
+    state.conversation_width_percent = u16::try_from(
+        u32::from(width)
+            .saturating_mul(100)
+            .checked_div(u32::from(viewport.width))
+            .unwrap_or_default(),
+    )
+    .unwrap_or(DEFAULT_CONVERSATION_WIDTH_PERCENT);
+}
+
+fn selection_point_for_event(
+    state: &AppState,
+    event: MouseEvent,
+    viewport: TuiViewport,
+) -> Option<(SelectionPanel, TextSelectionPoint)> {
+    let geometry = panel_geometries(state, viewport)
+        .into_iter()
+        .find(|geometry| geometry.contains(event.column, event.row))?;
+    Some((
+        geometry.panel,
+        selection_point_from_geometry(state, event.column, event.row, geometry),
+    ))
+}
+
+fn selection_point_for_panel(
+    state: &AppState,
+    event: MouseEvent,
+    viewport: TuiViewport,
+    panel: SelectionPanel,
+) -> TextSelectionPoint {
+    let geometry = panel_geometries(state, viewport)
+        .into_iter()
+        .find(|geometry| geometry.panel == panel)
+        .expect("selection panel geometry exists");
+    selection_point_from_geometry(state, event.column, event.row, geometry)
+}
+
+fn selection_point_from_geometry(
+    state: &AppState,
+    column: u16,
+    row: u16,
+    geometry: PanelGeometry,
+) -> TextSelectionPoint {
+    let lines = state.panel_text_lines(geometry.panel);
+    let line_count = lines.len().max(1);
+    let clamped_row = row.clamp(
+        geometry.y,
+        geometry.y.saturating_add(geometry.height.saturating_sub(1)),
+    );
+    let clamped_column = column.clamp(
+        geometry.x,
+        geometry.x.saturating_add(geometry.width.saturating_sub(1)),
+    );
+    let mut line = usize::from(clamped_row.saturating_sub(geometry.y));
+    if geometry.panel == SelectionPanel::Conversation {
+        line = line.saturating_add(usize::from(state.message_scroll));
+    }
+    line = line.min(line_count.saturating_sub(1));
+    let column = usize::from(clamped_column.saturating_sub(geometry.x))
+        .min(lines.get(line).map_or(0, |line| line.chars().count()));
+    TextSelectionPoint { line, column }
+}
+
+fn panel_geometries(state: &AppState, viewport: TuiViewport) -> Vec<PanelGeometry> {
+    if viewport.width < 60 {
+        return vec![content_geometry(
+            SelectionPanel::Conversation,
+            0,
+            0,
+            viewport.width,
+            viewport.height,
+        )];
+    }
+    let left_width = state.conversation_panel_width(viewport.width);
+    let mut geometries = vec![content_geometry(
+        SelectionPanel::Conversation,
+        0,
+        0,
+        left_width,
+        viewport.height,
+    )];
+    if state.sidebar_visible {
+        geometries.push(content_geometry(
+            SelectionPanel::Sidebar,
+            left_width.saturating_add(DIVIDER_WIDTH),
+            0,
+            viewport
+                .width
+                .saturating_sub(left_width)
+                .saturating_sub(DIVIDER_WIDTH),
+            viewport.height,
+        ));
+    }
+    geometries
+}
+
+fn content_geometry(
+    panel: SelectionPanel,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+) -> PanelGeometry {
+    let padding = match panel {
+        SelectionPanel::Conversation => 1,
+        SelectionPanel::Sidebar => 2,
+    };
+    PanelGeometry {
+        panel,
+        x: x.saturating_add(padding),
+        y: y.saturating_add(padding),
+        width: width.saturating_sub(padding.saturating_mul(2)),
+        height: height.saturating_sub(padding.saturating_mul(2)),
+    }
+}
+
+impl PanelGeometry {
+    fn contains(self, column: u16, row: u16) -> bool {
+        column >= self.x
+            && column < self.x.saturating_add(self.width)
+            && row >= self.y
+            && row < self.y.saturating_add(self.height)
+    }
+}
+
+fn selected_text(state: &AppState, selection: TextSelection) -> String {
+    let lines = state.panel_text_lines(selection.panel);
+    let (start, end) = ordered_points(selection.anchor, selection.focus);
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if index < start.line || index > end.line {
+                return None;
+            }
+            let start_column = if index == start.line { start.column } else { 0 };
+            let end_column = if index == end.line {
+                end.column
+            } else {
+                line.chars().count()
+            };
+            Some(slice_chars(line, start_column, end_column))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn ordered_points(
+    first: TextSelectionPoint,
+    second: TextSelectionPoint,
+) -> (TextSelectionPoint, TextSelectionPoint) {
+    if (first.line, first.column) <= (second.line, second.column) {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+fn slice_chars(line: &str, start: usize, end: usize) -> String {
+    line.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
+fn conversation_text_lines(state: &AppState) -> Vec<String> {
+    let mut lines = vec!["What should Jux work on?".to_owned(), String::new()];
+    for message in state.messages() {
+        let label = match message.role {
+            MessageRole::User => "You",
+            MessageRole::Assistant => "Jux",
+            MessageRole::Error => "Error",
+        };
+        lines.push(label.to_owned());
+        lines.extend(message.content.lines().map(str::to_owned));
+        lines.push(String::new());
+    }
+    for item in state.timeline() {
+        let status = match item.status {
+            TimelineStatus::Running => "Running",
+            TimelineStatus::Output => "Output",
+            TimelineStatus::Completed => "Completed",
+            TimelineStatus::Failed => "Failed",
+        };
+        lines.push(format!("{}  {status}", item.label));
+        if let Some(detail) = &item.detail {
+            lines.push(detail.clone());
+        }
+        if let Some(output) = &item.output {
+            let summary = output.split_whitespace().collect::<Vec<_>>().join(" ");
+            lines.push(truncate_timeline_detail_text(&summary));
+        }
+    }
+    if !state.timeline().is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(String::new());
+    lines.push("No active run.".to_owned());
+    lines.push("Use the CLI subcommands for run, skills, and session inspection.".to_owned());
+    lines
+}
+
+fn sidebar_text_lines(state: &AppState) -> Vec<String> {
+    if state.help_visible() {
+        return vec![
+            "Commands".to_owned(),
+            "/help  Show help".to_owned(),
+            "/clear Clear messages".to_owned(),
+            "/quit  Quit Jux".to_owned(),
+            "/skills Browse and select skills".to_owned(),
+            "/logs   Show runtime logs".to_owned(),
+        ];
+    }
+    let status = match state.run_status() {
+        TuiRunStatus::Idle => "Idle",
+        TuiRunStatus::Running => "Running",
+        TuiRunStatus::WaitingForHumanInput => "Waiting",
+        TuiRunStatus::Completed => "Completed",
+        TuiRunStatus::Failed => "Failed",
+        TuiRunStatus::Canceled => "Canceled",
+    };
+    vec![
+        "Jux".to_owned(),
+        String::new(),
+        format!("Session: {}", state.session_id().unwrap_or("-")),
+        format!("Run: {}", state.run_id().unwrap_or("-")),
+        format!(
+            "Model: {}/{}",
+            state.runtime_info().model_provider,
+            state.runtime_info().model_name
+        ),
+        "Focus: Left/Right".to_owned(),
+        "Quit: Ctrl+C".to_owned(),
+        String::new(),
+        format!("Status: {status}"),
+        match state.run_elapsed_millis() {
+            Some(millis) => format!("Elapsed: {millis} ms"),
+            None => "Elapsed: -".to_owned(),
+        },
+        String::new(),
+        format!("Workspace: {}", state.workspace_root.display()),
+        format!(
+            "Workspace ID: {}",
+            state.runtime_info().workspace_id.as_deref().unwrap_or("-")
+        ),
+    ]
+}
+
+fn truncate_timeline_detail_text(content: &str) -> String {
+    if content.chars().count() <= 80 {
+        return content.to_owned();
+    }
+    let mut truncated = content.chars().take(80).collect::<String>();
+    truncated.push_str("… [truncated]");
+    truncated
 }
 
 fn timeline_item_from_agent_event(event: AgentEvent) -> Option<TimelineItem> {

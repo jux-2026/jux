@@ -1,49 +1,84 @@
-use super::{AppState, MessageRole, TimelineStatus, TuiCodeChangeResult, TuiRunStatus};
+use super::{
+    AppState, FocusedPanel, MessageRole, SelectionPanel, TextSelectionPoint, TimelineStatus,
+    TuiCodeChangeResult, TuiRunStatus,
+};
 use jux_core::{HumanInputKind, StepKind};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 
 const MAX_TIMELINE_DETAIL_CHARS: usize = 80;
+const CONVERSATION_BACKGROUND: Color = Color::Rgb(12, 18, 24);
+const SIDEBAR_BACKGROUND: Color = Color::Rgb(18, 24, 32);
+const DIVIDER_BACKGROUND: Color = Color::Rgb(24, 32, 42);
+const CONVERSATION_PADDING: u16 = 1;
+const SIDEBAR_PADDING: u16 = 2;
 
 pub fn render_app(frame: &mut Frame<'_>, state: &AppState) {
-    let area = frame.area();
-    let footer_height = if area.height >= 12 { 5 } else { 1 };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(footer_height)])
-        .split(area);
-
-    render_workspace(frame, state, chunks[0]);
-    frame.render_widget(status_bar(state), chunks[1]);
+    render_workspace(frame, state, frame.area());
 }
 
 fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: ratatui::layout::Rect) {
     if area.width < 60 {
         frame.render_widget(prompt_panel(state), area);
+        render_input_area(frame, state, area, true);
         return;
     }
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
-
-    frame.render_widget(prompt_panel(state), chunks[0]);
-    if state.help_visible() {
-        frame.render_widget(help_panel(), chunks[1]);
-    } else if state.log_panel_visible() {
-        frame.render_widget(log_panel(state), chunks[1]);
-    } else if state.skill_panel_visible() {
-        frame.render_widget(skill_panel(state), chunks[1]);
-    } else if state.session_panel_visible() {
-        frame.render_widget(session_panel(state), chunks[1]);
-    } else if state.audit_panel_visible() {
-        frame.render_widget(audit_panel(state), chunks[1]);
-    } else {
-        frame.render_widget(run_panel(state), chunks[1]);
+    let conversation_width = state.conversation_panel_width(area.width);
+    let conversation_area = Rect::new(area.x, area.y, conversation_width, area.height);
+    let divider_area = Rect::new(
+        area.x.saturating_add(conversation_width),
+        area.y,
+        1,
+        area.height,
+    );
+    let conversation_focused = state.focused_panel() == FocusedPanel::Conversation;
+    frame.render_widget(prompt_panel(state), conversation_area);
+    render_input_area(frame, state, conversation_area, conversation_focused);
+    render_divider(frame, divider_area);
+    if !state.sidebar_visible() {
+        return;
     }
+    let sidebar_area = Rect::new(
+        divider_area.x.saturating_add(1),
+        area.y,
+        area.width
+            .saturating_sub(conversation_width)
+            .saturating_sub(1),
+        area.height,
+    );
+    if state.help_visible() {
+        frame.render_widget(help_panel(state), sidebar_area);
+    } else if state.log_panel_visible() {
+        frame.render_widget(log_panel(state), sidebar_area);
+    } else if state.skill_panel_visible() {
+        frame.render_widget(skill_panel(state), sidebar_area);
+    } else if state.session_panel_visible() {
+        frame.render_widget(session_panel(state), sidebar_area);
+    } else if state.audit_panel_visible() {
+        frame.render_widget(audit_panel(state), sidebar_area);
+    } else {
+        frame.render_widget(run_panel(state), sidebar_area);
+    }
+}
+
+fn render_divider(frame: &mut Frame<'_>, area: Rect) {
+    let arrow_row = area.height / 2;
+    let lines = (0..area.height)
+        .map(|row| {
+            if row == arrow_row {
+                Line::styled("▶", Style::default().fg(Color::Cyan))
+            } else {
+                Line::styled("│", Style::default().fg(Color::DarkGray))
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(DIVIDER_BACKGROUND)),
+        area,
+    );
 }
 
 fn log_panel(state: &AppState) -> Paragraph<'_> {
@@ -65,8 +100,10 @@ fn log_panel(state: &AppState) -> Paragraph<'_> {
             ));
         }
     }
+    let lines = apply_text_selection(state, SelectionPanel::Sidebar, 0, lines);
     Paragraph::new(lines)
-        .block(shell_block("logs"))
+        .block(panel_block(SIDEBAR_BACKGROUND, SIDEBAR_PADDING))
+        .style(Style::default().bg(SIDEBAR_BACKGROUND))
         .wrap(Wrap { trim: true })
 }
 
@@ -108,8 +145,10 @@ fn skill_panel(state: &AppState) -> Paragraph<'_> {
             Style::default().fg(Color::DarkGray),
         ),
     ]);
+    let lines = apply_text_selection(state, SelectionPanel::Sidebar, 0, lines);
     Paragraph::new(lines)
-        .block(shell_block("skills"))
+        .block(panel_block(SIDEBAR_BACKGROUND, SIDEBAR_PADDING))
+        .style(Style::default().bg(SIDEBAR_BACKGROUND))
         .wrap(Wrap { trim: true })
 }
 
@@ -124,8 +163,10 @@ fn audit_panel(state: &AppState) -> Paragraph<'_> {
             ));
         }
     }
+    let lines = apply_text_selection(state, SelectionPanel::Sidebar, 0, lines);
     Paragraph::new(lines)
-        .block(shell_block("audit"))
+        .block(panel_block(SIDEBAR_BACKGROUND, SIDEBAR_PADDING))
+        .style(Style::default().bg(SIDEBAR_BACKGROUND))
         .wrap(Wrap { trim: true })
 }
 
@@ -146,8 +187,10 @@ fn session_panel(state: &AppState) -> Paragraph<'_> {
             }
         }
     }
+    let lines = apply_text_selection(state, SelectionPanel::Sidebar, 0, lines);
     Paragraph::new(lines)
-        .block(shell_block("sessions"))
+        .block(panel_block(SIDEBAR_BACKGROUND, SIDEBAR_PADDING))
+        .style(Style::default().bg(SIDEBAR_BACKGROUND))
         .wrap(Wrap { trim: true })
 }
 
@@ -280,31 +323,17 @@ fn prompt_panel(state: &AppState) -> Paragraph<'_> {
         }
         lines.push(Line::from(""));
     }
-    if state.input_text().is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                "Start typing in the next step",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    } else {
-        lines.extend(state.input_text().lines().map(|line| {
-            Line::from(vec![
-                Span::styled("> ", Style::default().fg(Color::Cyan)),
-                Span::raw(line),
-            ])
-        }));
-    }
     lines.extend([
         Line::from(""),
         Line::from("No active run."),
         Line::from("Use the CLI subcommands for run, skills, and session inspection."),
     ]);
+    let lines = apply_text_selection(state, SelectionPanel::Conversation, 0, lines);
     Paragraph::new(lines)
-        .block(shell_block("conversation"))
+        .block(panel_block(CONVERSATION_BACKGROUND, CONVERSATION_PADDING))
+        .style(Style::default().bg(CONVERSATION_BACKGROUND))
         .scroll((state.message_scroll(), 0))
-        .wrap(Wrap { trim: true })
+        .wrap(Wrap { trim: false })
 }
 
 fn truncate_timeline_detail(content: &str) -> String {
@@ -319,6 +348,67 @@ fn truncate_timeline_detail(content: &str) -> String {
     truncated
 }
 
+fn input_line_style() -> Style {
+    Style::default().bg(Color::Rgb(20, 38, 48))
+}
+
+fn render_input_area(frame: &mut Frame<'_>, state: &AppState, panel_area: Rect, active: bool) {
+    let inner = Rect {
+        x: panel_area.x.saturating_add(1),
+        y: panel_area.y.saturating_add(1),
+        width: panel_area.width.saturating_sub(2),
+        height: panel_area.height.saturating_sub(2),
+    };
+    if inner.is_empty() {
+        return;
+    }
+    let input_line_count = state.input_text().lines().count().max(1) as u16;
+    let height = input_line_count.saturating_add(2).min(inner.height);
+    let area = Rect {
+        x: inner.x,
+        y: inner.y + inner.height - height,
+        width: inner.width,
+        height,
+    };
+    let mut lines = Vec::new();
+    if height >= 3 {
+        lines.push(Line::from(""));
+    }
+    lines.extend(input_lines(state));
+    if height >= 3 {
+        lines.push(Line::from(""));
+    }
+    let style = active.then(input_line_style).unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(style)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn input_lines(state: &AppState) -> Vec<Line<'_>> {
+    if state.input_text().is_empty() {
+        return vec![Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "Start typing in the next step",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])];
+    }
+    state
+        .input_text()
+        .lines()
+        .map(|line| {
+            Line::from(vec![
+                Span::styled("> ", Style::default().fg(Color::Cyan)),
+                Span::raw(line),
+            ])
+        })
+        .collect()
+}
+
 fn run_panel(state: &AppState) -> Paragraph<'_> {
     let status = match state.run_status() {
         TuiRunStatus::Idle => "Idle",
@@ -331,9 +421,17 @@ fn run_panel(state: &AppState) -> Paragraph<'_> {
     let lines = vec![
         Line::from("Jux"),
         Line::from(""),
-        Line::from(format!("Status: {status}")),
         Line::from(format!("Session: {}", state.session_id().unwrap_or("-"))),
         Line::from(format!("Run: {}", state.run_id().unwrap_or("-"))),
+        Line::from(format!(
+            "Model: {}/{}",
+            state.runtime_info().model_provider,
+            state.runtime_info().model_name
+        )),
+        Line::from("Focus: Left/Right"),
+        Line::from("Quit: Ctrl+C"),
+        Line::from(""),
+        Line::from(format!("Status: {status}")),
         Line::from(match state.run_elapsed_millis() {
             Some(millis) => format!("Elapsed: {millis} ms"),
             None => "Elapsed: -".to_owned(),
@@ -343,11 +441,6 @@ fn run_panel(state: &AppState) -> Paragraph<'_> {
         Line::from(format!(
             "Workspace ID: {}",
             state.runtime_info().workspace_id.as_deref().unwrap_or("-")
-        )),
-        Line::from(format!(
-            "Model: {}/{}",
-            state.runtime_info().model_provider,
-            state.runtime_info().model_name
         )),
         Line::from(format!(
             "Filesystem: {}",
@@ -370,12 +463,14 @@ fn run_panel(state: &AppState) -> Paragraph<'_> {
             display_names(state.active_skill_names())
         )),
     ];
+    let lines = apply_text_selection(state, SelectionPanel::Sidebar, 0, lines);
     Paragraph::new(lines)
-        .block(shell_block("status"))
+        .block(panel_block(SIDEBAR_BACKGROUND, SIDEBAR_PADDING))
+        .style(Style::default().bg(SIDEBAR_BACKGROUND))
         .wrap(Wrap { trim: true })
 }
 
-fn help_panel() -> Paragraph<'static> {
+fn help_panel(state: &AppState) -> Paragraph<'static> {
     let lines = vec![
         Line::from("Commands"),
         Line::from("/help  Show help"),
@@ -389,8 +484,10 @@ fn help_panel() -> Paragraph<'static> {
         Line::from("PageUp/PageDown Scroll"),
         Line::from("Ctrl+C Quit"),
     ];
+    let lines = apply_text_selection(state, SelectionPanel::Sidebar, 0, lines);
     Paragraph::new(lines)
-        .block(shell_block("help"))
+        .block(panel_block(SIDEBAR_BACKGROUND, SIDEBAR_PADDING))
+        .style(Style::default().bg(SIDEBAR_BACKGROUND))
         .wrap(Wrap { trim: true })
 }
 
@@ -402,34 +499,85 @@ fn display_names(names: &[String]) -> String {
     }
 }
 
-fn status_bar(state: &AppState) -> Paragraph<'_> {
-    let status = match state.run_status() {
-        TuiRunStatus::Idle => "Idle",
-        TuiRunStatus::Running => "Running",
-        TuiRunStatus::WaitingForHumanInput => "Waiting",
-        TuiRunStatus::Completed => "Completed",
-        TuiRunStatus::Failed => "Failed",
-        TuiRunStatus::Canceled => "Canceled",
-    };
-    Paragraph::new(format!(
-        "Session {} | Run {} | {}/{} | {status} | Ctrl+C quit",
-        state.session_id().unwrap_or("-"),
-        state.run_id().unwrap_or("-"),
-        state.runtime_info().model_provider,
-        state.runtime_info().model_name
-    ))
-    .style(Style::default().fg(Color::DarkGray))
-    .block(shell_block("keys"))
-    .alignment(Alignment::Center)
+fn panel_block(background: Color, padding: u16) -> Block<'static> {
+    Block::default()
+        .style(Style::default().bg(background))
+        .padding(Padding::uniform(padding))
 }
 
-fn shell_block(title: &'static str) -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            format!(" {title}"),
-            Style::default().fg(Color::Gray),
-        ))
-        .padding(ratatui::widgets::Padding::uniform(1))
+fn selection_style() -> Style {
+    Style::default().fg(Color::Black).bg(Color::Yellow)
+}
+
+fn apply_text_selection<'a>(
+    state: &AppState,
+    panel: SelectionPanel,
+    line_offset: usize,
+    lines: Vec<Line<'a>>,
+) -> Vec<Line<'a>> {
+    let Some(selection) = state.text_selection() else {
+        return lines;
+    };
+    if selection.panel != panel {
+        return lines;
+    }
+    let (start, end) = ordered_points(selection.anchor, selection.focus);
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let absolute_line = index.saturating_add(line_offset);
+            if absolute_line < start.line || absolute_line > end.line {
+                return line;
+            }
+            let text = line_text(&line);
+            let start_column = if absolute_line == start.line {
+                start.column
+            } else {
+                0
+            };
+            let end_column = if absolute_line == end.line {
+                end.column
+            } else {
+                text.chars().count()
+            };
+            selected_line(&text, start_column, end_column)
+        })
+        .collect()
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+}
+
+fn selected_line(text: &str, start: usize, end: usize) -> Line<'static> {
+    let before = take_chars(text, 0, start);
+    let selected = take_chars(text, start, end);
+    let after = take_chars(text, end, text.chars().count());
+    Line::from(vec![
+        Span::raw(before),
+        Span::styled(selected, selection_style()),
+        Span::raw(after),
+    ])
+}
+
+fn take_chars(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
+fn ordered_points(
+    first: TextSelectionPoint,
+    second: TextSelectionPoint,
+) -> (TextSelectionPoint, TextSelectionPoint) {
+    if (first.line, first.column) <= (second.line, second.column) {
+        (first, second)
+    } else {
+        (second, first)
+    }
 }

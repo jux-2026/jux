@@ -1,8 +1,9 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use jux_cli::tui::{
-    AgentEventSender, AppAction, AppCommand, AppState, BackgroundRun, RunResponse, TuiRunRequest,
-    TuiRunStatus, TuiRuntimeInfo, TuiSandboxSummary, execute_code_change_command,
-    execute_session_command, load_active_session_history, render_app, update,
+    AgentEventSender, AppAction, AppCommand, AppState, BackgroundRun, FocusedPanel, RunResponse,
+    SelectionPanel, TuiRunRequest, TuiRunStatus, TuiRuntimeInfo, TuiSandboxSummary, TuiViewport,
+    execute_code_change_command, execute_session_command, load_active_session_history, render_app,
+    update,
 };
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AssistantResponseItem,
@@ -13,6 +14,7 @@ use jux_core::{
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::style::Color;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
@@ -582,6 +584,28 @@ fn tui_lists_skill_details_and_project_overrides() {
 }
 
 #[test]
+fn tui_renders_the_skill_panel_with_the_sidebar_background() {
+    let mut state = AppState::new("/workspace");
+    state.set_skill_catalog(SkillCatalog {
+        skills: vec![skill_definition(
+            "review",
+            SkillScope::Project,
+            "/workspace/.jux/skills/review",
+        )],
+        overrides: Vec::new(),
+    });
+    type_text(&mut state, "/skills");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+
+    let buffer = render_to_buffer(&state, 120, 30);
+
+    assert_buffer_fragment_has_background(&buffer, "Skills", sidebar_background());
+}
+
+#[test]
 fn tui_selects_explicit_skills_for_the_next_run() {
     let mut state = AppState::new("/workspace");
     state.set_skill_catalog(SkillCatalog {
@@ -806,6 +830,11 @@ fn tui_displays_the_pending_human_input_question() {
     assert_buffer_contains(&buffer, "Which implementation should Jux use?");
     assert_buffer_contains(&buffer, "safe  Safer implementation");
     assert_buffer_contains(&buffer, "fast  Faster implementation");
+    assert_buffer_fragment_has_background(
+        &buffer,
+        "Which implementation should Jux use?",
+        conversation_background(),
+    );
 }
 
 #[test]
@@ -1072,6 +1101,11 @@ fn tui_displays_plan_files_and_switchable_diffs() {
     assert_buffer_contains(&first, "Plan: Rename both functions");
     assert_buffer_contains(&first, "src/a.rs");
     assert_buffer_contains(&first, "src/b.rs");
+    assert_buffer_fragment_has_background(
+        &first,
+        "Plan: Rename both functions",
+        conversation_background(),
+    );
     assert_buffer_contains(&first, "Policy: Confirm");
     assert_buffer_contains(&first, "-fn old_a() {}");
     assert_buffer_contains(&first, "+fn new_a() {}");
@@ -1081,6 +1115,11 @@ fn tui_displays_plan_files_and_switchable_diffs() {
         AppAction::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
     );
     let second = render_to_buffer(&state, 120, 40);
+    assert_buffer_fragment_has_background(
+        &second,
+        "Plan: Rename both functions",
+        conversation_background(),
+    );
     assert_buffer_contains(&second, "-fn old_b() {}");
     assert_buffer_contains(&second, "+fn new_b() {}");
 }
@@ -1539,7 +1578,263 @@ fn tui_shell_renders_workspace_and_idle_status() {
     assert_buffer_contains(&buffer, "What should Jux work on?");
     assert_buffer_contains(&buffer, "Workspace: /workspace");
     assert_buffer_contains(&buffer, "Status: Idle");
-    assert_buffer_contains(&buffer, "Ctrl+C quit");
+    assert_buffer_contains(&buffer, "Quit: Ctrl+C");
+    assert_buffer_contains(&buffer, "Focus: Left/Right");
+    assert_buffer_does_not_contain(&buffer, "keys");
+    assert_buffer_does_not_contain(&buffer, "Session - | Run -");
+    assert_buffer_does_not_contain(&buffer, "conversation");
+    assert_buffer_does_not_contain(&buffer, "status");
+    assert_buffer_has_no_panel_frames(&buffer);
+    assert_buffer_fragment_has_background(
+        &buffer,
+        "What should Jux work on?",
+        conversation_background(),
+    );
+    assert_buffer_fragment_has_background(&buffer, "Workspace: /workspace", sidebar_background());
+    assert_eq!(find_fragment_position(&buffer, "Session: -"), Some((4, 51)));
+    assert_eq!(find_fragment_position(&buffer, "▶"), Some((12, 48)));
+    assert_input_block_has_background(&buffer, "> Start typing", input_active_background());
+}
+
+#[test]
+fn tui_selects_the_status_panel_with_right_arrow() {
+    let mut state = AppState::new("/workspace");
+
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+    );
+
+    assert_eq!(state.focused_panel(), FocusedPanel::Sidebar);
+    let buffer = render_to_buffer(&state, 80, 24);
+    assert_buffer_fragment_has_background(&buffer, "Workspace: /workspace", sidebar_background());
+    assert_input_block_does_not_have_background(
+        &buffer,
+        "> Start typing",
+        input_active_background(),
+    );
+}
+
+#[test]
+fn tui_returns_focus_to_the_conversation_with_left_arrow() {
+    let mut state = AppState::new("/workspace");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+    );
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+    );
+
+    assert_eq!(state.focused_panel(), FocusedPanel::Conversation);
+    let buffer = render_to_buffer(&state, 80, 24);
+    assert_buffer_fragment_has_background(
+        &buffer,
+        "What should Jux work on?",
+        conversation_background(),
+    );
+    assert_input_block_has_background(&buffer, "> Start typing", input_active_background());
+}
+
+#[test]
+fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
+    let mut state = AppState::new("/workspace");
+    let viewport = TuiViewport {
+        width: 100,
+        height: 24,
+    };
+
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            viewport,
+        },
+    );
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Drag(MouseButton::Left), 90, 1),
+            viewport,
+        },
+    );
+    let command = update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Up(MouseButton::Left), 90, 1),
+            viewport,
+        },
+    );
+
+    assert_eq!(
+        command,
+        Some(AppCommand::CopyText {
+            content: "What should Jux work on?".to_owned(),
+        })
+    );
+    assert_eq!(
+        state.text_selection().map(|selection| selection.panel),
+        Some(SelectionPanel::Conversation)
+    );
+    let buffer = render_to_buffer(&state, 100, 24);
+    assert_buffer_fragment_has_fg_bg(
+        &buffer,
+        "What should Jux work on?",
+        Color::Black,
+        Color::Yellow,
+    );
+    let completed_selection = state.text_selection();
+    let command = update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 3),
+            viewport,
+        },
+    );
+    assert_eq!(command, None);
+    assert_eq!(state.text_selection(), completed_selection);
+}
+
+#[test]
+fn tui_selects_and_copies_text_inside_the_status_panel() {
+    let mut state = AppState::new("/workspace");
+    let viewport = TuiViewport {
+        width: 100,
+        height: 24,
+    };
+
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Down(MouseButton::Left), 63, 4),
+            viewport,
+        },
+    );
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Drag(MouseButton::Left), 70, 4),
+            viewport,
+        },
+    );
+    let command = update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Up(MouseButton::Left), 70, 4),
+            viewport,
+        },
+    );
+
+    assert_eq!(
+        command,
+        Some(AppCommand::CopyText {
+            content: "Session".to_owned(),
+        })
+    );
+    assert_eq!(
+        state.text_selection().map(|selection| selection.panel),
+        Some(SelectionPanel::Sidebar)
+    );
+    let buffer = render_to_buffer(&state, 100, 24);
+    assert_buffer_fragment_has_fg_bg(&buffer, "Session", Color::Black, Color::Yellow);
+}
+
+#[test]
+fn tui_drags_the_divider_to_resize_both_panels() {
+    let mut state = AppState::new("/workspace");
+    let viewport = TuiViewport {
+        width: 100,
+        height: 24,
+    };
+
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Down(MouseButton::Left), 60, 2),
+            viewport,
+        },
+    );
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Drag(MouseButton::Left), 70, 2),
+            viewport,
+        },
+    );
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Up(MouseButton::Left), 70, 2),
+            viewport,
+        },
+    );
+
+    let buffer = render_to_buffer(&state, 100, 24);
+    assert_eq!(find_fragment_position(&buffer, "▶"), Some((12, 70)));
+    assert_eq!(find_fragment_position(&buffer, "Session: -"), Some((4, 73)));
+}
+
+#[test]
+fn tui_toggles_the_sidebar_with_the_divider_arrow() {
+    let mut state = AppState::new("/workspace");
+    let viewport = TuiViewport {
+        width: 100,
+        height: 24,
+    };
+
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Down(MouseButton::Left), 60, 12),
+            viewport,
+        },
+    );
+
+    assert!(!state.sidebar_visible());
+    let hidden = render_to_buffer(&state, 100, 24);
+    assert_buffer_does_not_contain(&hidden, "Workspace: /workspace");
+    assert_eq!(find_fragment_position(&hidden, "▶"), Some((12, 99)));
+
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Down(MouseButton::Left), 99, 12),
+            viewport,
+        },
+    );
+
+    assert!(state.sidebar_visible());
+    let visible = render_to_buffer(&state, 100, 24);
+    assert_buffer_contains(&visible, "Workspace: /workspace");
+    assert_eq!(find_fragment_position(&visible, "▶"), Some((12, 60)));
+}
+
+#[test]
+fn tui_click_focus_does_not_start_text_selection() {
+    let mut state = AppState::new("/workspace");
+    let viewport = TuiViewport {
+        width: 100,
+        height: 24,
+    };
+
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            viewport,
+        },
+    );
+    let command = update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::Up(MouseButton::Left), 1, 1),
+            viewport,
+        },
+    );
+
+    assert_eq!(command, None);
+    assert_eq!(state.text_selection(), None);
 }
 
 #[test]
@@ -1564,7 +1859,10 @@ fn tui_displays_workspace_model_sandbox_and_summary_status() {
     assert_buffer_contains(&buffer, "Filesystem: read-only");
     assert_buffer_contains(&buffer, "Network: deny by default");
     assert_buffer_contains(&buffer, "Native commands: disabled");
-    assert_buffer_contains(&buffer, "Session - | Run - | deepseek/deepseek-chat | Idle");
+    assert_buffer_contains(&buffer, "Session: -");
+    assert_buffer_contains(&buffer, "Run: -");
+    assert_buffer_contains(&buffer, "Status: Idle");
+    assert_buffer_does_not_contain(&buffer, "Session - | Run -");
 }
 
 #[test]
@@ -1616,6 +1914,15 @@ fn type_text(state: &mut AppState, text: &str) {
             state,
             AppAction::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
         );
+    }
+}
+
+fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
     }
 }
 
@@ -1700,4 +2007,136 @@ fn assert_buffer_does_not_contain(buffer: &Buffer, unexpected: &str) {
         !content.contains(unexpected),
         "buffer unexpectedly contains {unexpected:?}:\n{content}"
     );
+}
+
+fn assert_buffer_has_no_panel_frames(buffer: &Buffer) {
+    let area = *buffer.area();
+    let has_border = (area.y..area.y + area.height)
+        .flat_map(|y| (area.x..area.x + area.width).map(move |x| (x, y)))
+        .filter_map(|position| buffer.cell(position))
+        .any(|cell| matches!(cell.symbol(), "─" | "┌" | "┐" | "└" | "┘"));
+    assert!(!has_border, "buffer unexpectedly contains panel frames");
+}
+
+fn assert_buffer_fragment_has_background(buffer: &Buffer, expected: &str, background: Color) {
+    let (y, x) = find_fragment_position(buffer, expected)
+        .unwrap_or_else(|| panic!("buffer does not contain fragment {expected:?}"));
+    let end = x + expected.chars().count() as u16;
+    assert!(
+        (x..end).all(|column| buffer
+            .cell((column, y))
+            .is_some_and(|cell| cell.bg == background)),
+        "fragment {expected:?} does not have expected background"
+    );
+}
+
+fn assert_buffer_fragment_has_fg_bg(buffer: &Buffer, expected: &str, fg: Color, bg: Color) {
+    let mut found = false;
+    let area = *buffer.area();
+    for y in area.y..area.y + area.height {
+        let row_cells = (area.x..area.x + area.width)
+            .filter_map(|x| buffer.cell((x, y)))
+            .collect::<Vec<_>>();
+        let row = row_cells
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let Some(start_byte) = row.find(expected) else {
+            continue;
+        };
+        found = true;
+        let start = row[..start_byte].chars().count();
+        let end = start + expected.chars().count();
+        if row_cells[start..end]
+            .iter()
+            .all(|cell| cell.fg == fg && cell.bg == bg)
+        {
+            return;
+        }
+    }
+    assert!(found, "buffer does not contain fragment {expected:?}");
+    panic!("buffer does not contain styled fragment {expected:?}");
+}
+
+fn assert_input_block_has_background(buffer: &Buffer, expected: &str, background: Color) {
+    let (y, x) = find_fragment_position(buffer, expected)
+        .unwrap_or_else(|| panic!("buffer does not contain fragment {expected:?}"));
+    for row_y in y.saturating_sub(1)..=y.saturating_add(1) {
+        assert_input_row_has_background(buffer, row_y, x, background);
+    }
+}
+
+fn assert_input_block_does_not_have_background(buffer: &Buffer, expected: &str, background: Color) {
+    let (y, x) = find_fragment_position(buffer, expected)
+        .unwrap_or_else(|| panic!("buffer does not contain fragment {expected:?}"));
+    for row_y in y.saturating_sub(1)..=y.saturating_add(1) {
+        assert_input_row_does_not_have_background(buffer, row_y, x, background);
+    }
+}
+
+fn find_fragment_position(buffer: &Buffer, expected: &str) -> Option<(u16, u16)> {
+    let area = *buffer.area();
+    for y in area.y..area.y + area.height {
+        let row_cells = (area.x..area.x + area.width)
+            .filter_map(|x| buffer.cell((x, y)))
+            .collect::<Vec<_>>();
+        let row = row_cells
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        if let Some(x) = row.find(expected) {
+            return Some((y, area.x + row[..x].chars().count() as u16));
+        }
+    }
+    None
+}
+
+fn assert_input_row_has_background(buffer: &Buffer, y: u16, x: u16, background: Color) {
+    let row_cells = input_row_cells(buffer, y, x);
+    assert!(
+        row_cells.iter().all(|cell| cell.bg == background),
+        "row {y} does not have expected input background"
+    );
+}
+
+fn assert_input_row_does_not_have_background(buffer: &Buffer, y: u16, x: u16, background: Color) {
+    let row_cells = input_row_cells(buffer, y, x);
+    assert!(
+        row_cells.iter().all(|cell| cell.bg != background),
+        "row {y} unexpectedly has active input background"
+    );
+}
+
+fn input_row_cells(buffer: &Buffer, y: u16, x: u16) -> Vec<&ratatui::buffer::Cell> {
+    let area = *buffer.area();
+    let panel_width = if area.width < 60 {
+        area.width
+    } else {
+        area.width.saturating_mul(60) / 100
+    };
+    let panel_start = if x < area.x.saturating_add(panel_width) {
+        area.x
+    } else {
+        area.x.saturating_add(panel_width)
+    };
+    let panel_end = if panel_start == area.x {
+        area.x.saturating_add(panel_width)
+    } else {
+        area.x.saturating_add(area.width)
+    };
+    (panel_start.saturating_add(1)..panel_end.saturating_sub(1))
+        .filter_map(|column| buffer.cell((column, y)))
+        .collect()
+}
+
+fn input_active_background() -> Color {
+    Color::Rgb(20, 38, 48)
+}
+
+fn conversation_background() -> Color {
+    Color::Rgb(12, 18, 24)
+}
+
+fn sidebar_background() -> Color {
+    Color::Rgb(18, 24, 32)
 }
