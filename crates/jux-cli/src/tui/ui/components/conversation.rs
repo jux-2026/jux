@@ -2,17 +2,14 @@ use super::super::layout::ConversationLayout;
 use super::super::text::{
     apply_text_selection, full_width_line, padded_full_width_lines, truncate_timeline_detail,
 };
-use super::super::theme::{
-    COMMAND_POPUP_BACKGROUND, CONVERSATION_BACKGROUND, CONVERSATION_PADDING, STATUS_BAR_BACKGROUND,
-    USER_MESSAGE_BACKGROUND, input_inactive_style, input_line_style, panel_block,
-};
+use super::super::theme::{CONVERSATION_PADDING, palette, panel_block};
 use crate::tui::{
     AppState, MessageRole, SelectionPanel, TimelineStatus, TuiCodeChangeResult, TuiRunStatus,
 };
 use jux_core::HumanInputKind;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -50,7 +47,7 @@ pub(in crate::tui::ui) fn render_conversation_panel(
     frame.render_widget(paragraph, layout.history);
     render_input_area(frame, state, layout, active);
     render_status_bar(frame, state, layout.status);
-    render_conversation_scrollbar(frame, layout.scrollbar, scroll);
+    render_conversation_scrollbar(frame, state, layout.scrollbar, scroll);
 }
 
 fn prompt_panel(
@@ -59,13 +56,15 @@ fn prompt_panel(
     visible_rows: u16,
 ) -> (Paragraph<'_>, ConversationScroll) {
     let mut lines = Vec::new();
-    for message in state.messages() {
+    let colors = palette(state.theme());
+    for (message_index, message) in state.messages().iter().enumerate() {
+        let selected = state.selected_message() == Some(message_index);
         match message.role {
             MessageRole::User => {
-                let background = Style::default().bg(USER_MESSAGE_BACKGROUND);
+                let background = Style::default().bg(colors.user_message);
                 lines.push(full_width_line("", content_width, background));
                 lines.extend(padded_full_width_lines(
-                    "You",
+                    if selected { "▶ You" } else { "You" },
                     content_width,
                     background.fg(Color::Cyan),
                 ));
@@ -84,8 +83,13 @@ fn prompt_panel(
                     MessageRole::Error => ("Error", Color::Red),
                     MessageRole::User => unreachable!(),
                 };
+                let label = if selected {
+                    format!("▶ {label}")
+                } else {
+                    label.to_owned()
+                };
                 lines.push(Line::styled(label, Style::default().fg(color)));
-                lines.extend(message.content.lines().map(Line::from));
+                lines.extend(markdown_lines(&message.content));
                 lines.push(Line::from(""));
             }
         }
@@ -118,6 +122,13 @@ fn prompt_panel(
         }
     }
     if !state.timeline().is_empty() {
+        lines.push(Line::from(""));
+    }
+    if state.run_status() == TuiRunStatus::Running {
+        lines.push(Line::styled(
+            "Generating ▌",
+            Style::default().fg(Color::Cyan),
+        ));
         lines.push(Line::from(""));
     }
     if let Some(request) = state.pending_human_input() {
@@ -196,8 +207,8 @@ fn prompt_panel(
     }
     let lines = apply_text_selection(state, SelectionPanel::Conversation, 0, lines);
     let paragraph = Paragraph::new(lines)
-        .block(panel_block(CONVERSATION_BACKGROUND, CONVERSATION_PADDING))
-        .style(Style::default().bg(CONVERSATION_BACKGROUND))
+        .block(panel_block(colors.conversation, CONVERSATION_PADDING))
+        .style(Style::default().bg(colors.conversation))
         .wrap(Wrap { trim: false });
     // `line_count` receives the full Paragraph area width and accounts for the
     // block's inner padding itself.
@@ -216,21 +227,104 @@ fn prompt_panel(
     )
 }
 
-fn render_conversation_scrollbar(frame: &mut Frame<'_>, area: Rect, scroll: ConversationScroll) {
+fn markdown_lines(content: &str) -> Vec<Line<'static>> {
+    const CODE_BACKGROUND: Color = Color::Rgb(24, 28, 34);
+    let mut rendered = Vec::new();
+    let mut code_language: Option<String> = None;
+    for raw_line in content.lines() {
+        if let Some(language) = raw_line.strip_prefix("```") {
+            if code_language.is_some() {
+                code_language = None;
+            } else {
+                let language = if language.trim().is_empty() {
+                    "code"
+                } else {
+                    language.trim()
+                };
+                rendered.push(Line::styled(
+                    format!(" {language} "),
+                    Style::default().fg(Color::DarkGray).bg(CODE_BACKGROUND),
+                ));
+                code_language = Some(language.to_owned());
+            }
+            continue;
+        }
+        if code_language.is_some() {
+            rendered.push(Line::styled(
+                format!(" {raw_line}"),
+                Style::default().fg(Color::White).bg(CODE_BACKGROUND),
+            ));
+            continue;
+        }
+        if let Some(heading) = raw_line.strip_prefix("### ") {
+            rendered.push(Line::styled(
+                heading.to_owned(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some(heading) = raw_line
+            .strip_prefix("## ")
+            .or_else(|| raw_line.strip_prefix("# "))
+        {
+            rendered.push(Line::styled(
+                heading.to_owned(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some(quote) = raw_line.strip_prefix("> ") {
+            rendered.push(Line::styled(
+                format!("│ {quote}"),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        } else if let Some(item) = raw_line
+            .strip_prefix("- ")
+            .or_else(|| raw_line.strip_prefix("* "))
+        {
+            rendered.push(Line::from(format!("• {item}")));
+        } else if raw_line.starts_with('|') && raw_line.ends_with('|') {
+            let cells = raw_line
+                .trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect::<Vec<_>>();
+            if cells.iter().all(|cell| {
+                cell.chars()
+                    .all(|character| character == '-' || character == ':')
+            }) {
+                rendered.push(Line::from(
+                    cells.iter().map(|_| "───").collect::<Vec<_>>().join("┼"),
+                ));
+            } else {
+                rendered.push(Line::from(cells.join(" │ ")));
+            }
+        } else {
+            rendered.push(Line::from(raw_line.to_owned()));
+        }
+    }
+    rendered
+}
+
+fn render_conversation_scrollbar(
+    frame: &mut Frame<'_>,
+    state: &AppState,
+    area: Rect,
+    scroll: ConversationScroll,
+) {
     if area.is_empty() {
         return;
     }
+    let background = palette(state.theme()).conversation;
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(None)
         .end_symbol(None)
         .track_symbol(Some("│"))
-        .track_style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .bg(CONVERSATION_BACKGROUND),
-        )
+        .track_style(Style::default().fg(Color::DarkGray).bg(background))
         .thumb_symbol("█")
-        .thumb_style(Style::default().fg(Color::Gray).bg(CONVERSATION_BACKGROUND));
+        .thumb_style(Style::default().fg(Color::Gray).bg(background));
     // Ratatui 0.29 models `content_length` as the range of possible positions,
     // then adds `viewport_content_length` when calculating the thumb. Our
     // position is a viewport offset, so its range is `0..=maximum`, not the
@@ -260,6 +354,7 @@ fn render_input_area(
         area.y.saturating_sub(layout.history.y.saturating_add(1)),
     );
     render_slash_command_popup(frame, state, popup_bounds, area.y);
+    render_inline_skill_popup(frame, state, popup_bounds, area.y);
     let mut lines = Vec::new();
     if height >= 3 {
         lines.push(Line::from(""));
@@ -271,10 +366,11 @@ fn render_input_area(
     let (cursor_line, cursor_column) = state.input_cursor_line_column();
     let cursor_line = cursor_line.saturating_add(u16::from(height >= 3));
     let vertical_scroll = cursor_line.saturating_sub(height.saturating_sub(1));
+    let colors = palette(state.theme());
     let style = if active {
-        input_line_style()
+        Style::default().bg(colors.input)
     } else {
-        input_inactive_style()
+        Style::default().bg(colors.input_inactive)
     };
     frame.render_widget(
         Paragraph::new(lines)
@@ -297,6 +393,56 @@ fn render_input_area(
     }
 }
 
+fn render_inline_skill_popup(
+    frame: &mut Frame<'_>,
+    state: &AppState,
+    input_bounds: Rect,
+    input_top: u16,
+) {
+    let suggestions = state.inline_skill_suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+    let available_height = input_top.saturating_sub(input_bounds.y);
+    let height = u16::try_from(suggestions.len())
+        .unwrap_or(available_height)
+        .saturating_add(2)
+        .min(available_height);
+    if height < 3 {
+        return;
+    }
+    let row_width = usize::from(input_bounds.width.saturating_sub(2));
+    let lines = suggestions
+        .iter()
+        .enumerate()
+        .map(|(index, skill)| {
+            let style = if index == state.selected_inline_skill() {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let content = format!("${:<20} {}", skill.name, skill.description);
+            Line::styled(content.chars().take(row_width).collect::<String>(), style)
+        })
+        .collect::<Vec<_>>();
+    let area = Rect::new(
+        input_bounds.x,
+        input_top.saturating_sub(height),
+        input_bounds.width,
+        height,
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .style(Style::default().bg(palette(state.theme()).popup))
+                    .padding(Padding::uniform(1)),
+            )
+            .style(Style::default().bg(palette(state.theme()).popup)),
+        area,
+    );
+}
+
 fn render_status_bar(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     if area.is_empty() {
         return;
@@ -304,6 +450,7 @@ fn render_status_bar(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     let text = state
         .notification()
         .or_else(|| state.escape_confirmation_hint())
+        .or(state.conversation_search())
         .unwrap_or_else(|| {
             if state.run_status() == TuiRunStatus::Running {
                 "Shift+Enter newline | Esc twice to interrupt | Ctrl+C quit"
@@ -311,7 +458,11 @@ fn render_status_bar(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
                 "Shift+Enter newline | Esc twice to clear | Ctrl+C quit"
             }
         });
-    let style = Style::default().fg(Color::Gray).bg(STATUS_BAR_BACKGROUND);
+    let text = text.replace("Ctrl+C", state.quit_shortcut_label());
+    let text = format!("{text} | {}", state.scroll_position_label());
+    let style = Style::default()
+        .fg(Color::Gray)
+        .bg(palette(state.theme()).status);
     let aligned_text = format!("   {text}");
     frame.render_widget(
         Paragraph::new(full_width_line(&aligned_text, area.width, style)).style(style),
@@ -370,10 +521,10 @@ fn render_slash_command_popup(
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .style(Style::default().bg(COMMAND_POPUP_BACKGROUND))
+                    .style(Style::default().bg(palette(state.theme()).popup))
                     .padding(Padding::uniform(1)),
             )
-            .style(Style::default().bg(COMMAND_POPUP_BACKGROUND)),
+            .style(Style::default().bg(palette(state.theme()).popup)),
         area,
     );
 }

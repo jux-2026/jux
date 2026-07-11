@@ -16,10 +16,11 @@ pub use code_change::{
     WorkspaceRelativePath,
 };
 pub use config::{
-    AgentConfig, ConfigError, FilesystemConfig, FilesystemPermissionConfig,
+    AgentConfig, ConfigError, CopyMessageShortcut, FilesystemConfig, FilesystemPermissionConfig,
     FilesystemRuleBaseConfig, FilesystemRuleConfig, HttpConfig, HttpMethodConfig, HttpRuleConfig,
     JuxConfig, JuxConfigLoader, LoggingConfig, LoggingLevelConfig, MatchKindConfig, ModelConfig,
-    NativeConfig, NetworkConfig, ResolvedConfig, RuleEffect, SandboxConfig,
+    NativeConfig, NetworkConfig, QuitShortcut, ResolvedConfig, RuleEffect, SandboxConfig,
+    TuiConfig, TuiShortcutConfig, TuiTheme,
 };
 pub use instructions::{
     InstructionDocument, InstructionError, InstructionResolver, InstructionScope,

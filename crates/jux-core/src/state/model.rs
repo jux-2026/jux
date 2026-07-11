@@ -42,6 +42,8 @@ pub struct Session {
     pub name: Option<String>,
     #[serde(default)]
     pub liked: bool,
+    #[serde(default)]
+    pub archived: bool,
     pub created_at: u128,
     pub updated_at: u128,
 }
@@ -55,6 +57,7 @@ impl Session {
             id,
             name,
             liked: false,
+            archived: false,
             created_at: now,
             updated_at: now,
         }

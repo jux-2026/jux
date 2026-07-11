@@ -297,6 +297,32 @@ trait SessionContextPayloadTestExt {
     fn to_tool_name(&self) -> Option<&str>;
 }
 
+#[test]
+fn sqlite_store_archives_a_session_without_deleting_history() {
+    let root = temp_workspace_root();
+    let store = SqliteWorkspaceStore::new(&root);
+    store.init_workspace().expect("workspace initializes");
+    let session = store
+        .create_session(Some("archived work".to_owned()))
+        .expect("session is created");
+    store
+        .set_active_session(&session.id)
+        .expect("session becomes active");
+    let run = store
+        .create_run("keep this request".to_owned())
+        .expect("run is created");
+
+    let archived = store
+        .set_session_archived(&session.id, true)
+        .expect("session is archived");
+
+    assert!(archived.archived);
+    assert_eq!(
+        store.load_session_runs(&session.id).expect("history loads"),
+        vec![run]
+    );
+}
+
 impl SessionContextPayloadTestExt for SessionContextPayload {
     fn to_system_prompt(&self) -> Option<&str> {
         match self {

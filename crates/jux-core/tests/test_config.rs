@@ -1,6 +1,7 @@
 use jux_core::{
-    JuxConfig, JuxConfigLoader, NativeCommandPolicy, NativeCommandRule, RuntimePolicy,
-    WasmFilesystemAccess, WasmFilesystemDecision, WasmHttpDecision, WasmHttpMethod,
+    CopyMessageShortcut, JuxConfig, JuxConfigLoader, NativeCommandPolicy, NativeCommandRule,
+    QuitShortcut, RuntimePolicy, TuiTheme, WasmFilesystemAccess, WasmFilesystemDecision,
+    WasmHttpDecision, WasmHttpMethod,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -219,6 +220,30 @@ fn loader_rejects_null_values() {
 
     assert!(error.to_string().contains("null values are not supported"));
     fs::remove_dir_all(home).expect("temporary directory is removed");
+}
+
+#[test]
+fn tui_preferences_are_strongly_typed_and_resolved() {
+    let config = JuxConfig::from_yaml_str(
+        r#"
+tui:
+  theme: high_contrast
+  scroll_lines: 9
+  shortcuts:
+    quit: ctrl_q
+    copy_message: ctrl_shift_c
+"#,
+    )
+    .expect("TUI config parses");
+    let resolved = config.resolve("/workspace").expect("config resolves");
+
+    assert_eq!(resolved.tui.theme, TuiTheme::HighContrast);
+    assert_eq!(resolved.tui.scroll_lines, 9);
+    assert_eq!(resolved.tui.shortcuts.quit, QuitShortcut::CtrlQ);
+    assert_eq!(
+        resolved.tui.shortcuts.copy_message,
+        CopyMessageShortcut::CtrlShiftC
+    );
 }
 
 #[test]

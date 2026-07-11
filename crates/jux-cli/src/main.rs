@@ -809,17 +809,19 @@ fn load_tui_configuration(workspace_root: &std::path::Path) -> TuiConfiguration 
             .and_then(|config| config.resolve(workspace_root)),
         None => JuxConfig::default().resolve(workspace_root),
     };
-    let (model_provider, model_name, runtime_policy, mut config_error) = match resolved {
+    let (model_provider, model_name, runtime_policy, tui, mut config_error) = match resolved {
         Ok(config) => (
             config.model.provider,
             config.model.name,
             config.runtime_policy,
+            config.tui,
             None,
         ),
         Err(error) => (
             "deepseek".to_owned(),
             DEFAULT_DEEPSEEK_MODEL.to_owned(),
             RuntimePolicy::workspace_default(workspace_root),
+            jux_core::TuiConfig::default(),
             Some(error.to_string()),
         ),
     };
@@ -844,6 +846,9 @@ fn load_tui_configuration(workspace_root: &std::path::Path) -> TuiConfiguration 
             model_name,
             sandbox: summarize_sandbox(&runtime_policy),
             config_error,
+            theme: tui.theme,
+            scroll_lines: tui.scroll_lines,
+            shortcuts: tui.shortcuts,
         },
         runtime_policy,
     }

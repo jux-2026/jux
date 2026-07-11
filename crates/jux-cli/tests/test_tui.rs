@@ -11,7 +11,7 @@ use jux_core::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AssistantResponseItem,
     CodeChangePlan, CodeChangeProposal, LlmUsage, ProposedFileContent, ReviewStatus, RunId,
     RunStatus as CoreRunStatus, SkillCatalog, SkillDefinition, SkillOverride, SkillScope,
-    SqliteWorkspaceStore, Step, StepId, StepKind, StepPayload,
+    SqliteWorkspaceStore, Step, StepId, StepKind, StepPayload, TuiShortcutConfig, TuiTheme,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -2436,6 +2436,7 @@ fn tui_displays_workspace_model_sandbox_and_summary_status() {
             native_commands: "disabled".to_owned(),
         },
         config_error: None,
+        ..TuiRuntimeInfo::default()
     });
 
     let buffer = render_to_buffer(&state, 120, 30);
@@ -2464,6 +2465,7 @@ fn tui_displays_configuration_errors_and_runtime_logs() {
             native_commands: "disabled".to_owned(),
         },
         config_error: Some("invalid config shape: unknown field".to_owned()),
+        ..TuiRuntimeInfo::default()
     });
     update(
         &mut state,
@@ -2767,4 +2769,222 @@ fn input_background() -> Color {
 
 fn status_bar_background() -> Color {
     Color::Rgb(18, 28, 36)
+}
+
+#[test]
+fn tui_completes_commands_and_restores_submitted_input_history() {
+    let mut state = AppState::new("/workspace");
+    type_text(&mut state, "/ver");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+    );
+    assert_eq!(state.input_text(), "/version");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    type_text(&mut state, "remember this");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    update(&mut state, AppAction::RunCanceled);
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+    );
+    assert_eq!(state.input_text(), "remember this");
+}
+
+#[test]
+fn tui_completes_inline_skill_references_for_the_next_run() {
+    let mut state = AppState::new("/workspace");
+    state.set_skill_catalog(SkillCatalog {
+        skills: vec![skill_definition(
+            "review-code",
+            SkillScope::Project,
+            ".jux/skills",
+        )],
+        overrides: Vec::new(),
+    });
+    type_text(&mut state, "Use $review");
+    let popup = render_to_buffer(&state, 100, 30);
+    assert_buffer_contains(&popup, "$review-code");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+    );
+    assert_eq!(state.input_text(), "Use $review-code");
+    assert_eq!(state.selected_skill_names(), &["review-code"]);
+}
+
+#[test]
+fn tui_renders_markdown_and_code_blocks_with_terminal_styles() {
+    let mut state = AppState::new("/workspace");
+    update(
+        &mut state,
+        AppAction::AssistantMessage {
+            content: "# Heading\n- item\n> quote\n```rust\nfn main() {}\n```\n| A | B |\n|---|---|"
+                .to_owned(),
+        },
+    );
+    let buffer = render_to_buffer(&state, 100, 30);
+    assert_buffer_contains(&buffer, "Heading");
+    assert_buffer_contains(&buffer, "• item");
+    assert_buffer_contains(&buffer, "│ quote");
+    assert_buffer_contains(&buffer, "rust");
+    assert_buffer_contains(&buffer, "A │ B");
+}
+
+#[test]
+fn tui_selects_copies_and_loads_a_user_message_for_editing() {
+    let mut state = AppState::new("/workspace");
+    type_text(&mut state, "original request");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    update(&mut state, AppAction::RunCanceled);
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+    );
+    assert_eq!(
+        update(
+            &mut state,
+            AppAction::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+        ),
+        Some(AppCommand::CopyText {
+            content: "original request".to_owned(),
+        })
+    );
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+    );
+    assert_eq!(state.input_text(), "original request");
+}
+
+#[test]
+fn tui_archives_a_session_and_preserves_a_working_active_session() {
+    let workspace = assert_fs::TempDir::new().expect("temp workspace exists");
+    let store = SqliteWorkspaceStore::new(workspace.path());
+    let initial = store.init_workspace().expect("workspace initializes");
+    let mut state = AppState::new(workspace.path());
+    load_active_session_history(&mut state, &store).expect("history loads");
+    type_text(&mut state, "/session");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    let command = update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+    )
+    .expect("archive command is emitted");
+    execute_session_command(&mut state, &store, &command).expect("session archives");
+    assert!(
+        store
+            .load_session(&initial.active_session_id)
+            .expect("archived session loads")
+            .archived
+    );
+    assert_ne!(
+        store
+            .load_active_session()
+            .expect("active session loads")
+            .id,
+        initial.active_session_id
+    );
+}
+
+#[test]
+fn tui_retries_failed_and_continues_canceled_requests() {
+    let mut failed = AppState::new("/workspace");
+    type_text(&mut failed, "retry me");
+    update(
+        &mut failed,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    update(
+        &mut failed,
+        AppAction::RunFailed {
+            error: "failed".to_owned(),
+        },
+    );
+    type_text(&mut failed, "/retry");
+    assert_eq!(
+        update(
+            &mut failed,
+            AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ),
+        Some(AppCommand::StartRun {
+            request: "retry me".to_owned(),
+        })
+    );
+
+    let mut canceled = AppState::new("/workspace");
+    type_text(&mut canceled, "continue me");
+    update(
+        &mut canceled,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    update(&mut canceled, AppAction::RunCanceled);
+    type_text(&mut canceled, "/continue");
+    assert_eq!(
+        update(
+            &mut canceled,
+            AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ),
+        Some(AppCommand::StartRun {
+            request: "continue me".to_owned(),
+        })
+    );
+}
+
+#[test]
+fn tui_searches_conversation_and_cycles_matching_messages() {
+    let mut state = AppState::new("/workspace");
+    for request in ["first needle", "middle", "last needle"] {
+        type_text(&mut state, request);
+        update(
+            &mut state,
+            AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        update(&mut state, AppAction::RunCanceled);
+    }
+    type_text(&mut state, "/search needle");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    let first = render_to_buffer(&state, 100, 30);
+    assert_buffer_contains(&first, "▶ You");
+    type_text(&mut state, "/search needle");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    assert_eq!(state.messages()[2].content, "last needle");
+}
+
+#[test]
+fn tui_applies_high_contrast_theme_and_custom_shortcuts() {
+    let mut state = AppState::new("/workspace");
+    state.set_runtime_info(TuiRuntimeInfo {
+        theme: TuiTheme::HighContrast,
+        shortcuts: TuiShortcutConfig {
+            quit: jux_core::QuitShortcut::CtrlQ,
+            copy_message: jux_core::CopyMessageShortcut::CtrlShiftC,
+        },
+        ..TuiRuntimeInfo::default()
+    });
+    let buffer = render_to_buffer(&state, 100, 24);
+    assert_eq!(buffer[(1, 1)].bg, Color::Black);
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+    );
+    assert!(state.should_quit);
 }

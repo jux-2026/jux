@@ -87,7 +87,7 @@ impl SqliteWorkspaceStore {
         let connection = self.connect()?;
         connection
             .query_row(
-                "select id, name, liked, created_at, updated_at from sessions where id = ?1",
+                "select id, name, liked, archived, created_at, updated_at from sessions where id = ?1",
                 params![session_id.as_str()],
                 row_to_session,
             )
@@ -98,7 +98,7 @@ impl SqliteWorkspaceStore {
     pub fn load_sessions(&self) -> Result<Vec<Session>, StoreError> {
         let connection = self.connect()?;
         let mut statement = connection.prepare(
-            "select id, name, liked, created_at, updated_at
+            "select id, name, liked, archived, created_at, updated_at
              from sessions
              order by id",
         )?;
@@ -166,6 +166,26 @@ impl SqliteWorkspaceStore {
     pub fn toggle_session_liked(&self, session_id: &SessionId) -> Result<Session, StoreError> {
         let session = self.load_session(session_id)?;
         self.set_session_liked(session_id, !session.liked)
+    }
+
+    pub fn set_session_archived(
+        &self,
+        session_id: &SessionId,
+        archived: bool,
+    ) -> Result<Session, StoreError> {
+        let mut session = self.load_session(session_id)?;
+        session.archived = archived;
+        session.updated_at = now_millis();
+        let connection = self.connect()?;
+        connection.execute(
+            "update sessions set archived = ?1, updated_at = ?2 where id = ?3",
+            params![
+                session.archived,
+                session.updated_at.to_string(),
+                session.id.as_str(),
+            ],
+        )?;
+        Ok(session)
     }
 
     pub fn set_active_session(&self, session_id: &SessionId) -> Result<Workspace, StoreError> {
@@ -477,6 +497,7 @@ fn init_schema(connection: &Connection) -> Result<(), StoreError> {
             id text primary key,
             name text,
             liked integer not null default 0,
+            archived integer not null default 0,
             created_at text not null,
             updated_at text not null
         );
@@ -510,6 +531,29 @@ fn init_schema(connection: &Connection) -> Result<(), StoreError> {
         ",
     )?;
     ensure_sessions_liked_column(connection)?;
+    ensure_sessions_archived_column(connection)?;
+    Ok(())
+}
+
+fn ensure_sessions_archived_column(connection: &Connection) -> Result<(), StoreError> {
+    ensure_session_boolean_column(connection, "archived")
+}
+
+fn ensure_session_boolean_column(
+    connection: &Connection,
+    column_name: &str,
+) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("pragma table_info(sessions)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == column_name {
+            return Ok(());
+        }
+    }
+    connection.execute(
+        &format!("alter table sessions add column {column_name} integer not null default 0"),
+        [],
+    )?;
     Ok(())
 }
 
@@ -570,12 +614,13 @@ fn next_number_after(latest_id: Option<&str>) -> Result<u64, StoreError> {
 
 fn insert_session(transaction: &Transaction<'_>, session: &Session) -> Result<(), StoreError> {
     transaction.execute(
-        "insert into sessions (id, name, liked, created_at, updated_at)
-         values (?1, ?2, ?3, ?4, ?5)",
+        "insert into sessions (id, name, liked, archived, created_at, updated_at)
+         values (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             session.id.as_str(),
             session.name,
             session.liked,
+            session.archived,
             session.created_at.to_string(),
             session.updated_at.to_string(),
         ],
@@ -671,8 +716,9 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         id: SessionId::from(row.get::<_, String>(0)?),
         name: row.get(1)?,
         liked: row.get(2)?,
-        created_at: parse_timestamp(row.get::<_, String>(3)?),
-        updated_at: parse_timestamp(row.get::<_, String>(4)?),
+        archived: row.get(3)?,
+        created_at: parse_timestamp(row.get::<_, String>(4)?),
+        updated_at: parse_timestamp(row.get::<_, String>(5)?),
     })
 }
 

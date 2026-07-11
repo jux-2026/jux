@@ -66,6 +66,8 @@ pub struct JuxConfig {
     pub sandbox: SandboxConfig,
     /// Logging preference used by higher-level application code.
     pub logging: LoggingConfig,
+    /// Terminal UI appearance and interaction preferences.
+    pub tui: TuiConfig,
 }
 
 impl JuxConfig {
@@ -95,12 +97,18 @@ impl JuxConfig {
         self,
         workspace_root: impl Into<PathBuf>,
     ) -> Result<ResolvedConfig, ConfigError> {
+        if !(1..=100).contains(&self.tui.scroll_lines) {
+            return Err(ConfigError::new(
+                "tui.scroll_lines must be between 1 and 100",
+            ));
+        }
         let workspace_root = workspace_root.into();
         let runtime_policy = self.sandbox.into_runtime_policy(workspace_root)?;
         Ok(ResolvedConfig {
             model: self.model,
             agent: self.agent,
             logging: self.logging,
+            tui: self.tui,
             runtime_policy,
         })
     }
@@ -125,6 +133,7 @@ impl Default for JuxConfig {
             agent: AgentConfig::default(),
             sandbox: SandboxConfig::default(),
             logging: LoggingConfig::default(),
+            tui: TuiConfig::default(),
         }
     }
 }
@@ -143,8 +152,69 @@ pub struct ResolvedConfig {
     pub agent: AgentConfig,
     /// Resolved logging preference.
     pub logging: LoggingConfig,
+    /// Terminal UI preferences.
+    pub tui: TuiConfig,
     /// Runtime policy consumed by tools and execution backends.
     pub runtime_policy: RuntimePolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+/// Terminal UI preferences.
+pub struct TuiConfig {
+    pub theme: TuiTheme,
+    pub scroll_lines: u16,
+    pub shortcuts: TuiShortcutConfig,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            theme: TuiTheme::Dark,
+            scroll_lines: 5,
+            shortcuts: TuiShortcutConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiTheme {
+    #[default]
+    Dark,
+    HighContrast,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TuiShortcutConfig {
+    pub quit: QuitShortcut,
+    pub copy_message: CopyMessageShortcut,
+}
+
+impl Default for TuiShortcutConfig {
+    fn default() -> Self {
+        Self {
+            quit: QuitShortcut::CtrlC,
+            copy_message: CopyMessageShortcut::CtrlY,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuitShortcut {
+    #[default]
+    CtrlC,
+    CtrlQ,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyMessageShortcut {
+    #[default]
+    CtrlY,
+    CtrlShiftC,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

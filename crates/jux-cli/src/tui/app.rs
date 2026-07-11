@@ -3,10 +3,10 @@ use crossterm::event::{
 };
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventKind, AssistantResponseItem, CALL_SKILL_TOOL_NAME,
-    CodeChangeError, CodeChangeProposal, CodeChangeReview, HumanInputRequest,
-    PROPOSE_CODE_CHANGE_TOOL_NAME, ReviewStatus, Run, RunStatus, Session, SessionId, SkillCatalog,
-    SkillDefinition, SkillOverride, SqliteWorkspaceStore, Step, StepPayload, StoreError,
-    latest_human_input_request,
+    CodeChangeError, CodeChangeProposal, CodeChangeReview, CopyMessageShortcut, HumanInputRequest,
+    PROPOSE_CODE_CHANGE_TOOL_NAME, QuitShortcut, ReviewStatus, Run, RunStatus, Session, SessionId,
+    SkillCatalog, SkillDefinition, SkillOverride, SqliteWorkspaceStore, Step, StepPayload,
+    StoreError, TuiShortcutConfig, TuiTheme, latest_human_input_request,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,7 +18,6 @@ use super::RunResponse;
 const DEFAULT_CONVERSATION_WIDTH_PERCENT: u16 = 60;
 const MIN_PANEL_WIDTH: u16 = 20;
 const DIVIDER_WIDTH: u16 = 1;
-const MOUSE_SCROLL_LINES: u16 = 5;
 const ESCAPE_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
 const NOTIFICATION_DURATION: Duration = Duration::from_secs(2);
 
@@ -100,7 +99,10 @@ pub struct AppState {
     input_history_draft: String,
     undo_input: Option<(String, usize)>,
     messages: Vec<Message>,
+    selected_message: Option<usize>,
+    conversation_search: Option<String>,
     conversation_scroll_from_bottom: u16,
+    conversation_max_scroll: u16,
     help_visible: bool,
     run_status: TuiRunStatus,
     session_id: Option<String>,
@@ -124,6 +126,8 @@ pub struct AppState {
     code_change_result: Option<TuiCodeChangeResult>,
     audit_items: Vec<AuditItem>,
     audit_panel_visible: bool,
+    audit_filter: AuditFilter,
+    selected_audit_item: usize,
     skills: Vec<SkillDefinition>,
     skill_overrides: Vec<SkillOverride>,
     selected_skill: usize,
@@ -140,6 +144,7 @@ pub struct AppState {
     divider_dragging: bool,
     conversation_width_percent: u16,
     selected_slash_command: usize,
+    selected_inline_skill: usize,
     slash_commands_dismissed: bool,
     pending_escape_action: Option<PendingEscapeAction>,
     notification: Option<(String, Instant)>,
@@ -172,6 +177,14 @@ pub struct AuditItem {
     pub detail: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuditFilter {
+    All,
+    Files,
+    Commands,
+    Policy,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TuiSandboxSummary {
     pub filesystem: String,
@@ -186,6 +199,9 @@ pub struct TuiRuntimeInfo {
     pub model_name: String,
     pub sandbox: TuiSandboxSummary,
     pub config_error: Option<String>,
+    pub theme: TuiTheme,
+    pub scroll_lines: u16,
+    pub shortcuts: TuiShortcutConfig,
 }
 
 impl Default for TuiRuntimeInfo {
@@ -200,6 +216,9 @@ impl Default for TuiRuntimeInfo {
                 native_commands: "-".to_owned(),
             },
             config_error: None,
+            theme: TuiTheme::Dark,
+            scroll_lines: 5,
+            shortcuts: TuiShortcutConfig::default(),
         }
     }
 }
@@ -299,7 +318,10 @@ impl AppState {
             input_history_draft: String::new(),
             undo_input: None,
             messages: Vec::new(),
+            selected_message: None,
+            conversation_search: None,
             conversation_scroll_from_bottom: 0,
+            conversation_max_scroll: 0,
             help_visible: false,
             run_status: TuiRunStatus::Idle,
             session_id: None,
@@ -323,6 +345,8 @@ impl AppState {
             code_change_result: None,
             audit_items: Vec::new(),
             audit_panel_visible: false,
+            audit_filter: AuditFilter::All,
+            selected_audit_item: 0,
             skills: Vec::new(),
             skill_overrides: Vec::new(),
             selected_skill: 0,
@@ -339,6 +363,7 @@ impl AppState {
             divider_dragging: false,
             conversation_width_percent: DEFAULT_CONVERSATION_WIDTH_PERCENT,
             selected_slash_command: 0,
+            selected_inline_skill: 0,
             slash_commands_dismissed: false,
             pending_escape_action: None,
             notification: None,
@@ -372,6 +397,16 @@ impl AppState {
     }
 
     #[must_use]
+    pub(super) fn selected_message(&self) -> Option<usize> {
+        self.selected_message
+    }
+
+    #[must_use]
+    pub(super) fn conversation_search(&self) -> Option<&str> {
+        self.conversation_search.as_deref()
+    }
+
+    #[must_use]
     pub fn conversation_scroll_from_bottom(&self) -> u16 {
         self.conversation_scroll_from_bottom
     }
@@ -389,7 +424,19 @@ impl AppState {
     }
 
     pub(crate) fn clamp_conversation_scroll_to(&mut self, maximum: u16) {
+        self.conversation_max_scroll = maximum;
         self.conversation_scroll_from_bottom = self.conversation_scroll_from_bottom.min(maximum);
+    }
+
+    #[must_use]
+    pub(super) fn scroll_position_label(&self) -> &'static str {
+        if self.conversation_scroll_from_bottom == 0 {
+            "Bottom"
+        } else if self.conversation_scroll_from_bottom >= self.conversation_max_scroll {
+            "Top"
+        } else {
+            "History"
+        }
     }
 
     #[must_use]
@@ -472,6 +519,7 @@ impl AppState {
         let mut sessions = self
             .sessions
             .iter()
+            .filter(|session| !session.archived)
             .filter(|session| {
                 query.is_empty()
                     || session
@@ -530,6 +578,31 @@ impl AppState {
     #[must_use]
     pub fn audit_panel_visible(&self) -> bool {
         self.audit_panel_visible
+    }
+
+    #[must_use]
+    pub fn audit_filter(&self) -> AuditFilter {
+        self.audit_filter
+    }
+
+    #[must_use]
+    pub fn selected_audit_item(&self) -> usize {
+        self.selected_audit_item
+    }
+
+    #[must_use]
+    pub fn filtered_audit_items(&self) -> Vec<&AuditItem> {
+        self.audit_items
+            .iter()
+            .filter(|item| match self.audit_filter {
+                AuditFilter::All => true,
+                AuditFilter::Files => item.title.starts_with("File"),
+                AuditFilter::Commands => {
+                    item.title.starts_with("Tool") || item.title.contains("command")
+                }
+                AuditFilter::Policy => item.title.starts_with("Policy"),
+            })
+            .collect()
     }
 
     pub fn set_skill_catalog(&mut self, catalog: SkillCatalog) {
@@ -593,6 +666,27 @@ impl AppState {
     }
 
     #[must_use]
+    pub(super) fn theme(&self) -> TuiTheme {
+        self.runtime_info.theme
+    }
+
+    #[must_use]
+    pub(super) fn quit_shortcut_label(&self) -> &'static str {
+        match self.runtime_info.shortcuts.quit {
+            QuitShortcut::CtrlC => "Ctrl+C",
+            QuitShortcut::CtrlQ => "Ctrl+Q",
+        }
+    }
+
+    #[must_use]
+    pub(super) fn copy_shortcut_label(&self) -> &'static str {
+        match self.runtime_info.shortcuts.copy_message {
+            CopyMessageShortcut::CtrlY => "Ctrl+Y",
+            CopyMessageShortcut::CtrlShiftC => "Ctrl+Shift+C",
+        }
+    }
+
+    #[must_use]
     pub fn runtime_logs(&self) -> &[TuiRuntimeLog] {
         &self.runtime_logs
     }
@@ -643,6 +737,47 @@ impl AppState {
             })
             .filter(|definition| definition.name.trim_start_matches('/').starts_with(query))
             .collect()
+    }
+
+    #[must_use]
+    pub(super) fn inline_skill_suggestions(&self) -> Vec<&SkillDefinition> {
+        let token_start = self.input[..self.cursor]
+            .rfind(char::is_whitespace)
+            .map_or(0, |index| index + 1);
+        let token = &self.input[token_start..self.cursor];
+        let Some(query) = token.strip_prefix('$') else {
+            return Vec::new();
+        };
+        let query = query.to_lowercase();
+        self.skills
+            .iter()
+            .filter(|skill| skill.name.to_lowercase().contains(&query))
+            .collect()
+    }
+
+    #[must_use]
+    pub(super) fn selected_inline_skill(&self) -> usize {
+        self.selected_inline_skill
+    }
+
+    fn complete_inline_skill(&mut self) {
+        let Some(name) = self
+            .inline_skill_suggestions()
+            .get(self.selected_inline_skill)
+            .map(|skill| skill.name.clone())
+        else {
+            return;
+        };
+        let token_start = self.input[..self.cursor]
+            .rfind(char::is_whitespace)
+            .map_or(0, |index| index + 1);
+        self.remember_undo_state();
+        self.input
+            .replace_range(token_start..self.cursor, &format!("${name}"));
+        self.cursor = token_start + name.len() + 1;
+        if !self.selected_skill_names.contains(&name) {
+            self.selected_skill_names.push(name);
+        }
     }
 
     #[must_use]
@@ -709,6 +844,7 @@ impl AppState {
         self.input.clear();
         self.cursor = 0;
         self.selected_slash_command = 0;
+        self.selected_inline_skill = 0;
         self.slash_commands_dismissed = false;
         self.pending_escape_action = None;
         self.input_history_index = None;
@@ -720,6 +856,7 @@ impl AppState {
         self.input.insert(self.cursor, character);
         self.cursor += character.len_utf8();
         self.selected_slash_command = 0;
+        self.selected_inline_skill = 0;
         self.slash_commands_dismissed = false;
     }
 
@@ -933,6 +1070,13 @@ pub fn execute_session_command(
         }
         AppCommand::ToggleSessionLiked { session_id } => {
             store.toggle_session_liked(session_id)?;
+        }
+        AppCommand::ArchiveSession { session_id } => {
+            store.set_session_archived(session_id, true)?;
+            if state.session_id.as_deref() == Some(session_id.as_str()) {
+                let replacement = store.create_session(None)?;
+                store.set_active_session(&replacement.id)?;
+            }
         }
         AppCommand::SwitchSession { session_id } => {
             store.set_active_session(session_id)?;
@@ -1217,6 +1361,7 @@ pub enum AppCommand {
     RenameActiveSession { name: String },
     RenameSession { session_id: SessionId, name: String },
     ToggleSessionLiked { session_id: SessionId },
+    ArchiveSession { session_id: SessionId },
     SwitchSession { session_id: SessionId },
     AcceptCodeChange,
     RejectCodeChange,
@@ -1416,10 +1561,83 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         AppAction::Key(KeyEvent {
             code: KeyCode::Esc, ..
         }) => handle_escape(state, Instant::now()),
-        AppAction::Key(key)
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Char('f'),
+            ..
+        }) if state.audit_panel_visible => {
+            state.audit_filter = match state.audit_filter {
+                AuditFilter::All => AuditFilter::Files,
+                AuditFilter::Files => AuditFilter::Commands,
+                AuditFilter::Commands => AuditFilter::Policy,
+                AuditFilter::Policy => AuditFilter::All,
+            };
+            state.selected_audit_item = 0;
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Up, ..
+        }) if state.audit_panel_visible => {
+            state.selected_audit_item = state.selected_audit_item.saturating_sub(1);
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Down,
+            ..
+        }) if state.audit_panel_visible => {
+            let maximum = state.filtered_audit_items().len().saturating_sub(1);
+            state.selected_audit_item = (state.selected_audit_item + 1).min(maximum);
+            None
+        }
+        AppAction::Key(key) if is_quit_shortcut(state, key) => {
             state.should_quit = true;
+            None
+        }
+        AppAction::Key(key)
+            if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            if !state.messages.is_empty() {
+                state.selected_message = Some(
+                    state
+                        .selected_message
+                        .unwrap_or(state.messages.len())
+                        .saturating_sub(1),
+                );
+            }
+            None
+        }
+        AppAction::Key(key)
+            if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            if !state.messages.is_empty() {
+                state.selected_message = Some(
+                    state
+                        .selected_message
+                        .map_or(0, |index| (index + 1).min(state.messages.len() - 1)),
+                );
+            }
+            None
+        }
+        AppAction::Key(key) if is_copy_message_shortcut(state, key) => state
+            .selected_message
+            .and_then(|index| state.messages.get(index))
+            .map(|message| message.content.clone())
+            .map(|content| {
+                state.notify("Copied to clipboard");
+                AppCommand::CopyText { content }
+            }),
+        AppAction::Key(key)
+            if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            if let Some(message) = state
+                .selected_message
+                .and_then(|index| state.messages.get(index))
+                .filter(|message| message.role == MessageRole::User)
+                .cloned()
+            {
+                state.input = message.content;
+                state.cursor = state.input.len();
+                state.notify("Message loaded for editing");
+            }
             None
         }
         AppAction::Key(key)
@@ -1438,6 +1656,12 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 state.input = command.name.to_owned();
                 state.cursor = state.input.len();
             }
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Tab, ..
+        }) if !state.inline_skill_suggestions().is_empty() => {
+            state.complete_inline_skill();
             None
         }
         AppAction::Key(KeyEvent {
@@ -1497,6 +1721,17 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             ..
         }) if state.session_panel_visible && state.run_status != TuiRunStatus::Running => {
             Some(AppCommand::CreateSession { name: None })
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }) if state.session_panel_visible => {
+            state
+                .selected_filtered_session()
+                .map(|session| AppCommand::ArchiveSession {
+                    session_id: session.id.clone(),
+                })
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Char('g'),
@@ -1605,6 +1840,24 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         }) if !state.slash_command_suggestions().is_empty() => {
             let command_count = state.slash_command_suggestions().len();
             state.selected_slash_command = (state.selected_slash_command + 1) % command_count;
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Up, ..
+        }) if !state.inline_skill_suggestions().is_empty() => {
+            let count = state.inline_skill_suggestions().len();
+            state.selected_inline_skill = state
+                .selected_inline_skill
+                .checked_sub(1)
+                .unwrap_or(count - 1);
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Down,
+            ..
+        }) if !state.inline_skill_suggestions().is_empty() => {
+            let count = state.inline_skill_suggestions().len();
+            state.selected_inline_skill = (state.selected_inline_skill + 1) % count;
             None
         }
         AppAction::Key(KeyEvent {
@@ -1727,6 +1980,41 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 state.focused_panel = FocusedPanel::Sidebar;
                 return None;
             }
+            if let Some(query) = state.input.trim().strip_prefix("/search ")
+                && !query.is_empty()
+            {
+                let query = query.to_lowercase();
+                let start = if state.conversation_search.as_deref() == Some(query.as_str()) {
+                    state.selected_message.map_or(0, |index| index + 1)
+                } else {
+                    0
+                };
+                state.selected_message = state
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .find(|(_, message)| message.content.to_lowercase().contains(&query))
+                    .map(|(index, _)| index)
+                    .or_else(|| {
+                        state.messages.iter().enumerate().take(start).find_map(
+                            |(index, message)| {
+                                message
+                                    .content
+                                    .to_lowercase()
+                                    .contains(&query)
+                                    .then_some(index)
+                            },
+                        )
+                    });
+                state.conversation_search = Some(query);
+                state.conversation_scroll_from_bottom = u16::MAX;
+                if state.selected_message.is_none() {
+                    state.notify("No conversation matches");
+                }
+                state.clear_input();
+                return None;
+            }
             if state.input.trim() == "/review accept" && state.code_change_review.is_some() {
                 state.clear_input();
                 return Some(AppCommand::AcceptCodeChange);
@@ -1786,6 +2074,23 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             }
             if state.run_status == TuiRunStatus::Running {
                 return None;
+            }
+            if state.input.trim_start().starts_with('/') {
+                state.notify("Unknown or invalid command");
+                state.clear_input();
+                return None;
+            }
+            let inline_skill_names = state
+                .input
+                .split_whitespace()
+                .filter_map(|token| token.strip_prefix('$'))
+                .filter(|name| state.skills.iter().any(|skill| skill.name == *name))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            for name in inline_skill_names {
+                if !state.selected_skill_names.contains(&name) {
+                    state.selected_skill_names.push(name);
+                }
             }
             let request = std::mem::take(&mut state.input);
             if state.input_history.last() != Some(&request) {
@@ -1988,6 +2293,28 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
     }
 }
 
+fn is_quit_shortcut(state: &AppState, key: KeyEvent) -> bool {
+    let character = match state.runtime_info.shortcuts.quit {
+        QuitShortcut::CtrlC => 'c',
+        QuitShortcut::CtrlQ => 'q',
+    };
+    key.code == KeyCode::Char(character) && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn is_copy_message_shortcut(state: &AppState, key: KeyEvent) -> bool {
+    match state.runtime_info.shortcuts.copy_message {
+        CopyMessageShortcut::CtrlY => {
+            key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL)
+        }
+        CopyMessageShortcut::CtrlShiftC => {
+            key.code == KeyCode::Char('c')
+                && key
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        }
+    }
+}
+
 fn handle_escape(state: &mut AppState, now: Instant) -> Option<AppCommand> {
     let action = if state.run_status == TuiRunStatus::Running {
         EscapeAction::InterruptRun
@@ -2133,13 +2460,13 @@ fn handle_mouse_event(
             MouseEventKind::ScrollUp => {
                 state.conversation_scroll_from_bottom = state
                     .conversation_scroll_from_bottom
-                    .saturating_add(MOUSE_SCROLL_LINES);
+                    .saturating_add(state.runtime_info.scroll_lines);
                 return None;
             }
             MouseEventKind::ScrollDown => {
                 state.conversation_scroll_from_bottom = state
                     .conversation_scroll_from_bottom
-                    .saturating_sub(MOUSE_SCROLL_LINES);
+                    .saturating_sub(state.runtime_info.scroll_lines);
                 return None;
             }
             _ => {}
@@ -2147,6 +2474,60 @@ fn handle_mouse_event(
     }
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if state.session_panel_visible && event.row >= 3 {
+                let index = usize::from(event.row.saturating_sub(3));
+                if let Some(session_id) = state
+                    .filtered_sessions()
+                    .get(index)
+                    .map(|session| session.id.clone())
+                {
+                    state.selected_session = index;
+                    return Some(AppCommand::SwitchSession { session_id });
+                }
+            }
+            if state.skill_panel_visible
+                && event.column > state.conversation_panel_width(viewport.width)
+                && event.row >= 4
+            {
+                let index = usize::from(event.row.saturating_sub(4));
+                if index < state.skills.len() {
+                    state.selected_skill = index;
+                    let name = state.skills[index].name.clone();
+                    if let Some(selected) = state
+                        .selected_skill_names
+                        .iter()
+                        .position(|selected| selected == &name)
+                    {
+                        state.selected_skill_names.remove(selected);
+                    } else {
+                        state.selected_skill_names.push(name);
+                    }
+                    return None;
+                }
+            }
+            let slash_suggestions = state.slash_command_suggestions();
+            if !slash_suggestions.is_empty() {
+                let input_lines = state.input.lines().count().max(1) as u16;
+                let input_top = viewport
+                    .height
+                    .saturating_sub(1)
+                    .saturating_sub(input_lines.saturating_add(2));
+                let popup_height = u16::try_from(slash_suggestions.len())
+                    .unwrap_or(input_top)
+                    .saturating_add(2)
+                    .min(input_top.saturating_sub(1));
+                let first_row = input_top.saturating_sub(popup_height).saturating_add(1);
+                if event.row >= first_row {
+                    let index = usize::from(event.row.saturating_sub(first_row));
+                    if index < slash_suggestions.len() {
+                        state.selected_slash_command = index;
+                        return match execute_selected_slash_command(state) {
+                            SlashCommandExecution::Executed(command) => command,
+                            SlashCommandExecution::NotSelected => None,
+                        };
+                    }
+                }
+            }
             if divider_column(state, viewport) == Some(event.column) {
                 state.text_selection = None;
                 state.text_selection_drag = None;

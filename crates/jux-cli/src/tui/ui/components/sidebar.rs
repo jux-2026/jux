@@ -1,9 +1,10 @@
 use super::super::text::{apply_text_selection, display_names};
-use super::super::theme::{SIDEBAR_BACKGROUND, panel_block};
+use super::super::theme::{palette, panel_block};
 use crate::tui::{AppState, SelectionPanel, TuiRunStatus};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(in crate::tui::ui) fn log_panel(state: &AppState) -> Paragraph<'_> {
     let mut lines = vec![Line::from("Runtime logs"), Line::from("")];
@@ -69,9 +70,18 @@ pub(in crate::tui::ui) fn skill_panel(state: &AppState) -> Paragraph<'_> {
 }
 
 pub(in crate::tui::ui) fn audit_panel(state: &AppState) -> Paragraph<'_> {
-    let mut lines = vec![Line::from("Audit"), Line::from("")];
-    for item in state.audit_items() {
-        lines.push(Line::from(item.title.as_str()));
+    let mut lines = vec![
+        Line::from("Audit"),
+        Line::from(format!("Filter: {:?} (F to change)", state.audit_filter())),
+        Line::from(""),
+    ];
+    for (index, item) in state.filtered_audit_items().iter().enumerate() {
+        let marker = if index == state.selected_audit_item() {
+            ">"
+        } else {
+            " "
+        };
+        lines.push(Line::from(format!("{marker} {}", item.title)));
         if let Some(detail) = &item.detail {
             lines.push(Line::styled(
                 detail.as_str(),
@@ -103,14 +113,10 @@ pub(in crate::tui::ui) fn run_panel(state: &AppState) -> Paragraph<'_> {
             state.runtime_info().model_name
         )),
         Line::from("Focus: Left/Right"),
-        Line::from("Quit: Ctrl+C"),
+        Line::from(format!("Quit: {}", state.quit_shortcut_label())),
         Line::from(""),
         Line::from(format!("Status: {status}")),
-        Line::from(if state.run_status() == TuiRunStatus::Running {
-            "Activity: ◐"
-        } else {
-            "Activity: -"
-        }),
+        Line::from(format!("Activity: {}", activity_indicator(state))),
         Line::from(format!("Progress: {}", run_progress(state))),
         Line::from(state.run_elapsed_millis().map_or_else(
             || "Elapsed: -".to_owned(),
@@ -144,6 +150,17 @@ pub(in crate::tui::ui) fn run_panel(state: &AppState) -> Paragraph<'_> {
         )),
     ];
     sidebar_paragraph(state, lines)
+}
+
+fn activity_indicator(state: &AppState) -> &'static str {
+    if state.run_status() != TuiRunStatus::Running {
+        return "-";
+    }
+    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    let frame = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() / 100);
+    FRAMES[(frame as usize) % FRAMES.len()]
 }
 
 fn run_progress(state: &AppState) -> &'static str {
@@ -190,15 +207,17 @@ pub(in crate::tui::ui) fn help_panel(state: &AppState) -> Paragraph<'static> {
             Line::from(contextual),
             Line::from("Shift+Enter Newline"),
             Line::from("PageUp/PageDown Scroll"),
-            Line::from("Ctrl+C Quit"),
+            Line::from(format!("{} Quit", state.quit_shortcut_label())),
+            Line::from(format!("{} Copy message", state.copy_shortcut_label())),
         ],
     )
 }
 
 fn sidebar_paragraph<'a>(state: &AppState, lines: Vec<Line<'a>>) -> Paragraph<'a> {
     let lines = apply_text_selection(state, SelectionPanel::Sidebar, 0, lines);
+    let background = palette(state.theme()).sidebar;
     Paragraph::new(lines)
-        .block(panel_block(SIDEBAR_BACKGROUND, 2))
-        .style(Style::default().bg(SIDEBAR_BACKGROUND))
+        .block(panel_block(background, 2))
+        .style(Style::default().bg(background))
         .wrap(Wrap { trim: true })
 }

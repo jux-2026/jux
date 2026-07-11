@@ -1,4 +1,4 @@
-use super::super::theme::CONVERSATION_BACKGROUND;
+use super::super::theme::palette;
 use crate::tui::AppState;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Padding, Paragraph};
 const SELECTED_BACKGROUND: Color = Color::Rgb(40, 52, 64);
 
 pub(in crate::tui::ui) fn render(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    let background = palette(state.theme()).conversation;
     let regions = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -27,7 +28,7 @@ pub(in crate::tui::ui) fn render(frame: &mut Frame<'_>, state: &AppState, area: 
         Span::styled(label, Style::default().fg(Color::DarkGray)),
         Span::raw(value),
     ]))
-    .style(Style::default().bg(CONVERSATION_BACKGROUND))
+    .style(Style::default().bg(background))
     .block(Block::default().padding(Padding::vertical(1)));
     frame.render_widget(search, regions[0]);
 
@@ -58,18 +59,12 @@ pub(in crate::tui::ui) fn render(frame: &mut Frame<'_>, state: &AppState, area: 
         ));
     }
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(CONVERSATION_BACKGROUND)),
+        Paragraph::new(lines).style(Style::default().bg(background)),
         regions[1],
     );
     frame.render_widget(
-        Paragraph::new(
-            " Ctrl+N new  ↑/↓ select  Enter switch  Ctrl+L like  Ctrl+R rename  Ctrl+G title",
-        )
-        .style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .bg(CONVERSATION_BACKGROUND),
-        ),
+        Paragraph::new(" Ctrl+N new  Ctrl+A archive  ↑/↓ select  Enter switch  Ctrl+L like")
+            .style(Style::default().fg(Color::DarkGray).bg(background)),
         regions[2],
     );
 
