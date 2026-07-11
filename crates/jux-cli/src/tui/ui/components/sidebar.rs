@@ -106,6 +106,12 @@ pub(in crate::tui::ui) fn run_panel(state: &AppState) -> Paragraph<'_> {
         Line::from("Quit: Ctrl+C"),
         Line::from(""),
         Line::from(format!("Status: {status}")),
+        Line::from(if state.run_status() == TuiRunStatus::Running {
+            "Activity: ◐"
+        } else {
+            "Activity: -"
+        }),
+        Line::from(format!("Progress: {}", run_progress(state))),
         Line::from(state.run_elapsed_millis().map_or_else(
             || "Elapsed: -".to_owned(),
             |millis| format!("Elapsed: {millis} ms"),
@@ -140,7 +146,34 @@ pub(in crate::tui::ui) fn run_panel(state: &AppState) -> Paragraph<'_> {
     sidebar_paragraph(state, lines)
 }
 
+fn run_progress(state: &AppState) -> &'static str {
+    if state.run_status() == TuiRunStatus::WaitingForHumanInput {
+        return "Waiting for input";
+    }
+    if state.run_status() != TuiRunStatus::Running {
+        return "-";
+    }
+    state.timeline().last().map_or("Thinking", |item| {
+        if item.label.starts_with("LLM") {
+            "Generating response"
+        } else if item.label.starts_with("Tool") {
+            "Calling tool"
+        } else {
+            "Thinking"
+        }
+    })
+}
+
 pub(in crate::tui::ui) fn help_panel(state: &AppState) -> Paragraph<'static> {
+    let contextual = if state.skill_panel_visible() {
+        "Up/Down select | Space toggle | Esc close"
+    } else if state.session_panel_visible() {
+        "Ctrl+N new | Enter switch | Ctrl+L favorite"
+    } else if state.run_status() == TuiRunStatus::Running {
+        "Esc twice Interrupt run"
+    } else {
+        "Home/End Jump | PageUp/PageDown Scroll"
+    };
     sidebar_paragraph(
         state,
         vec![
@@ -154,6 +187,7 @@ pub(in crate::tui::ui) fn help_panel(state: &AppState) -> Paragraph<'static> {
             Line::from("/logs   Show runtime logs"),
             Line::from(""),
             Line::from("Shortcuts"),
+            Line::from(contextual),
             Line::from("Shift+Enter Newline"),
             Line::from("PageUp/PageDown Scroll"),
             Line::from("Ctrl+C Quit"),

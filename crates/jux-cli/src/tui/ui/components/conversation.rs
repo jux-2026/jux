@@ -301,13 +301,16 @@ fn render_status_bar(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     if area.is_empty() {
         return;
     }
-    let text = state.escape_confirmation_hint().unwrap_or_else(|| {
-        if state.run_status() == TuiRunStatus::Running {
-            "Shift+Enter newline | Esc twice to interrupt | Ctrl+C quit"
-        } else {
-            "Shift+Enter newline | Esc twice to clear | Ctrl+C quit"
-        }
-    });
+    let text = state
+        .notification()
+        .or_else(|| state.escape_confirmation_hint())
+        .unwrap_or_else(|| {
+            if state.run_status() == TuiRunStatus::Running {
+                "Shift+Enter newline | Esc twice to interrupt | Ctrl+C quit"
+            } else {
+                "Shift+Enter newline | Esc twice to clear | Ctrl+C quit"
+            }
+        });
     let style = Style::default().fg(Color::Gray).bg(STATUS_BAR_BACKGROUND);
     let aligned_text = format!("   {text}");
     frame.render_widget(
@@ -344,7 +347,15 @@ fn render_slash_command_popup(
             } else {
                 Style::default().fg(Color::Gray)
             };
-            let content = format!("{:<10} {}", definition.name, definition.description);
+            let arguments = if definition.usage != definition.name {
+                format!(" ({})", definition.usage)
+            } else {
+                String::new()
+            };
+            let content = format!(
+                "{:<10} {}{arguments}",
+                definition.name, definition.description
+            );
             let content = content.chars().take(row_width).collect::<String>();
             Line::styled(format!("{content:<row_width$}"), style)
         })

@@ -32,7 +32,7 @@ pub(in crate::tui::ui) fn render(frame: &mut Frame<'_>, state: &AppState, area: 
     frame.render_widget(search, regions[0]);
 
     let width = regions[1].width.saturating_sub(1) as usize;
-    let lines = state
+    let mut lines = state
         .filtered_sessions()
         .into_iter()
         .enumerate()
@@ -51,12 +51,21 @@ pub(in crate::tui::ui) fn render(frame: &mut Frame<'_>, state: &AppState, area: 
             Line::styled(format!(" {title:<width$}"), style)
         })
         .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            " No sessions match your search.",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(CONVERSATION_BACKGROUND)),
         regions[1],
     );
     frame.render_widget(
-        Paragraph::new(" ↑/↓ select  Enter switch  Ctrl+L like  Ctrl+R rename  Esc close").style(
+        Paragraph::new(
+            " Ctrl+N new  ↑/↓ select  Enter switch  Ctrl+L like  Ctrl+R rename  Ctrl+G title",
+        )
+        .style(
             Style::default()
                 .fg(Color::DarkGray)
                 .bg(CONVERSATION_BACKGROUND),

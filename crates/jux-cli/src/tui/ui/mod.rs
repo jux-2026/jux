@@ -6,6 +6,8 @@ use self::layout::WorkspaceLayout;
 use super::{AppState, FocusedPanel};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 mod components;
 mod layout;
@@ -19,6 +21,17 @@ pub fn render_app(frame: &mut Frame<'_>, state: &AppState) {
 pub(crate) use self::components::conversation::conversation_max_scroll;
 
 fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    if area.width < 20 || area.height < 6 {
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new("Terminal too small\nResize to at least 40x10")
+                .style(Style::default().fg(Color::Yellow))
+                .block(Block::default().borders(Borders::ALL).title("Jux"))
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
     let layout = WorkspaceLayout::calculate(state, area);
     let conversation_focused = state.focused_panel() == FocusedPanel::Conversation;
     if state.session_panel_visible() {

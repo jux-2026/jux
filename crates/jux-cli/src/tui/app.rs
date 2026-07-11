@@ -20,6 +20,7 @@ const MIN_PANEL_WIDTH: u16 = 20;
 const DIVIDER_WIDTH: u16 = 1;
 const MOUSE_SCROLL_LINES: u16 = 5;
 const ESCAPE_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
+const NOTIFICATION_DURATION: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EscapeAction {
@@ -38,6 +39,8 @@ enum SlashCommand {
     NewSession,
     Session,
     Version,
+    Retry,
+    Continue,
 }
 
 enum SlashCommandExecution {
@@ -50,23 +53,39 @@ pub(super) struct SlashCommandDefinition {
     command: SlashCommand,
     pub name: &'static str,
     pub description: &'static str,
+    pub usage: &'static str,
 }
 
-const SLASH_COMMANDS: [SlashCommandDefinition; 3] = [
+const SLASH_COMMANDS: [SlashCommandDefinition; 5] = [
     SlashCommandDefinition {
         command: SlashCommand::NewSession,
         name: "/new",
         description: "Start a new session",
+        usage: "/new",
     },
     SlashCommandDefinition {
         command: SlashCommand::Session,
         name: "/session",
         description: "Switch active session",
+        usage: "/session [new|rename|switch]",
     },
     SlashCommandDefinition {
         command: SlashCommand::Version,
         name: "/version",
         description: "Show the Jux version",
+        usage: "/version",
+    },
+    SlashCommandDefinition {
+        command: SlashCommand::Retry,
+        name: "/retry",
+        description: "Retry the failed request",
+        usage: "/retry",
+    },
+    SlashCommandDefinition {
+        command: SlashCommand::Continue,
+        name: "/continue",
+        description: "Continue the canceled request",
+        usage: "/continue",
     },
 ];
 
@@ -76,6 +95,10 @@ pub struct AppState {
     pub should_quit: bool,
     input: String,
     cursor: usize,
+    input_history: Vec<String>,
+    input_history_index: Option<usize>,
+    input_history_draft: String,
+    undo_input: Option<(String, usize)>,
     messages: Vec<Message>,
     conversation_scroll_from_bottom: u16,
     help_visible: bool,
@@ -119,6 +142,7 @@ pub struct AppState {
     selected_slash_command: usize,
     slash_commands_dismissed: bool,
     pending_escape_action: Option<PendingEscapeAction>,
+    notification: Option<(String, Instant)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -270,6 +294,10 @@ impl AppState {
             should_quit: false,
             input: String::new(),
             cursor: 0,
+            input_history: Vec::new(),
+            input_history_index: None,
+            input_history_draft: String::new(),
+            undo_input: None,
             messages: Vec::new(),
             conversation_scroll_from_bottom: 0,
             help_visible: false,
@@ -313,6 +341,7 @@ impl AppState {
             selected_slash_command: 0,
             slash_commands_dismissed: false,
             pending_escape_action: None,
+            notification: None,
         }
     }
 
@@ -440,7 +469,8 @@ impl AppState {
     #[must_use]
     pub fn filtered_sessions(&self) -> Vec<&Session> {
         let query = self.session_search.to_lowercase();
-        self.sessions
+        let mut sessions = self
+            .sessions
             .iter()
             .filter(|session| {
                 query.is_empty()
@@ -451,7 +481,14 @@ impl AppState {
                         .to_lowercase()
                         .contains(&query)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| {
+            right
+                .liked
+                .cmp(&left.liked)
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+        sessions
     }
 
     fn selected_filtered_session(&self) -> Option<&Session> {
@@ -599,6 +636,11 @@ impl AppState {
         SLASH_COMMANDS
             .iter()
             .copied()
+            .filter(|definition| match definition.command {
+                SlashCommand::Retry => self.run_status == TuiRunStatus::Failed,
+                SlashCommand::Continue => self.run_status == TuiRunStatus::Canceled,
+                _ => true,
+            })
             .filter(|definition| definition.name.trim_start_matches('/').starts_with(query))
             .collect()
     }
@@ -611,6 +653,18 @@ impl AppState {
                 EscapeAction::ClearInput => "Press Esc again to clear the input",
                 EscapeAction::InterruptRun => "Press Esc again to interrupt the current run",
             })
+    }
+
+    #[must_use]
+    pub(super) fn notification(&self) -> Option<&str> {
+        self.notification
+            .as_ref()
+            .filter(|(_, expires_at)| *expires_at >= Instant::now())
+            .map(|(message, _)| message.as_str())
+    }
+
+    fn notify(&mut self, message: impl Into<String>) {
+        self.notification = Some((message.into(), Instant::now() + NOTIFICATION_DURATION));
     }
 
     #[must_use]
@@ -657,9 +711,12 @@ impl AppState {
         self.selected_slash_command = 0;
         self.slash_commands_dismissed = false;
         self.pending_escape_action = None;
+        self.input_history_index = None;
+        self.input_history_draft.clear();
     }
 
     fn insert(&mut self, character: char) {
+        self.remember_undo_state();
         self.input.insert(self.cursor, character);
         self.cursor += character.len_utf8();
         self.selected_slash_command = 0;
@@ -714,6 +771,7 @@ impl AppState {
         let Some((index, _)) = self.input[..self.cursor].char_indices().next_back() else {
             return;
         };
+        self.remember_undo_state();
         self.input.drain(index..self.cursor);
         self.cursor = index;
         self.selected_slash_command = 0;
@@ -724,10 +782,92 @@ impl AppState {
         let Some(character) = self.input[self.cursor..].chars().next() else {
             return;
         };
+        self.remember_undo_state();
         self.input
             .drain(self.cursor..self.cursor + character.len_utf8());
         self.selected_slash_command = 0;
         self.slash_commands_dismissed = false;
+    }
+
+    fn remember_undo_state(&mut self) {
+        self.undo_input = Some((self.input.clone(), self.cursor));
+        self.input_history_index = None;
+    }
+
+    fn undo_edit(&mut self) {
+        if let Some((input, cursor)) = self.undo_input.take() {
+            self.input = input;
+            self.cursor = cursor;
+        }
+    }
+
+    fn move_cursor_word_left(&mut self) {
+        let before = &self.input[..self.cursor];
+        let trimmed = before.trim_end_matches(char::is_whitespace);
+        self.cursor = trimmed.rfind(char::is_whitespace).map_or(0, |index| {
+            index + trimmed[index..].chars().next().map_or(0, char::len_utf8)
+        });
+    }
+
+    fn move_cursor_word_right(&mut self) {
+        let after = &self.input[self.cursor..];
+        let word_end = after.find(char::is_whitespace).unwrap_or(after.len());
+        let rest = &after[word_end..];
+        let whitespace_end = rest
+            .find(|character: char| !character.is_whitespace())
+            .unwrap_or(rest.len());
+        self.cursor += word_end + whitespace_end;
+    }
+
+    fn move_cursor_to_line_start(&mut self) {
+        self.cursor = self.input[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+    }
+
+    fn move_cursor_to_line_end(&mut self) {
+        self.cursor = self.input[self.cursor..]
+            .find('\n')
+            .map_or(self.input.len(), |index| self.cursor + index);
+    }
+
+    fn delete_current_line(&mut self) {
+        if self.input.is_empty() {
+            return;
+        }
+        self.remember_undo_state();
+        let start = self.input[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let end = self.input[self.cursor..]
+            .find('\n')
+            .map_or(self.input.len(), |index| self.cursor + index + 1);
+        self.input.drain(start..end);
+        self.cursor = start.min(self.input.len());
+    }
+
+    fn browse_input_history(&mut self, previous: bool) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let index = match (self.input_history_index, previous) {
+            (None, true) => {
+                self.input_history_draft = self.input.clone();
+                self.input_history.len() - 1
+            }
+            (Some(index), true) => index.saturating_sub(1),
+            (Some(index), false) if index + 1 < self.input_history.len() => index + 1,
+            (Some(_), false) => {
+                self.input_history_index = None;
+                self.input = std::mem::take(&mut self.input_history_draft);
+                self.cursor = self.input.len();
+                return;
+            }
+            (None, false) => return,
+        };
+        self.input_history_index = Some(index);
+        self.input.clone_from(&self.input_history[index]);
+        self.cursor = self.input.len();
     }
 
     fn panel_text_lines(&self, panel: SelectionPanel) -> Vec<String> {
@@ -811,6 +951,7 @@ pub fn execute_session_command(
         state.session_rename = None;
         state.selected_session = 0;
         state.focused_panel = FocusedPanel::Conversation;
+        state.notify("Session switched");
     }
     Ok(true)
 }
@@ -1289,6 +1430,18 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Tab, ..
+        }) if !state.slash_command_suggestions().is_empty() => {
+            if let Some(command) = state
+                .slash_command_suggestions()
+                .get(state.selected_slash_command)
+            {
+                state.input = command.name.to_owned();
+                state.cursor = state.input.len();
+            }
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Tab, ..
         }) => {
             if !state.timeline.is_empty() {
                 let next = state
@@ -1337,6 +1490,27 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 .map(|session| AppCommand::ToggleSessionLiked {
                     session_id: session.id.clone(),
                 })
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }) if state.session_panel_visible && state.run_status != TuiRunStatus::Running => {
+            Some(AppCommand::CreateSession { name: None })
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Char('g'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }) if state.session_panel_visible => {
+            state.selected_filtered_session().and_then(|session| {
+                state.session_history(&session.id).and_then(|history| {
+                    history.runs.first().map(|run| AppCommand::RenameSession {
+                        session_id: session.id.clone(),
+                        name: generated_session_title(&run.request),
+                    })
+                })
+            })
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Char('r'),
@@ -1614,6 +1788,11 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 return None;
             }
             let request = std::mem::take(&mut state.input);
+            if state.input_history.last() != Some(&request) {
+                state.input_history.push(request.clone());
+            }
+            state.input_history_index = None;
+            state.input_history_draft.clear();
             state.cursor = 0;
             state.run_status = TuiRunStatus::Running;
             state.pending_human_input = None;
@@ -1634,6 +1813,64 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             state.session_search.clear();
             state.selected_session = 0;
             state.insert('/');
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Left,
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }) => {
+            state.move_cursor_word_left();
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Right,
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }) => {
+            state.move_cursor_word_right();
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Home,
+            ..
+        }) if !state.input.is_empty() => {
+            state.move_cursor_to_line_start();
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::End, ..
+        }) if !state.input.is_empty() => {
+            state.move_cursor_to_line_end();
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Char('u'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }) => {
+            state.delete_current_line();
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Char('z'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }) => {
+            state.undo_edit();
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Up, ..
+        }) if state.input.is_empty() || state.input_history_index.is_some() => {
+            state.browse_input_history(true);
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Down,
+            ..
+        }) if state.input_history_index.is_some() => {
+            state.browse_input_history(false);
             None
         }
         AppAction::Key(KeyEvent {
@@ -1734,6 +1971,19 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 state.conversation_scroll_from_bottom.saturating_sub(10);
             None
         }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Home,
+            ..
+        }) => {
+            state.conversation_scroll_from_bottom = u16::MAX;
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::End, ..
+        }) => {
+            state.conversation_scroll_from_bottom = 0;
+            None
+        }
         AppAction::Key(_) => None,
     }
 }
@@ -1790,7 +2040,7 @@ fn execute_selected_slash_command(state: &mut AppState) -> SlashCommandExecution
             state.session_search.clear();
             state.focused_panel = FocusedPanel::Conversation;
             state.selected_session = state
-                .sessions
+                .filtered_sessions()
                 .iter()
                 .position(|session| Some(session.id.to_string()) == state.session_id)
                 .unwrap_or_default();
@@ -1800,6 +2050,53 @@ fn execute_selected_slash_command(state: &mut AppState) -> SlashCommandExecution
             state.messages.push(Message {
                 role: MessageRole::Assistant,
                 content: format!("Jux {}", jux_core::version()),
+            });
+            SlashCommandExecution::Executed(None)
+        }
+        SlashCommand::Retry if state.run_status == TuiRunStatus::Failed => state
+            .runs
+            .last()
+            .map(|run| run.request.clone())
+            .or_else(|| {
+                state
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == MessageRole::User)
+                    .map(|message| message.content.clone())
+            })
+            .map_or(SlashCommandExecution::Executed(None), |request| {
+                state.run_status = TuiRunStatus::Running;
+                state.messages.push(Message {
+                    role: MessageRole::User,
+                    content: request.clone(),
+                });
+                SlashCommandExecution::Executed(Some(AppCommand::StartRun { request }))
+            }),
+        SlashCommand::Continue if state.run_status == TuiRunStatus::Canceled => state
+            .runs
+            .last()
+            .map(|run| run.request.clone())
+            .or_else(|| {
+                state
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == MessageRole::User)
+                    .map(|message| message.content.clone())
+            })
+            .map_or(SlashCommandExecution::Executed(None), |request| {
+                state.run_status = TuiRunStatus::Running;
+                state.messages.push(Message {
+                    role: MessageRole::User,
+                    content: request.clone(),
+                });
+                SlashCommandExecution::Executed(Some(AppCommand::StartRun { request }))
+            }),
+        SlashCommand::Retry | SlashCommand::Continue => {
+            state.messages.push(Message {
+                role: MessageRole::Error,
+                content: "The current run cannot be restarted in this state.".to_owned(),
             });
             SlashCommandExecution::Executed(None)
         }
@@ -1915,6 +2212,7 @@ fn handle_mouse_event(
                 None
             } else {
                 state.text_selection = Some(selection);
+                state.notify("Copied to clipboard");
                 Some(AppCommand::CopyText { content })
             }
         }
