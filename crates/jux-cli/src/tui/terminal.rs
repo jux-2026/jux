@@ -1,8 +1,10 @@
+use super::ui::conversation_max_scroll;
 use super::{
     AppAction, AppCommand, AppState, BackgroundRun, RunHandler, RunResponse, TuiRunRequest,
     TuiRuntimeInfo, TuiViewport, execute_code_change_command, execute_session_command,
     load_active_session_history, render_app, update,
 };
+use super::{EventHandler, TuiEvent};
 use anyhow::Result;
 use crossterm::Command;
 use crossterm::event::{
@@ -24,6 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[allow(dead_code)]
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 // SGR mouse reports are drained from the PTY in one iteration below; retain a
 // short grace period so an isolated Escape remains responsive.
@@ -115,9 +118,26 @@ fn run_app_loop(
     run_handler: Arc<dyn RunHandler>,
 ) -> Result<()> {
     let mut active_run: Option<BackgroundRun> = None;
-    let mut event_decoder = TerminalEventDecoder::default();
+    let event_handler = EventHandler::new();
+    // Temporary 10 FPS cap for comparing terminal output responsiveness.
+    let target_frame = Duration::from_millis(100);
+    let mut next_frame = Instant::now();
+    let mut pending_scroll_delta: i32 = 0;
     while !state.should_quit {
-        terminal.draw(|frame| render_app(frame, state))?;
+        if Instant::now() >= next_frame {
+            if pending_scroll_delta != 0 {
+                state.apply_scroll_delta(pending_scroll_delta);
+                pending_scroll_delta = 0;
+            }
+            let size = terminal.size()?;
+            let conversation_width = state.conversation_panel_width(size.width);
+            let area = ratatui::layout::Rect::new(0, 0, conversation_width, size.height);
+            state.clamp_conversation_scroll_to(conversation_max_scroll(state, area));
+            let draw_started = Instant::now();
+            terminal.draw(|frame| render_app(frame, state))?;
+            let draw_elapsed = draw_started.elapsed();
+            next_frame = Instant::now() + target_frame.max(draw_elapsed);
+        }
         while let Some(event) = active_run.as_ref().and_then(BackgroundRun::try_recv_event) {
             update(state, AppAction::AgentEvent(event));
         }
@@ -133,7 +153,28 @@ fn run_app_loop(
             }
             continue;
         }
-        if let Some(event) = read_terminal_event(&mut event_decoder)? {
+        if let Ok(event) = event_handler.recv() {
+            let event = match event {
+                TuiEvent::ScrollDelta { delta, .. } => {
+                    let starts_new_scroll = pending_scroll_delta == 0;
+                    pending_scroll_delta = pending_scroll_delta.saturating_add(delta);
+                    if starts_new_scroll && pending_scroll_delta != 0 {
+                        next_frame = Instant::now();
+                    }
+                    continue;
+                }
+                TuiEvent::Terminal(event) => event,
+                TuiEvent::Closed => break,
+            };
+            // Clicks, drags, and keyboard input must be visible immediately;
+            // only wheel bursts are intentionally deferred/coalesced.
+            if !matches!(event, Event::Mouse(mouse) if matches!(
+                mouse.kind,
+                crossterm::event::MouseEventKind::ScrollUp
+                    | crossterm::event::MouseEventKind::ScrollDown
+            )) {
+                next_frame = Instant::now();
+            }
             let action = match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => Some(AppAction::Key(key)),
                 Event::Mouse(event) => {
@@ -192,6 +233,7 @@ fn run_app_loop(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn read_terminal_event(decoder: &mut TerminalEventDecoder) -> Result<Option<Event>> {
     let now = Instant::now();
     if let Some(event) = decoder.next(now) {
@@ -244,6 +286,7 @@ impl TerminalEventDecoder {
         self.ready.pop_front()
     }
 
+    #[allow(dead_code)]
     fn poll_timeout(&self, now: Instant, maximum: Duration) -> Duration {
         self.pending_escape.as_ref().map_or(maximum, |pending| {
             pending.deadline.saturating_duration_since(now).min(maximum)

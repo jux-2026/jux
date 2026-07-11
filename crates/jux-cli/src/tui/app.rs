@@ -335,6 +335,22 @@ impl AppState {
         self.conversation_scroll_from_bottom
     }
 
+    pub(crate) fn apply_scroll_delta(&mut self, delta: i32) {
+        if delta >= 0 {
+            self.conversation_scroll_from_bottom = self
+                .conversation_scroll_from_bottom
+                .saturating_add(delta as u16);
+        } else {
+            self.conversation_scroll_from_bottom = self
+                .conversation_scroll_from_bottom
+                .saturating_sub(delta.unsigned_abs() as u16);
+        }
+    }
+
+    pub(crate) fn clamp_conversation_scroll_to(&mut self, maximum: u16) {
+        self.conversation_scroll_from_bottom = self.conversation_scroll_from_bottom.min(maximum);
+    }
+
     #[must_use]
     pub fn help_visible(&self) -> bool {
         self.help_visible
@@ -1866,7 +1882,7 @@ fn slice_chars(line: &str, start: usize, end: usize) -> String {
 }
 
 fn conversation_text_lines(state: &AppState) -> Vec<String> {
-    let mut lines = vec!["What should Jux work on?".to_owned(), String::new()];
+    let mut lines = Vec::new();
     for message in state.messages() {
         match message.role {
             MessageRole::User => {
@@ -1907,9 +1923,6 @@ fn conversation_text_lines(state: &AppState) -> Vec<String> {
     if !state.timeline().is_empty() {
         lines.push(String::new());
     }
-    lines.push(String::new());
-    lines.push("No active run.".to_owned());
-    lines.push("Use the CLI subcommands for run, skills, and session inspection.".to_owned());
     lines
 }
 

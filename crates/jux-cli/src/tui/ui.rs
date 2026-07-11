@@ -2,7 +2,7 @@ use super::{
     AppState, FocusedPanel, MessageRole, SelectionPanel, TextSelectionPoint, TimelineStatus,
     TuiCodeChangeResult, TuiRunStatus,
 };
-use jux_core::{HumanInputKind, StepKind};
+use jux_core::HumanInputKind;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style};
@@ -39,6 +39,16 @@ struct ConversationLayout {
 
 pub fn render_app(frame: &mut Frame<'_>, state: &AppState) {
     render_workspace(frame, state, frame.area());
+}
+
+pub(crate) fn conversation_max_scroll(state: &AppState, area: Rect) -> u16 {
+    let layout = conversation_layout(state, area);
+    let (_, scroll) = prompt_panel(
+        state,
+        layout.history.width.saturating_sub(2),
+        layout.history.height.saturating_sub(2),
+    );
+    scroll.total_rows.saturating_sub(scroll.visible_rows)
 }
 
 fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: ratatui::layout::Rect) {
@@ -106,14 +116,18 @@ fn conversation_layout(state: &AppState, area: Rect) -> ConversationLayout {
     let scrollbar_x = area.x.saturating_add(area.width.saturating_sub(1));
     ConversationLayout {
         history: Rect::new(area.x, area.y, area.width, input_y.saturating_sub(area.y)),
-        input: Rect::new(area.x, input_y, area.width.saturating_sub(1), input_height),
-        status: Rect::new(
-            area.x,
-            status_y,
-            area.width.saturating_sub(1),
-            status_height,
+        input: Rect::new(area.x, input_y, area.width, input_height),
+        status: Rect::new(area.x, status_y, area.width, status_height),
+        // The scrollbar tracks only the scrollable history region. Input and
+        // status are fixed rows and must not affect thumb position/size.
+        scrollbar: Rect::new(
+            scrollbar_x,
+            area.y.saturating_add(CONVERSATION_PADDING),
+            u16::from(area.width > 0),
+            input_y
+                .saturating_sub(area.y)
+                .saturating_sub(CONVERSATION_PADDING.saturating_mul(2)),
         ),
-        scrollbar: Rect::new(scrollbar_x, area.y, u16::from(area.width > 0), area.height),
     }
 }
 
@@ -253,7 +267,7 @@ fn prompt_panel(
     content_width: u16,
     visible_rows: u16,
 ) -> (Paragraph<'_>, ConversationScroll) {
-    let mut lines = vec![Line::from("What should Jux work on?"), Line::from("")];
+    let mut lines = Vec::new();
     for message in state.messages() {
         match message.role {
             MessageRole::User => {
@@ -313,19 +327,6 @@ fn prompt_panel(
         }
     }
     if !state.timeline().is_empty() {
-        lines.push(Line::from(""));
-    }
-    for step in state.steps() {
-        let label = match step.kind {
-            StepKind::UserMessage => "User message",
-            StepKind::AssistantResponse => "Assistant response",
-            StepKind::ToolResult => "Tool result",
-            StepKind::SkillExecution => "Skill execution",
-            StepKind::Error => "Error",
-        };
-        lines.push(Line::from(format!("Step  {label}")));
-    }
-    if !state.steps().is_empty() {
         lines.push(Line::from(""));
     }
     if let Some(request) = state.pending_human_input() {
@@ -402,36 +403,26 @@ fn prompt_panel(
         }
         lines.push(Line::from(""));
     }
-    lines.extend([
-        Line::from(""),
-        Line::from("No active run."),
-        Line::from("Use the CLI subcommands for run, skills, and session inspection."),
-    ]);
     let lines = apply_text_selection(state, SelectionPanel::Conversation, 0, lines);
-    let total_rows = wrapped_line_count(&lines, content_width);
-    let maximum = total_rows.saturating_sub(visible_rows);
-    let offset = maximum.saturating_sub(state.conversation_scroll_from_bottom().min(maximum));
+    let paragraph = Paragraph::new(lines)
+        .block(panel_block(CONVERSATION_BACKGROUND, CONVERSATION_PADDING))
+        .style(Style::default().bg(CONVERSATION_BACKGROUND))
+        .wrap(Wrap { trim: false });
+    // `line_count` receives the full Paragraph area width and accounts for the
+    // block's inner padding itself.
+    let total_rows = paragraph.line_count(content_width.saturating_add(2));
+    let maximum = total_rows.saturating_sub(usize::from(visible_rows));
+    let offset =
+        maximum.saturating_sub(usize::from(state.conversation_scroll_from_bottom()).min(maximum));
     let scroll = ConversationScroll {
-        offset,
-        total_rows,
+        offset: u16::try_from(offset).unwrap_or(u16::MAX),
+        total_rows: u16::try_from(total_rows).unwrap_or(u16::MAX),
         visible_rows,
     };
     (
-        Paragraph::new(lines)
-            .block(panel_block(CONVERSATION_BACKGROUND, CONVERSATION_PADDING))
-            .style(Style::default().bg(CONVERSATION_BACKGROUND))
-            .scroll((offset, 0))
-            .wrap(Wrap { trim: false }),
+        paragraph.scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
         scroll,
     )
-}
-
-fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> u16 {
-    let width = usize::from(width.max(1));
-    lines.iter().fold(0_u16, |total, line| {
-        let rows = line.width().max(1).div_ceil(width);
-        total.saturating_add(u16::try_from(rows).unwrap_or(u16::MAX))
-    })
 }
 
 fn render_conversation_scrollbar(frame: &mut Frame<'_>, area: Rect, scroll: ConversationScroll) {
@@ -449,7 +440,12 @@ fn render_conversation_scrollbar(frame: &mut Frame<'_>, area: Rect, scroll: Conv
         )
         .thumb_symbol("█")
         .thumb_style(Style::default().fg(Color::Gray).bg(CONVERSATION_BACKGROUND));
-    let mut scrollbar_state = ScrollbarState::new(usize::from(scroll.total_rows))
+    // Ratatui 0.29 models `content_length` as the range of possible positions,
+    // then adds `viewport_content_length` when calculating the thumb. Our
+    // position is a viewport offset, so its range is `0..=maximum`, not the
+    // number of rendered rows.
+    let maximum = scroll.total_rows.saturating_sub(scroll.visible_rows);
+    let mut scrollbar_state = ScrollbarState::new(usize::from(maximum.saturating_add(1)))
         .position(usize::from(scroll.offset))
         .viewport_content_length(usize::from(scroll.visible_rows));
     frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);

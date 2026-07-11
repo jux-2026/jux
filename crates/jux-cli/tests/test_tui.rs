@@ -370,7 +370,7 @@ fn tui_displays_the_agent_response() {
             .expect("second assistant response is rendered");
     assert_eq!(
         find_fragment_position(&buffer, "User request"),
-        Some((5, 2))
+        Some((3, 2))
     );
     assert_eq!(
         buffer.cell((1, user_row)).map(|cell| cell.symbol()),
@@ -534,7 +534,16 @@ fn tui_keeps_input_and_status_fixed_beside_the_full_height_scrollbar() {
     assert_eq!(input_position.1, 1);
     assert_row_has_background(&initial, 22, 0, 47, input_background());
     assert_row_has_background(&initial, 23, 0, 47, status_bar_background());
-    assert_full_height_scrollbar(&initial, 47);
+    assert!((1..18).all(|row| {
+        initial
+            .cell((47, row))
+            .is_some_and(|cell| matches!(cell.symbol(), "█" | "│"))
+    }));
+    assert!((18..24).all(|row| {
+        initial
+            .cell((47, row))
+            .is_some_and(|cell| !matches!(cell.symbol(), "█" | "│"))
+    }));
 
     update(
         &mut state,
@@ -555,7 +564,11 @@ fn tui_keeps_input_and_status_fixed_beside_the_full_height_scrollbar() {
         find_fragment_position(&scrolled, "Shift+Enter newline"),
         Some(status_position)
     );
-    assert_full_height_scrollbar(&scrolled, 47);
+    assert!((1..18).all(|row| {
+        scrolled
+            .cell((47, row))
+            .is_some_and(|cell| matches!(cell.symbol(), "█" | "│"))
+    }));
 }
 
 #[test]
@@ -2007,8 +2020,8 @@ fn tui_displays_persisted_steps_in_id_order() {
         "workspace-0001-000001-000002"
     );
     let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&buffer, "User message");
-    assert_buffer_contains(&buffer, "Tool result");
+    assert_buffer_does_not_contain(&buffer, "Step  User message");
+    assert_buffer_does_not_contain(&buffer, "Step  Tool result");
 }
 
 #[test]
@@ -2042,7 +2055,6 @@ fn tui_shell_renders_workspace_and_idle_status() {
     let buffer = render_to_buffer(&state, 80, 24);
 
     assert_buffer_contains(&buffer, "Jux");
-    assert_buffer_contains(&buffer, "What should Jux work on?");
     assert_buffer_contains(&buffer, "Workspace: /workspace");
     assert_buffer_contains(&buffer, "Status: Idle");
     assert_buffer_contains(&buffer, "Quit: Ctrl+C");
@@ -2052,11 +2064,6 @@ fn tui_shell_renders_workspace_and_idle_status() {
     assert_buffer_does_not_contain(&buffer, "conversation");
     assert_buffer_does_not_contain(&buffer, "status");
     assert_buffer_has_no_panel_frames(&buffer);
-    assert_buffer_fragment_has_background(
-        &buffer,
-        "What should Jux work on?",
-        conversation_background(),
-    );
     assert_buffer_fragment_has_background(&buffer, "Workspace: /workspace", sidebar_background());
     assert_eq!(find_fragment_position(&buffer, "Session: -"), Some((4, 51)));
     assert_eq!(find_fragment_position(&buffer, "▶"), Some((12, 48)));
@@ -2096,17 +2103,19 @@ fn tui_returns_focus_to_the_conversation_with_left_arrow() {
 
     assert_eq!(state.focused_panel(), FocusedPanel::Conversation);
     let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_fragment_has_background(
-        &buffer,
-        "What should Jux work on?",
-        conversation_background(),
-    );
+    assert_buffer_fragment_has_background(&buffer, "Workspace: /workspace", sidebar_background());
     assert_input_block_has_background(&buffer, "> Start typing", input_active_background());
 }
 
 #[test]
 fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
     let mut state = AppState::new("/workspace");
+    update(
+        &mut state,
+        AppAction::AssistantMessage {
+            content: "Selectable message".to_owned(),
+        },
+    );
     let viewport = TuiViewport {
         width: 100,
         height: 24,
@@ -2137,7 +2146,7 @@ fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
     assert_eq!(
         command,
         Some(AppCommand::CopyText {
-            content: "What should Jux work on?".to_owned(),
+            content: "Jux".to_owned(),
         })
     );
     assert_eq!(
@@ -2145,12 +2154,7 @@ fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
         Some(SelectionPanel::Conversation)
     );
     let buffer = render_to_buffer(&state, 100, 24);
-    assert_buffer_fragment_has_fg_bg(
-        &buffer,
-        "What should Jux work on?",
-        Color::Black,
-        Color::Yellow,
-    );
+    assert_buffer_fragment_has_fg_bg(&buffer, "Jux", Color::Black, Color::Yellow);
     let completed_selection = state.text_selection();
     let command = update(
         &mut state,
@@ -2525,14 +2529,6 @@ fn scrollbar_thumb_start(buffer: &Buffer, column: u16) -> u16 {
                 .is_some_and(|cell| cell.symbol() == "█")
         })
         .expect("conversation scrollbar thumb is rendered")
-}
-
-fn assert_full_height_scrollbar(buffer: &Buffer, column: u16) {
-    assert!((0..buffer.area().height).all(|row| {
-        buffer
-            .cell((column, row))
-            .is_some_and(|cell| matches!(cell.symbol(), "█" | "│"))
-    }));
 }
 
 fn assert_buffer_fragment_has_fg_bg(buffer: &Buffer, expected: &str, fg: Color, bg: Color) {

@@ -1,4 +1,5 @@
 mod app;
+mod events;
 mod runtime;
 mod terminal;
 mod ui;
@@ -10,6 +11,7 @@ pub use self::app::{
     TuiViewport, execute_code_change_command, execute_session_command, load_active_session_history,
     update,
 };
+pub use self::events::{EventHandler, TuiEvent};
 pub use self::runtime::{AgentEventSender, BackgroundRun, RunHandler, RunResponse, TuiRunRequest};
 pub use self::terminal::{TerminalEventDecoder, run_tui};
 pub use self::ui::render_app;
