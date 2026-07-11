@@ -11,5 +11,5 @@ pub use self::app::{
     update,
 };
 pub use self::runtime::{AgentEventSender, BackgroundRun, RunHandler, RunResponse, TuiRunRequest};
-pub use self::terminal::run_tui;
+pub use self::terminal::{TerminalEventDecoder, run_tui};
 pub use self::ui::render_app;

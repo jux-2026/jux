@@ -15,7 +15,7 @@ rust-version = "1.91"
 [workspace.dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.39", features = ["derive", "env"] }
-crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
+crossterm = { version = "0.28.1", features = ["bracketed-paste"] }
 jux-core = { path = "crates/jux-core" }
 mlua = { version = "0.11.5", features = ["lua54", "vendored"] }
 rig-core = "0.36.0"

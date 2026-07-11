@@ -1,11 +1,11 @@
 use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use jux_cli::tui::{
     AgentEventSender, AppAction, AppCommand, AppState, BackgroundRun, FocusedPanel, Message,
-    MessageRole, RunResponse, SelectionPanel, TuiRunRequest, TuiRunStatus, TuiRuntimeInfo,
-    TuiSandboxSummary, TuiViewport, execute_code_change_command, execute_session_command,
-    load_active_session_history, render_app, update,
+    MessageRole, RunResponse, SelectionPanel, TerminalEventDecoder, TuiRunRequest, TuiRunStatus,
+    TuiRuntimeInfo, TuiSandboxSummary, TuiViewport, execute_code_change_command,
+    execute_session_command, load_active_session_history, render_app, update,
 };
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AssistantResponseItem,
@@ -20,7 +20,102 @@ use ratatui::layout::Position;
 use ratatui::style::Color;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[test]
+fn tui_recovers_a_fragmented_sgr_mouse_report() {
+    let mut decoder = TerminalEventDecoder::default();
+    let started_at = Instant::now();
+    decoder.push(
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        started_at,
+    );
+    for (index, character) in "[<65;113;52M".chars().enumerate() {
+        decoder.push(
+            Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+            started_at + Duration::from_millis(index as u64 + 1),
+        );
+    }
+
+    assert_eq!(
+        decoder.next(started_at + Duration::from_millis(15)),
+        Some(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 112,
+            row: 51,
+            modifiers: KeyModifiers::NONE,
+        }))
+    );
+    assert_eq!(decoder.next(started_at + Duration::from_millis(15)), None);
+}
+
+#[test]
+fn tui_preserves_an_isolated_escape_key_after_the_mouse_sequence_timeout() {
+    let mut decoder = TerminalEventDecoder::default();
+    let started_at = Instant::now();
+    let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    decoder.push(escape.clone(), started_at);
+
+    assert_eq!(decoder.next(started_at + Duration::from_millis(24)), None);
+    assert_eq!(
+        decoder.next(started_at + Duration::from_millis(25)),
+        Some(escape)
+    );
+}
+
+#[test]
+fn tui_recovers_a_mouse_tail_after_crossterm_already_emitted_escape() {
+    let mut decoder = TerminalEventDecoder::default();
+    let started_at = Instant::now();
+    let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    decoder.push(escape.clone(), started_at);
+    assert_eq!(
+        decoder.next(started_at + Duration::from_millis(25)),
+        Some(escape)
+    );
+
+    for (index, character) in "[<64;113;52M".chars().enumerate() {
+        decoder.push(
+            Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+            started_at + Duration::from_millis(index as u64 + 250),
+        );
+    }
+
+    assert_eq!(
+        decoder.next(started_at + Duration::from_millis(265)),
+        Some(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 112,
+            row: 51,
+            modifiers: KeyModifiers::NONE,
+        }))
+    );
+}
+
+#[test]
+fn tui_preserves_text_after_escape_when_it_is_not_a_mouse_report() {
+    let mut decoder = TerminalEventDecoder::default();
+    let started_at = Instant::now();
+    let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let bracket = Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+    let letter = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    decoder.push(escape.clone(), started_at);
+    decoder.push(bracket.clone(), started_at + Duration::from_millis(1));
+    decoder.push(letter.clone(), started_at + Duration::from_millis(2));
+
+    assert_eq!(
+        decoder.next(started_at + Duration::from_millis(2)),
+        Some(escape)
+    );
+    assert_eq!(
+        decoder.next(started_at + Duration::from_millis(2)),
+        Some(bracket)
+    );
+    assert_eq!(
+        decoder.next(started_at + Duration::from_millis(2)),
+        Some(letter)
+    );
+}
 
 #[test]
 fn tui_accepts_q_as_text_input() {
@@ -63,14 +158,14 @@ fn tui_accepts_multiline_text_input() {
     assert_row_has_background(
         &newline_buffer,
         first_line_row.saturating_sub(1),
-        1,
+        0,
         47,
         input_background(),
     );
     assert_row_has_background(
         &newline_buffer,
         newline_cursor.y.saturating_add(1),
-        1,
+        0,
         47,
         input_background(),
     );
@@ -179,8 +274,8 @@ fn tui_displays_the_input_cursor_at_the_editing_position() {
     type_text(&mut state, "你");
 
     let single_line = render_to_buffer(&state, 80, 24);
-    assert_eq!(find_fragment_position(&single_line, "> 你"), Some((21, 2)));
-    assert_eq!(render_cursor_position(&state, 80, 24), Position::new(6, 21));
+    assert_eq!(find_fragment_position(&single_line, "> 你"), Some((21, 1)));
+    assert_eq!(render_cursor_position(&state, 80, 24), Position::new(5, 21));
 
     update(
         &mut state,
@@ -188,7 +283,7 @@ fn tui_displays_the_input_cursor_at_the_editing_position() {
     );
     type_text(&mut state, "a");
 
-    assert_eq!(render_cursor_position(&state, 80, 24), Position::new(5, 21));
+    assert_eq!(render_cursor_position(&state, 80, 24), Position::new(4, 21));
 }
 
 #[test]
@@ -324,18 +419,143 @@ fn tui_scrolls_through_messages_longer_than_the_viewport() {
     }
 
     let initial = render_to_buffer(&state, 80, 24);
-    assert_buffer_does_not_contain(&initial, "response-8");
+    assert_buffer_contains(&initial, "response-11");
+    assert_buffer_does_not_contain(&initial, "response-0");
+    let initial_thumb_row = scrollbar_thumb_start(&initial, 47);
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::ScrollUp, 10, 10),
+            viewport: TuiViewport {
+                width: 80,
+                height: 24,
+            },
+        },
     );
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::ScrollUp, 10, 10),
+            viewport: TuiViewport {
+                width: 80,
+                height: 24,
+            },
+        },
     );
     let scrolled = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&scrolled, "response-8");
+    assert_buffer_contains(&scrolled, "response-5");
+    assert_buffer_does_not_contain(&scrolled, "response-11");
+    assert!(scrollbar_thumb_start(&scrolled, 47) < initial_thumb_row);
+    update(
+        &mut state,
+        AppAction::AssistantMessage {
+            content: "response-12".to_owned(),
+        },
+    );
+    assert_eq!(state.conversation_scroll_from_bottom(), 10);
+    assert_buffer_does_not_contain(&render_to_buffer(&state, 80, 24), "response-12");
+
+    for _ in 0..2 {
+        update(
+            &mut state,
+            AppAction::Mouse {
+                event: mouse_event(MouseEventKind::ScrollDown, 10, 10),
+                viewport: TuiViewport {
+                    width: 80,
+                    height: 24,
+                },
+            },
+        );
+    }
+    let returned_to_bottom = render_to_buffer(&state, 80, 24);
+    assert_buffer_contains(&returned_to_bottom, "response-12");
+    assert_eq!(state.conversation_scroll_from_bottom(), 0);
+
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::ScrollUp, 70, 10),
+            viewport: TuiViewport {
+                width: 80,
+                height: 24,
+            },
+        },
+    );
+    assert_eq!(state.conversation_scroll_from_bottom(), 0);
+
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::ScrollUp, 0, 23),
+            viewport: TuiViewport {
+                width: 80,
+                height: 24,
+            },
+        },
+    );
+    assert_eq!(state.conversation_scroll_from_bottom(), 5);
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::ScrollDown, 47, 23),
+            viewport: TuiViewport {
+                width: 80,
+                height: 24,
+            },
+        },
+    );
+    assert_eq!(state.conversation_scroll_from_bottom(), 0);
+}
+
+#[test]
+fn tui_keeps_input_and_status_fixed_beside_the_full_height_scrollbar() {
+    let mut state = AppState::new("/workspace");
+    for index in 0..12 {
+        update(
+            &mut state,
+            AppAction::AssistantMessage {
+                content: format!("response-{index}"),
+            },
+        );
+    }
+    type_text(&mut state, "draft");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+    );
+
+    let initial = render_to_buffer(&state, 80, 24);
+    let input_position =
+        find_fragment_position(&initial, "> draft").expect("input is rendered above status");
+    let status_position =
+        find_fragment_position(&initial, "Shift+Enter newline").expect("status bar is rendered");
+    assert_eq!(status_position.0, 23);
+    assert_eq!(input_position.1, 1);
+    assert_row_has_background(&initial, 22, 0, 47, input_background());
+    assert_row_has_background(&initial, 23, 0, 47, status_bar_background());
+    assert_full_height_scrollbar(&initial, 47);
+
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(MouseEventKind::ScrollUp, 10, 10),
+            viewport: TuiViewport {
+                width: 80,
+                height: 24,
+            },
+        },
+    );
+    let scrolled = render_to_buffer(&state, 80, 24);
+    assert_eq!(
+        find_fragment_position(&scrolled, "> draft"),
+        Some(input_position)
+    );
+    assert_eq!(
+        find_fragment_position(&scrolled, "Shift+Enter newline"),
+        Some(status_position)
+    );
+    assert_full_height_scrollbar(&scrolled, 47);
 }
 
 #[test]
@@ -826,7 +1046,7 @@ fn tui_shows_filters_and_dismisses_slash_command_suggestions() {
     assert_buffer_contains(&initial, "/new");
     assert_buffer_contains(&initial, "Start a new session");
     assert_buffer_contains(&initial, "/version");
-    assert_eq!(find_fragment_position(&initial, "/new"), Some((17, 2)));
+    assert_eq!(find_fragment_position(&initial, "/new"), Some((17, 1)));
     assert_buffer_fragment_has_fg_bg(&initial, "/new", Color::Black, Color::Cyan);
     let (selected_row, selected_start) =
         find_fragment_position(&initial, "/new").expect("selected command is rendered");
@@ -850,6 +1070,7 @@ fn tui_shows_filters_and_dismisses_slash_command_suggestions() {
     );
     let dismissed = render_to_buffer(&state, 80, 24);
     assert_buffer_does_not_contain(&dismissed, "Show the Jux version");
+    assert_buffer_does_not_contain(&dismissed, "Press Esc again");
     assert_eq!(state.input_text(), "/ver");
 }
 
@@ -863,7 +1084,7 @@ fn tui_selects_and_executes_the_version_slash_command() {
         AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
     let selected = render_to_buffer(&state, 80, 24);
-    assert_eq!(find_fragment_position(&selected, "/version"), Some((18, 2)));
+    assert_eq!(find_fragment_position(&selected, "/version"), Some((18, 1)));
     assert_buffer_fragment_has_fg_bg(&selected, "/version", Color::Black, Color::Cyan);
     let command = update(
         &mut state,
@@ -954,6 +1175,17 @@ fn tui_cancels_the_running_run_with_escape() {
         AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
+    let first_command = update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    );
+    assert_eq!(first_command, None);
+    assert_eq!(state.run_status(), TuiRunStatus::Running);
+    assert_buffer_contains(
+        &render_to_buffer(&state, 80, 24),
+        "Press Esc again to interrupt the current run",
+    );
+
     let command = update(
         &mut state,
         AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -964,6 +1196,33 @@ fn tui_cancels_the_running_run_with_escape() {
     assert_eq!(state.run_status(), TuiRunStatus::Canceled);
     let buffer = render_to_buffer(&state, 80, 24);
     assert_buffer_contains(&buffer, "Status: Canceled");
+}
+
+#[test]
+fn tui_clears_input_with_double_escape_while_not_running() {
+    let mut state = AppState::new("/workspace");
+    type_text(&mut state, "draft request");
+
+    let first_command = update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    );
+
+    assert_eq!(first_command, None);
+    assert_eq!(state.input_text(), "draft request");
+    assert_buffer_contains(
+        &render_to_buffer(&state, 80, 24),
+        "Press Esc again to clear the input",
+    );
+
+    let second_command = update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    );
+
+    assert_eq!(second_command, None);
+    assert_eq!(state.input_text(), "");
+    assert_buffer_does_not_contain(&render_to_buffer(&state, 80, 24), "Press Esc again");
 }
 
 #[test]
@@ -2258,6 +2517,24 @@ fn assert_row_has_background(buffer: &Buffer, y: u16, start: u16, end: u16, back
     );
 }
 
+fn scrollbar_thumb_start(buffer: &Buffer, column: u16) -> u16 {
+    (0..buffer.area().height)
+        .find(|row| {
+            buffer
+                .cell((column, *row))
+                .is_some_and(|cell| cell.symbol() == "█")
+        })
+        .expect("conversation scrollbar thumb is rendered")
+}
+
+fn assert_full_height_scrollbar(buffer: &Buffer, column: u16) {
+    assert!((0..buffer.area().height).all(|row| {
+        buffer
+            .cell((column, row))
+            .is_some_and(|cell| matches!(cell.symbol(), "█" | "│"))
+    }));
+}
+
 fn assert_buffer_fragment_has_fg_bg(buffer: &Buffer, expected: &str, fg: Color, bg: Color) {
     let mut found = false;
     let area = *buffer.area();
@@ -2375,4 +2652,8 @@ fn user_message_background() -> Color {
 
 fn input_background() -> Color {
     Color::Rgb(20, 38, 48)
+}
+
+fn status_bar_background() -> Color {
+    Color::Rgb(18, 28, 36)
 }

@@ -10,6 +10,7 @@ use jux_core::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 use super::RunResponse;
@@ -17,6 +18,20 @@ use super::RunResponse;
 const DEFAULT_CONVERSATION_WIDTH_PERCENT: u16 = 60;
 const MIN_PANEL_WIDTH: u16 = 20;
 const DIVIDER_WIDTH: u16 = 1;
+const MOUSE_SCROLL_LINES: u16 = 5;
+const ESCAPE_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EscapeAction {
+    ClearInput,
+    InterruptRun,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingEscapeAction {
+    action: EscapeAction,
+    expires_at: Instant,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SlashCommand {
@@ -56,7 +71,7 @@ pub struct AppState {
     input: String,
     cursor: usize,
     messages: Vec<Message>,
-    message_scroll: u16,
+    conversation_scroll_from_bottom: u16,
     help_visible: bool,
     run_status: TuiRunStatus,
     session_id: Option<String>,
@@ -94,6 +109,7 @@ pub struct AppState {
     conversation_width_percent: u16,
     selected_slash_command: usize,
     slash_commands_dismissed: bool,
+    pending_escape_action: Option<PendingEscapeAction>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -246,7 +262,7 @@ impl AppState {
             input: String::new(),
             cursor: 0,
             messages: Vec::new(),
-            message_scroll: 0,
+            conversation_scroll_from_bottom: 0,
             help_visible: false,
             run_status: TuiRunStatus::Idle,
             session_id: None,
@@ -284,6 +300,7 @@ impl AppState {
             conversation_width_percent: DEFAULT_CONVERSATION_WIDTH_PERCENT,
             selected_slash_command: 0,
             slash_commands_dismissed: false,
+            pending_escape_action: None,
         }
     }
 
@@ -314,8 +331,8 @@ impl AppState {
     }
 
     #[must_use]
-    pub fn message_scroll(&self) -> u16 {
-        self.message_scroll
+    pub fn conversation_scroll_from_bottom(&self) -> u16 {
+        self.conversation_scroll_from_bottom
     }
 
     #[must_use]
@@ -514,6 +531,16 @@ impl AppState {
     }
 
     #[must_use]
+    pub(super) fn escape_confirmation_hint(&self) -> Option<&'static str> {
+        self.pending_escape_action
+            .filter(|pending| pending.expires_at >= Instant::now())
+            .map(|pending| match pending.action {
+                EscapeAction::ClearInput => "Press Esc again to clear the input",
+                EscapeAction::InterruptRun => "Press Esc again to interrupt the current run",
+            })
+    }
+
+    #[must_use]
     pub(super) fn conversation_panel_width(&self, viewport_width: u16) -> u16 {
         if viewport_width < 60 {
             return viewport_width;
@@ -556,6 +583,7 @@ impl AppState {
         self.cursor = 0;
         self.selected_slash_command = 0;
         self.slash_commands_dismissed = false;
+        self.pending_escape_action = None;
     }
 
     fn insert(&mut self, character: char) {
@@ -969,6 +997,13 @@ pub enum AppCommand {
 }
 
 pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
+    if matches!(
+        &action,
+        AppAction::Key(key) if key.kind != KeyEventKind::Release && key.code != KeyCode::Esc
+    ) || matches!(&action, AppAction::Mouse { .. })
+    {
+        state.pending_escape_action = None;
+    }
     match action {
         AppAction::Mouse { event, viewport } => handle_mouse_event(state, event, viewport),
         AppAction::Key(KeyEvent {
@@ -1036,6 +1071,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::RunFinished { response } => {
+            state.pending_escape_action = None;
             let waiting_for_human_input = response.status == RunStatus::WaitingForHumanInput;
             state.run_status = match response.status {
                 RunStatus::Running => TuiRunStatus::Running,
@@ -1069,6 +1105,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::RunFailed { error } => {
+            state.pending_escape_action = None;
             state.run_status = TuiRunStatus::Failed;
             state.runtime_logs.push(TuiRuntimeLog {
                 title: "Run failed".to_owned(),
@@ -1081,6 +1118,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::RunCanceled => {
+            state.pending_escape_action = None;
             state.run_status = TuiRunStatus::Canceled;
             state.runtime_logs.push(TuiRuntimeLog {
                 title: "Run canceled".to_owned(),
@@ -1091,12 +1129,14 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         AppAction::Key(KeyEvent {
             code: KeyCode::Esc, ..
         }) if !state.slash_command_suggestions().is_empty() => {
+            state.pending_escape_action = None;
             state.slash_commands_dismissed = true;
             None
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Esc, ..
         }) if state.log_panel_visible => {
+            state.pending_escape_action = None;
             state.log_panel_visible = false;
             state.focused_panel = FocusedPanel::Conversation;
             None
@@ -1104,13 +1144,14 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         AppAction::Key(KeyEvent {
             code: KeyCode::Esc, ..
         }) if state.skill_panel_visible => {
+            state.pending_escape_action = None;
             state.skill_panel_visible = false;
             state.focused_panel = FocusedPanel::Conversation;
             None
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Esc, ..
-        }) if state.run_status == TuiRunStatus::Running => Some(AppCommand::CancelRun),
+        }) => handle_escape(state, Instant::now()),
         AppAction::Key(key)
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
@@ -1286,7 +1327,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             if state.input.trim() == "/clear" {
                 state.clear_input();
                 state.messages.clear();
-                state.message_scroll = 0;
+                state.conversation_scroll_from_bottom = 0;
                 return None;
             }
             if state.input.trim() == "/help" {
@@ -1447,17 +1488,46 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             code: KeyCode::PageUp,
             ..
         }) => {
-            state.message_scroll = state.message_scroll.saturating_sub(10);
+            state.conversation_scroll_from_bottom =
+                state.conversation_scroll_from_bottom.saturating_add(10);
             None
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::PageDown,
             ..
         }) => {
-            state.message_scroll = state.message_scroll.saturating_add(10);
+            state.conversation_scroll_from_bottom =
+                state.conversation_scroll_from_bottom.saturating_sub(10);
             None
         }
         AppAction::Key(_) => None,
+    }
+}
+
+fn handle_escape(state: &mut AppState, now: Instant) -> Option<AppCommand> {
+    let action = if state.run_status == TuiRunStatus::Running {
+        EscapeAction::InterruptRun
+    } else {
+        EscapeAction::ClearInput
+    };
+    let confirmed = state
+        .pending_escape_action
+        .is_some_and(|pending| pending.action == action && pending.expires_at >= now);
+    if !confirmed {
+        state.pending_escape_action = Some(PendingEscapeAction {
+            action,
+            expires_at: now + ESCAPE_CONFIRMATION_WINDOW,
+        });
+        return None;
+    }
+
+    state.pending_escape_action = None;
+    match action {
+        EscapeAction::ClearInput => {
+            state.clear_input();
+            None
+        }
+        EscapeAction::InterruptRun => Some(AppCommand::CancelRun),
     }
 }
 
@@ -1503,6 +1573,23 @@ fn handle_mouse_event(
     event: MouseEvent,
     viewport: TuiViewport,
 ) -> Option<AppCommand> {
+    if conversation_area_contains(state, viewport, event.column, event.row) {
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                state.conversation_scroll_from_bottom = state
+                    .conversation_scroll_from_bottom
+                    .saturating_add(MOUSE_SCROLL_LINES);
+                return None;
+            }
+            MouseEventKind::ScrollDown => {
+                state.conversation_scroll_from_bottom = state
+                    .conversation_scroll_from_bottom
+                    .saturating_sub(MOUSE_SCROLL_LINES);
+                return None;
+            }
+            _ => {}
+        }
+    }
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if divider_column(state, viewport) == Some(event.column) {
@@ -1577,6 +1664,20 @@ fn handle_mouse_event(
     }
 }
 
+fn conversation_area_contains(
+    state: &AppState,
+    viewport: TuiViewport,
+    column: u16,
+    row: u16,
+) -> bool {
+    let width = if viewport.width < 60 {
+        viewport.width
+    } else {
+        state.conversation_panel_width(viewport.width)
+    };
+    column < width && row < viewport.height
+}
+
 fn divider_column(state: &AppState, viewport: TuiViewport) -> Option<u16> {
     (viewport.width >= 60).then(|| state.conversation_panel_width(viewport.width))
 }
@@ -1645,7 +1746,7 @@ fn selection_point_from_geometry(
     );
     let mut line = usize::from(clamped_row.saturating_sub(geometry.y));
     if geometry.panel == SelectionPanel::Conversation {
-        line = line.saturating_add(usize::from(state.message_scroll));
+        line = line.saturating_add(conversation_scroll_offset(state, geometry));
     }
     line = line.min(line_count.saturating_sub(1));
     let column = usize::from(clamped_column.saturating_sub(geometry.x))
@@ -1654,23 +1755,12 @@ fn selection_point_from_geometry(
 }
 
 fn panel_geometries(state: &AppState, viewport: TuiViewport) -> Vec<PanelGeometry> {
+    let conversation = conversation_geometry(state, viewport);
     if viewport.width < 60 {
-        return vec![content_geometry(
-            SelectionPanel::Conversation,
-            0,
-            0,
-            viewport.width,
-            viewport.height,
-        )];
+        return vec![conversation];
     }
     let left_width = state.conversation_panel_width(viewport.width);
-    let mut geometries = vec![content_geometry(
-        SelectionPanel::Conversation,
-        0,
-        0,
-        left_width,
-        viewport.height,
-    )];
+    let mut geometries = vec![conversation];
     if state.sidebar_visible {
         geometries.push(content_geometry(
             SelectionPanel::Sidebar,
@@ -1684,6 +1774,26 @@ fn panel_geometries(state: &AppState, viewport: TuiViewport) -> Vec<PanelGeometr
         ));
     }
     geometries
+}
+
+fn conversation_geometry(state: &AppState, viewport: TuiViewport) -> PanelGeometry {
+    let width = if viewport.width < 60 {
+        viewport.width
+    } else {
+        state.conversation_panel_width(viewport.width)
+    };
+    content_geometry(SelectionPanel::Conversation, 0, 0, width, viewport.height)
+}
+
+fn conversation_scroll_offset(state: &AppState, geometry: PanelGeometry) -> usize {
+    let width = usize::from(geometry.width.max(1));
+    let total_rows = state
+        .conversation_text_lines()
+        .iter()
+        .map(|line| UnicodeWidthStr::width(line.as_str()).max(1).div_ceil(width))
+        .sum::<usize>();
+    let maximum = total_rows.saturating_sub(usize::from(geometry.height));
+    maximum.saturating_sub(usize::from(state.conversation_scroll_from_bottom).min(maximum))
 }
 
 fn content_geometry(

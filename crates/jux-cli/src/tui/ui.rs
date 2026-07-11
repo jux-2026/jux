@@ -7,7 +7,9 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MAX_TIMELINE_DETAIL_CHARS: usize = 80;
@@ -16,8 +18,24 @@ const SIDEBAR_BACKGROUND: Color = Color::Rgb(18, 24, 32);
 const DIVIDER_BACKGROUND: Color = Color::Rgb(24, 32, 42);
 const COMMAND_POPUP_BACKGROUND: Color = Color::Rgb(28, 36, 46);
 const USER_MESSAGE_BACKGROUND: Color = Color::Rgb(24, 34, 44);
+const STATUS_BAR_BACKGROUND: Color = Color::Rgb(18, 28, 36);
 const CONVERSATION_PADDING: u16 = 1;
 const SIDEBAR_PADDING: u16 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConversationScroll {
+    offset: u16,
+    total_rows: u16,
+    visible_rows: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConversationLayout {
+    history: Rect,
+    input: Rect,
+    status: Rect,
+    scrollbar: Rect,
+}
 
 pub fn render_app(frame: &mut Frame<'_>, state: &AppState) {
     render_workspace(frame, state, frame.area());
@@ -25,8 +43,7 @@ pub fn render_app(frame: &mut Frame<'_>, state: &AppState) {
 
 fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: ratatui::layout::Rect) {
     if area.width < 60 {
-        frame.render_widget(prompt_panel(state, area.width.saturating_sub(2)), area);
-        render_input_area(frame, state, area, true);
+        render_conversation_panel(frame, state, area, true);
         return;
     }
     let conversation_width = state.conversation_panel_width(area.width);
@@ -38,11 +55,7 @@ fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: ratatui::layo
         area.height,
     );
     let conversation_focused = state.focused_panel() == FocusedPanel::Conversation;
-    frame.render_widget(
-        prompt_panel(state, conversation_area.width.saturating_sub(2)),
-        conversation_area,
-    );
-    render_input_area(frame, state, conversation_area, conversation_focused);
+    render_conversation_panel(frame, state, conversation_area, conversation_focused);
     render_divider(frame, divider_area, state.sidebar_visible());
     if !state.sidebar_visible() {
         return;
@@ -67,6 +80,40 @@ fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: ratatui::layo
         frame.render_widget(audit_panel(state), sidebar_area);
     } else {
         frame.render_widget(run_panel(state), sidebar_area);
+    }
+}
+
+fn render_conversation_panel(frame: &mut Frame<'_>, state: &AppState, area: Rect, active: bool) {
+    let layout = conversation_layout(state, area);
+    let (paragraph, scroll) = prompt_panel(
+        state,
+        layout.history.width.saturating_sub(2),
+        layout.history.height.saturating_sub(2),
+    );
+    frame.render_widget(paragraph, layout.history);
+    render_input_area(frame, state, layout, active);
+    render_status_bar(frame, state, layout.status);
+    render_conversation_scrollbar(frame, layout.scrollbar, scroll);
+}
+
+fn conversation_layout(state: &AppState, area: Rect) -> ConversationLayout {
+    let status_height = u16::from(area.height > 0);
+    let available_height = area.height.saturating_sub(status_height);
+    let input_line_count = state.input_text().split('\n').count().max(1) as u16;
+    let input_height = input_line_count.saturating_add(2).min(available_height);
+    let status_y = area.y.saturating_add(available_height);
+    let input_y = status_y.saturating_sub(input_height);
+    let scrollbar_x = area.x.saturating_add(area.width.saturating_sub(1));
+    ConversationLayout {
+        history: Rect::new(area.x, area.y, area.width, input_y.saturating_sub(area.y)),
+        input: Rect::new(area.x, input_y, area.width.saturating_sub(1), input_height),
+        status: Rect::new(
+            area.x,
+            status_y,
+            area.width.saturating_sub(1),
+            status_height,
+        ),
+        scrollbar: Rect::new(scrollbar_x, area.y, u16::from(area.width > 0), area.height),
     }
 }
 
@@ -201,7 +248,11 @@ fn session_panel(state: &AppState) -> Paragraph<'_> {
         .wrap(Wrap { trim: true })
 }
 
-fn prompt_panel(state: &AppState, content_width: u16) -> Paragraph<'_> {
+fn prompt_panel(
+    state: &AppState,
+    content_width: u16,
+    visible_rows: u16,
+) -> (Paragraph<'_>, ConversationScroll) {
     let mut lines = vec![Line::from("What should Jux work on?"), Line::from("")];
     for message in state.messages() {
         match message.role {
@@ -357,11 +408,51 @@ fn prompt_panel(state: &AppState, content_width: u16) -> Paragraph<'_> {
         Line::from("Use the CLI subcommands for run, skills, and session inspection."),
     ]);
     let lines = apply_text_selection(state, SelectionPanel::Conversation, 0, lines);
-    Paragraph::new(lines)
-        .block(panel_block(CONVERSATION_BACKGROUND, CONVERSATION_PADDING))
-        .style(Style::default().bg(CONVERSATION_BACKGROUND))
-        .scroll((state.message_scroll(), 0))
-        .wrap(Wrap { trim: false })
+    let total_rows = wrapped_line_count(&lines, content_width);
+    let maximum = total_rows.saturating_sub(visible_rows);
+    let offset = maximum.saturating_sub(state.conversation_scroll_from_bottom().min(maximum));
+    let scroll = ConversationScroll {
+        offset,
+        total_rows,
+        visible_rows,
+    };
+    (
+        Paragraph::new(lines)
+            .block(panel_block(CONVERSATION_BACKGROUND, CONVERSATION_PADDING))
+            .style(Style::default().bg(CONVERSATION_BACKGROUND))
+            .scroll((offset, 0))
+            .wrap(Wrap { trim: false }),
+        scroll,
+    )
+}
+
+fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    lines.iter().fold(0_u16, |total, line| {
+        let rows = line.width().max(1).div_ceil(width);
+        total.saturating_add(u16::try_from(rows).unwrap_or(u16::MAX))
+    })
+}
+
+fn render_conversation_scrollbar(frame: &mut Frame<'_>, area: Rect, scroll: ConversationScroll) {
+    if area.is_empty() {
+        return;
+    }
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .track_style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .bg(CONVERSATION_BACKGROUND),
+        )
+        .thumb_symbol("█")
+        .thumb_style(Style::default().fg(Color::Gray).bg(CONVERSATION_BACKGROUND));
+    let mut scrollbar_state = ScrollbarState::new(usize::from(scroll.total_rows))
+        .position(usize::from(scroll.offset))
+        .viewport_content_length(usize::from(scroll.visible_rows));
+    frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
 }
 
 fn full_width_line(text: &str, width: u16, style: Style) -> Line<'static> {
@@ -417,28 +508,24 @@ fn input_line_style() -> Style {
     Style::default().bg(Color::Rgb(20, 38, 48))
 }
 
-fn render_input_area(frame: &mut Frame<'_>, state: &AppState, panel_area: Rect, active: bool) {
-    let inner = Rect {
-        x: panel_area.x.saturating_add(1),
-        y: panel_area.y.saturating_add(1),
-        width: panel_area.width.saturating_sub(2),
-        height: panel_area.height.saturating_sub(2),
-    };
-    if inner.is_empty() {
+fn render_input_area(
+    frame: &mut Frame<'_>,
+    state: &AppState,
+    layout: ConversationLayout,
+    active: bool,
+) {
+    let area = layout.input;
+    if area.is_empty() {
         return;
     }
-    // `str::lines` drops a trailing empty line, but that line is where the cursor sits immediately
-    // after Shift+Enter. Count split segments so the bottom padding is reserved before more text is
-    // typed on the new line.
-    let input_line_count = state.input_text().split('\n').count().max(1) as u16;
-    let height = input_line_count.saturating_add(2).min(inner.height);
-    let area = Rect {
-        x: inner.x,
-        y: inner.y + inner.height - height,
-        width: inner.width,
-        height,
-    };
-    render_slash_command_popup(frame, state, inner, area.y);
+    let height = area.height;
+    let popup_bounds = Rect::new(
+        area.x,
+        layout.history.y.saturating_add(1),
+        area.width,
+        area.y.saturating_sub(layout.history.y.saturating_add(1)),
+    );
+    render_slash_command_popup(frame, state, popup_bounds, area.y);
     let mut lines = Vec::new();
     if height >= 3 {
         lines.push(Line::from(""));
@@ -470,6 +557,24 @@ fn render_input_area(frame: &mut Frame<'_>, state: &AppState, panel_area: Rect, 
             .min(area.y.saturating_add(area.height.saturating_sub(1)));
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
     }
+}
+
+fn render_status_bar(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+    let text = state.escape_confirmation_hint().unwrap_or_else(|| {
+        if state.run_status() == TuiRunStatus::Running {
+            "Shift+Enter newline | Esc twice to interrupt | Ctrl+C quit"
+        } else {
+            "Shift+Enter newline | Esc twice to clear | Ctrl+C quit"
+        }
+    });
+    let style = Style::default().fg(Color::Gray).bg(STATUS_BAR_BACKGROUND);
+    frame.render_widget(
+        Paragraph::new(full_width_line(text, area.width, style)).style(style),
+        area,
+    );
 }
 
 fn render_slash_command_popup(
