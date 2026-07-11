@@ -2,6 +2,7 @@ use jux_core::{
     AssistantResponseItem, LlmUsage, SessionContextKind, SessionContextPayload,
     SqliteWorkspaceStore, StepKind, StepPayload,
 };
+use rusqlite::Connection;
 
 #[test]
 fn sqlite_store_creates_and_lists_named_sessions() {
@@ -41,6 +42,63 @@ fn sqlite_store_renames_a_session() {
             .as_deref(),
         Some("new-name")
     );
+}
+
+#[test]
+fn sqlite_store_sets_and_toggles_session_liked_state() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let session = store
+        .create_session(Some("favorite".to_owned()))
+        .expect("session is created");
+
+    assert!(!session.liked);
+    assert!(
+        store
+            .set_session_liked(&session.id, true)
+            .expect("session is liked")
+            .liked
+    );
+    assert!(
+        store
+            .load_session(&session.id)
+            .expect("session reloads")
+            .liked
+    );
+    assert!(
+        !store
+            .toggle_session_liked(&session.id)
+            .expect("session like is toggled")
+            .liked
+    );
+}
+
+#[test]
+fn sqlite_store_migrates_existing_sessions_with_unliked_default() {
+    let root = temp_workspace_root();
+    let state_dir = root.join(".jux");
+    std::fs::create_dir_all(&state_dir).expect("state directory is created");
+    let connection = Connection::open(state_dir.join("state.db")).expect("database opens");
+    connection
+        .execute_batch(
+            "create table sessions (
+                id text primary key,
+                name text,
+                created_at text not null,
+                updated_at text not null
+            );
+            insert into sessions (id, name, created_at, updated_at)
+            values ('workspace-0001', 'legacy', '1', '1');",
+        )
+        .expect("legacy schema is created");
+    drop(connection);
+
+    let sessions = SqliteWorkspaceStore::new(root)
+        .load_sessions()
+        .expect("legacy sessions load after migration");
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].name.as_deref(), Some("legacy"));
+    assert!(!sessions[0].liked);
 }
 
 #[test]

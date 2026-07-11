@@ -93,6 +93,8 @@ pub struct AppState {
     sessions: Vec<Session>,
     session_histories: Vec<SessionHistory>,
     session_panel_visible: bool,
+    session_search: String,
+    session_rename: Option<String>,
     selected_session: usize,
     code_change_review: Option<CodeChangeReview>,
     selected_changed_file: usize,
@@ -285,6 +287,8 @@ impl AppState {
             sessions: Vec::new(),
             session_histories: Vec::new(),
             session_panel_visible: false,
+            session_search: String::new(),
+            session_rename: None,
             selected_session: 0,
             code_change_review: None,
             selected_changed_file: 0,
@@ -375,6 +379,15 @@ impl AppState {
     }
 
     #[must_use]
+    pub fn session_name(&self) -> Option<&str> {
+        let active_id = self.session_id.as_deref()?;
+        self.sessions
+            .iter()
+            .find(|session| session.id.as_str() == active_id)
+            .and_then(|session| session.name.as_deref())
+    }
+
+    #[must_use]
     pub fn run_id(&self) -> Option<&str> {
         self.run_id.as_deref()
     }
@@ -412,6 +425,37 @@ impl AppState {
     #[must_use]
     pub fn selected_session(&self) -> usize {
         self.selected_session
+    }
+
+    #[must_use]
+    pub fn session_search(&self) -> &str {
+        &self.session_search
+    }
+
+    #[must_use]
+    pub fn session_rename(&self) -> Option<&str> {
+        self.session_rename.as_deref()
+    }
+
+    #[must_use]
+    pub fn filtered_sessions(&self) -> Vec<&Session> {
+        let query = self.session_search.to_lowercase();
+        self.sessions
+            .iter()
+            .filter(|session| {
+                query.is_empty()
+                    || session
+                        .name
+                        .as_deref()
+                        .unwrap_or("(unnamed)")
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .collect()
+    }
+
+    fn selected_filtered_session(&self) -> Option<&Session> {
+        self.filtered_sessions().get(self.selected_session).copied()
     }
 
     #[must_use]
@@ -734,6 +778,7 @@ pub fn execute_session_command(
     store: &SqliteWorkspaceStore,
     command: &AppCommand,
 ) -> Result<bool, StoreError> {
+    let close_picker = matches!(command, AppCommand::SwitchSession { .. });
     match command {
         AppCommand::CreateSession { name } => {
             let session = store.create_session(name.clone())?;
@@ -742,6 +787,12 @@ pub fn execute_session_command(
         AppCommand::RenameActiveSession { name } => {
             let session = store.load_active_session()?;
             store.rename_session(&session.id, Some(name.clone()))?;
+        }
+        AppCommand::RenameSession { session_id, name } => {
+            store.rename_session(session_id, Some(name.clone()))?;
+        }
+        AppCommand::ToggleSessionLiked { session_id } => {
+            store.toggle_session_liked(session_id)?;
         }
         AppCommand::SwitchSession { session_id } => {
             store.set_active_session(session_id)?;
@@ -754,8 +805,13 @@ pub fn execute_session_command(
         | AppCommand::CopyText { .. } => return Ok(false),
     }
     load_active_session_history(state, store)?;
-    state.session_panel_visible = true;
-    state.sidebar_visible = true;
+    state.session_panel_visible = !close_picker;
+    if close_picker {
+        state.session_search.clear();
+        state.session_rename = None;
+        state.selected_session = 0;
+        state.focused_panel = FocusedPanel::Conversation;
+    }
     Ok(true)
 }
 
@@ -1018,6 +1074,8 @@ pub enum AppCommand {
     CancelRun,
     CreateSession { name: Option<String> },
     RenameActiveSession { name: String },
+    RenameSession { session_id: SessionId, name: String },
+    ToggleSessionLiked { session_id: SessionId },
     SwitchSession { session_id: SessionId },
     AcceptCodeChange,
     RejectCodeChange,
@@ -1131,7 +1189,26 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 title: format!("Run finished: {:?}", state.run_status),
                 detail: state.run_id.clone(),
             });
-            None
+            let should_generate_title = state.run_status == TuiRunStatus::Completed
+                && state.runs.is_empty()
+                && state.sessions.iter().any(|session| {
+                    Some(session.id.as_str()) == state.session_id.as_deref()
+                        && session.name.as_deref().is_none_or(|name| name == "default")
+                });
+            should_generate_title
+                .then(|| {
+                    state
+                        .messages
+                        .iter()
+                        .find(|message| message.role == MessageRole::User)
+                        .map(|message| generated_session_title(&message.content))
+                })
+                .flatten()
+                .zip(state.session_id.as_ref())
+                .map(|(name, session_id)| AppCommand::RenameSession {
+                    session_id: SessionId::from(session_id.clone()),
+                    name,
+                })
         }
         AppAction::RunFailed { error } => {
             state.pending_escape_action = None;
@@ -1175,6 +1252,23 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         }) if state.skill_panel_visible => {
             state.pending_escape_action = None;
             state.skill_panel_visible = false;
+            state.focused_panel = FocusedPanel::Conversation;
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Esc, ..
+        }) if state.session_rename.is_some() => {
+            state.session_rename = None;
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Esc, ..
+        }) if state.session_panel_visible => {
+            state.pending_escape_action = None;
+            state.session_panel_visible = false;
+            state.session_search.clear();
+            state.session_rename = None;
+            state.selected_session = 0;
             state.focused_panel = FocusedPanel::Conversation;
             None
         }
@@ -1234,22 +1328,45 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::Key(KeyEvent {
+            code: KeyCode::Char('l'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }) if state.session_panel_visible => {
+            state
+                .selected_filtered_session()
+                .map(|session| AppCommand::ToggleSessionLiked {
+                    session_id: session.id.clone(),
+                })
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Char('r'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }) if state.session_panel_visible => {
+            state.session_rename = state
+                .selected_filtered_session()
+                .map(|session| session.name.clone().unwrap_or_default());
+            None
+        }
+        AppAction::Key(KeyEvent {
             code: KeyCode::Up, ..
-        }) if state.session_panel_visible && state.input.is_empty() => {
-            if !state.sessions.is_empty() {
+        }) if state.session_panel_visible => {
+            let session_count = state.filtered_sessions().len();
+            if session_count > 0 {
                 state.selected_session = state
                     .selected_session
                     .checked_sub(1)
-                    .unwrap_or(state.sessions.len() - 1);
+                    .unwrap_or(session_count - 1);
             }
             None
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Down,
             ..
-        }) if state.session_panel_visible && state.input.is_empty() => {
-            if !state.sessions.is_empty() {
-                state.selected_session = (state.selected_session + 1) % state.sessions.len();
+        }) if state.session_panel_visible => {
+            let session_count = state.filtered_sessions().len();
+            if session_count > 0 {
+                state.selected_session = (state.selected_session + 1) % session_count;
             }
             None
         }
@@ -1363,17 +1480,24 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         AppAction::Key(KeyEvent {
             code: KeyCode::Enter,
             ..
-        }) if state.session_panel_visible
-            && state.input.is_empty()
-            && state.run_status != TuiRunStatus::Running =>
-        {
+        }) if state.session_panel_visible && state.session_rename.is_some() => {
+            let name = state.session_rename.take().unwrap_or_default();
             state
-                .sessions
-                .get(state.selected_session)
-                .map(|session| AppCommand::SwitchSession {
+                .selected_filtered_session()
+                .map(|session| AppCommand::RenameSession {
                     session_id: session.id.clone(),
+                    name,
                 })
         }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        }) if state.session_panel_visible && state.run_status != TuiRunStatus::Running => state
+            .filtered_sessions()
+            .get(state.selected_session)
+            .map(|session| AppCommand::SwitchSession {
+                session_id: session.id.clone(),
+            }),
         AppAction::Key(KeyEvent {
             code: KeyCode::Enter,
             ..
@@ -1403,8 +1527,9 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             if state.input.trim() == "/sessions" {
                 state.clear_input();
                 state.session_panel_visible = true;
-                state.sidebar_visible = true;
-                state.focused_panel = FocusedPanel::Sidebar;
+                state.session_search.clear();
+                state.selected_session = 0;
+                state.focused_panel = FocusedPanel::Conversation;
                 return None;
             }
             if state.input.trim() == "/audit" {
@@ -1498,6 +1623,52 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 content: request.clone(),
             });
             Some(AppCommand::StartRun { request })
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Char('/'),
+            ..
+        }) if state.session_panel_visible => {
+            // Preserve the legacy typed session subcommands: beginning a slash
+            // command leaves the picker and returns input to the conversation.
+            state.session_panel_visible = false;
+            state.session_search.clear();
+            state.selected_session = 0;
+            state.insert('/');
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Char(character),
+            ..
+        }) if state.session_panel_visible && state.session_rename.is_some() => {
+            if let Some(rename) = &mut state.session_rename {
+                rename.push(character);
+            }
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Backspace,
+            ..
+        }) if state.session_panel_visible && state.session_rename.is_some() => {
+            if let Some(rename) = &mut state.session_rename {
+                rename.pop();
+            }
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Char(character),
+            ..
+        }) if state.session_panel_visible => {
+            state.session_search.push(character);
+            state.selected_session = 0;
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Backspace,
+            ..
+        }) if state.session_panel_visible => {
+            state.session_search.pop();
+            state.selected_session = 0;
+            None
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Char(character),
@@ -1616,8 +1787,8 @@ fn execute_selected_slash_command(state: &mut AppState) -> SlashCommandExecution
         }
         SlashCommand::Session => {
             state.session_panel_visible = true;
-            state.sidebar_visible = true;
-            state.focused_panel = FocusedPanel::Sidebar;
+            state.session_search.clear();
+            state.focused_panel = FocusedPanel::Conversation;
             state.selected_session = state
                 .sessions
                 .iter()
@@ -1640,6 +1811,19 @@ fn byte_at_character_column(input: &str, start: usize, end: usize, column: usize
         .char_indices()
         .nth(column)
         .map_or(end, |(index, _)| start + index)
+}
+
+fn generated_session_title(request: &str) -> String {
+    let title = request
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("New session")
+        .trim();
+    let mut shortened = title.chars().take(48).collect::<String>();
+    if title.chars().count() > 48 {
+        shortened.push('…');
+    }
+    shortened
 }
 
 fn handle_mouse_event(

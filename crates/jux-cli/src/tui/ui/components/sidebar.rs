@@ -82,33 +82,6 @@ pub(in crate::tui::ui) fn audit_panel(state: &AppState) -> Paragraph<'_> {
     sidebar_paragraph(state, lines)
 }
 
-pub(in crate::tui::ui) fn session_panel(state: &AppState) -> Paragraph<'_> {
-    let mut lines = vec![Line::from("Sessions"), Line::from("")];
-    for (index, session) in state.sessions().iter().enumerate() {
-        let selected = index == state.selected_session();
-        let marker = match (selected, state.session_id() == Some(session.id.as_str())) {
-            (true, true) => ">*",
-            (true, false) => "> ",
-            (false, true) => " *",
-            (false, false) => "  ",
-        };
-        let name = session.name.as_deref().unwrap_or("(unnamed)");
-        let style = if selected {
-            Style::default().bg(Color::Rgb(40, 52, 64))
-        } else {
-            Style::default()
-        };
-        lines.push(Line::styled(format!("{marker} {name}"), style));
-        lines.push(Line::from(format!("  {}", session.id)));
-        if let Some(history) = state.session_history(&session.id) {
-            for run in &history.runs {
-                lines.push(Line::from(format!("  [{:?}] {}", run.status, run.request)));
-            }
-        }
-    }
-    sidebar_paragraph(state, lines)
-}
-
 pub(in crate::tui::ui) fn run_panel(state: &AppState) -> Paragraph<'_> {
     let status = match state.run_status() {
         TuiRunStatus::Idle => "Idle",
@@ -121,7 +94,8 @@ pub(in crate::tui::ui) fn run_panel(state: &AppState) -> Paragraph<'_> {
     let lines = vec![
         Line::from("Jux"),
         Line::from(""),
-        Line::from(format!("Session: {}", state.session_id().unwrap_or("-"))),
+        Line::from(format!("Session: {}", state.session_name().unwrap_or("-"))),
+        Line::from(format!("Session ID: {}", state.session_id().unwrap_or("-"))),
         Line::from(format!("Run: {}", state.run_id().unwrap_or("-"))),
         Line::from(format!(
             "Model: {}/{}",

@@ -222,6 +222,8 @@ fn run_app_loop(
                     }
                     AppCommand::CreateSession { .. }
                     | AppCommand::RenameActiveSession { .. }
+                    | AppCommand::RenameSession { .. }
+                    | AppCommand::ToggleSessionLiked { .. }
                     | AppCommand::SwitchSession { .. }
                     | AppCommand::AcceptCodeChange
                     | AppCommand::RejectCodeChange => {}

@@ -1268,7 +1268,7 @@ fn tui_displays_waiting_run_status_and_metadata() {
     assert_eq!(state.run_status(), TuiRunStatus::WaitingForHumanInput);
     let buffer = render_to_buffer(&state, 80, 24);
     assert_buffer_contains(&buffer, "Status: Waiting");
-    assert_buffer_contains(&buffer, "Session: workspace-0001");
+    assert_buffer_contains(&buffer, "Session ID: workspace-0001");
     assert_buffer_contains(&buffer, "Run: workspace-0001-000001");
     assert_buffer_contains(&buffer, "Elapsed: 250 ms");
 }
@@ -1465,8 +1465,8 @@ fn tui_lists_workspace_sessions_and_marks_the_active_session() {
 
     assert_eq!(command, None);
     let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&buffer, "Sessions");
-    assert_buffer_contains(&buffer, "* default");
+    assert_buffer_contains(&buffer, "Search:");
+    assert_buffer_contains(&buffer, "default");
     assert_buffer_contains(&buffer, "feature-a");
 }
 
@@ -1562,6 +1562,70 @@ fn tui_session_slash_command_selects_and_switches_sessions() {
         store.load_active_session().expect("session loads").id,
         target.id
     );
+    let switched = render_to_buffer(&state, 80, 24);
+    assert_buffer_does_not_contain(&switched, "Search:");
+    assert_buffer_contains(&switched, "Session: feature-a");
+}
+
+#[test]
+fn tui_session_picker_searches_likes_renames_and_closes() {
+    let workspace = assert_fs::TempDir::new().expect("temp workspace exists");
+    let store = SqliteWorkspaceStore::new(workspace.path());
+    store.init_workspace().expect("workspace initializes");
+    let target = store
+        .create_session(Some("feature-a".to_owned()))
+        .expect("session is created");
+    let mut state = AppState::new(workspace.path());
+    load_active_session_history(&mut state, &store).expect("history loads");
+    type_text(&mut state, "/session");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    type_text(&mut state, "feature");
+    let filtered = render_to_buffer(&state, 80, 24);
+    assert_buffer_contains(&filtered, "feature-a");
+
+    let like = update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+    )
+    .expect("like command is emitted");
+    assert!(execute_session_command(&mut state, &store, &like).expect("like toggles"));
+    assert!(store.load_session(&target.id).expect("session loads").liked);
+
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+    );
+    for _ in 0.."feature-a".chars().count() {
+        update(
+            &mut state,
+            AppAction::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+        );
+    }
+    type_text(&mut state, "renamed");
+    let rename = update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    )
+    .expect("rename command is emitted");
+    assert!(execute_session_command(&mut state, &store, &rename).expect("session renames"));
+    assert_eq!(
+        store
+            .load_session(&target.id)
+            .expect("session loads")
+            .name
+            .as_deref(),
+        Some("renamed")
+    );
+
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    );
+    let closed = render_to_buffer(&state, 80, 24);
+    assert_buffer_does_not_contain(&closed, "Search:");
 }
 
 #[test]
@@ -1589,8 +1653,10 @@ fn tui_lists_run_history_under_each_session() {
     );
 
     let buffer = render_to_buffer(&state, 120, 30);
-    assert_buffer_contains(&buffer, "Default session run");
-    assert_buffer_contains(&buffer, "Feature session run");
+    assert_buffer_contains(&buffer, "default");
+    assert_buffer_contains(&buffer, "feature-a");
+    assert_buffer_does_not_contain(&buffer, "Default session run");
+    assert_buffer_does_not_contain(&buffer, "Feature session run");
 }
 
 #[test]

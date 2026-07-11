@@ -40,6 +40,8 @@ impl Workspace {
 pub struct Session {
     pub id: SessionId,
     pub name: Option<String>,
+    #[serde(default)]
+    pub liked: bool,
     pub created_at: u128,
     pub updated_at: u128,
 }
@@ -52,6 +54,7 @@ impl Session {
         Self {
             id,
             name,
+            liked: false,
             created_at: now,
             updated_at: now,
         }
