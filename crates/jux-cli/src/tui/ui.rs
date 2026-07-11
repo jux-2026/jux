@@ -567,8 +567,9 @@ fn render_status_bar(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         }
     });
     let style = Style::default().fg(Color::Gray).bg(STATUS_BAR_BACKGROUND);
+    let aligned_text = format!("   {text}");
     frame.render_widget(
-        Paragraph::new(full_width_line(text, area.width, style)).style(style),
+        Paragraph::new(full_width_line(&aligned_text, area.width, style)).style(style),
         area,
     );
 }
