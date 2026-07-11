@@ -199,12 +199,6 @@ fn read_terminal_event(decoder: &mut TerminalEventDecoder) -> Result<Option<Even
     }
     if event::poll(decoder.poll_timeout(now, EVENT_POLL_INTERVAL))? {
         decoder.push(event::read()?, Instant::now());
-        // Drain all events already buffered by the terminal in this iteration.
-        // This keeps fragmented SGR mouse reports together instead of allowing
-        // the decoder timeout to expire between individual bytes.
-        while event::poll(Duration::ZERO)? {
-            decoder.push(event::read()?, Instant::now());
-        }
     }
     Ok(decoder.next(Instant::now()))
 }
