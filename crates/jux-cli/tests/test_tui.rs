@@ -254,6 +254,10 @@ fn tui_moves_the_cursor_across_lines() {
         &mut state,
         AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    );
     type_text(&mut state, "Q");
     update(
         &mut state,
@@ -1059,7 +1063,7 @@ fn tui_shows_filters_and_dismisses_slash_command_suggestions() {
     assert_buffer_contains(&initial, "/new");
     assert_buffer_contains(&initial, "Start a new session");
     assert_buffer_contains(&initial, "/version");
-    assert_eq!(find_fragment_position(&initial, "/new"), Some((17, 1)));
+    assert_eq!(find_fragment_position(&initial, "/new"), Some((16, 1)));
     assert_buffer_fragment_has_fg_bg(&initial, "/new", Color::Black, Color::Cyan);
     let (selected_row, selected_start) =
         find_fragment_position(&initial, "/new").expect("selected command is rendered");
@@ -1092,6 +1096,10 @@ fn tui_selects_and_executes_the_version_slash_command() {
     let mut state = AppState::new("/workspace");
     type_text(&mut state, "/");
 
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    );
     update(
         &mut state,
         AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
@@ -1513,6 +1521,47 @@ fn tui_creates_renames_and_switches_sessions() {
     .expect("switch command is emitted");
     assert!(execute_session_command(&mut state, &store, &switch).expect("session is switched"));
     assert_eq!(state.session_id(), Some(default_session.as_str()));
+}
+
+#[test]
+fn tui_session_slash_command_selects_and_switches_sessions() {
+    let workspace = assert_fs::TempDir::new().expect("temp workspace exists");
+    let store = SqliteWorkspaceStore::new(workspace.path());
+    store.init_workspace().expect("workspace initializes");
+    let target = store
+        .create_session(Some("feature-a".to_owned()))
+        .expect("session is created");
+    let mut state = AppState::new(workspace.path());
+    load_active_session_history(&mut state, &store).expect("history loads");
+
+    type_text(&mut state, "/session");
+    assert_eq!(
+        update(
+            &mut state,
+            AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ),
+        None
+    );
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    );
+    let command = update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    )
+    .expect("switch command is emitted");
+    assert_eq!(
+        command,
+        AppCommand::SwitchSession {
+            session_id: target.id.clone(),
+        }
+    );
+    assert!(execute_session_command(&mut state, &store, &command).expect("session switches"));
+    assert_eq!(
+        store.load_active_session().expect("session loads").id,
+        target.id
+    );
 }
 
 #[test]

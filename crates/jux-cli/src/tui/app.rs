@@ -36,6 +36,7 @@ struct PendingEscapeAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SlashCommand {
     NewSession,
+    Session,
     Version,
 }
 
@@ -51,11 +52,16 @@ pub(super) struct SlashCommandDefinition {
     pub description: &'static str,
 }
 
-const SLASH_COMMANDS: [SlashCommandDefinition; 2] = [
+const SLASH_COMMANDS: [SlashCommandDefinition; 3] = [
     SlashCommandDefinition {
         command: SlashCommand::NewSession,
         name: "/new",
         description: "Start a new session",
+    },
+    SlashCommandDefinition {
+        command: SlashCommand::Session,
+        name: "/session",
+        description: "Switch active session",
     },
     SlashCommandDefinition {
         command: SlashCommand::Version,
@@ -87,6 +93,7 @@ pub struct AppState {
     sessions: Vec<Session>,
     session_histories: Vec<SessionHistory>,
     session_panel_visible: bool,
+    selected_session: usize,
     code_change_review: Option<CodeChangeReview>,
     selected_changed_file: usize,
     code_change_result: Option<TuiCodeChangeResult>,
@@ -278,6 +285,7 @@ impl AppState {
             sessions: Vec::new(),
             session_histories: Vec::new(),
             session_panel_visible: false,
+            selected_session: 0,
             code_change_review: None,
             selected_changed_file: 0,
             code_change_result: None,
@@ -399,6 +407,11 @@ impl AppState {
     #[must_use]
     pub fn sessions(&self) -> &[Session] {
         &self.sessions
+    }
+
+    #[must_use]
+    pub fn selected_session(&self) -> usize {
+        self.selected_session
     }
 
     #[must_use]
@@ -1222,6 +1235,26 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Up, ..
+        }) if state.session_panel_visible && state.input.is_empty() => {
+            if !state.sessions.is_empty() {
+                state.selected_session = state
+                    .selected_session
+                    .checked_sub(1)
+                    .unwrap_or(state.sessions.len() - 1);
+            }
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Down,
+            ..
+        }) if state.session_panel_visible && state.input.is_empty() => {
+            if !state.sessions.is_empty() {
+                state.selected_session = (state.selected_session + 1) % state.sessions.len();
+            }
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Up, ..
         }) if state.skill_panel_visible && state.input.is_empty() => {
             if !state.skills.is_empty() {
                 state.selected_skill = state
@@ -1326,6 +1359,20 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             state.sidebar_visible = true;
             state.focused_panel = FocusedPanel::Sidebar;
             None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        }) if state.session_panel_visible
+            && state.input.is_empty()
+            && state.run_status != TuiRunStatus::Running =>
+        {
+            state
+                .sessions
+                .get(state.selected_session)
+                .map(|session| AppCommand::SwitchSession {
+                    session_id: session.id.clone(),
+                })
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Enter,
@@ -1566,6 +1613,17 @@ fn execute_selected_slash_command(state: &mut AppState) -> SlashCommandExecution
         }
         SlashCommand::NewSession => {
             SlashCommandExecution::Executed(Some(AppCommand::CreateSession { name: None }))
+        }
+        SlashCommand::Session => {
+            state.session_panel_visible = true;
+            state.sidebar_visible = true;
+            state.focused_panel = FocusedPanel::Sidebar;
+            state.selected_session = state
+                .sessions
+                .iter()
+                .position(|session| Some(session.id.to_string()) == state.session_id)
+                .unwrap_or_default();
+            SlashCommandExecution::Executed(None)
         }
         SlashCommand::Version => {
             state.messages.push(Message {
