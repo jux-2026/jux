@@ -13,6 +13,10 @@ pub(super) fn input_line_style() -> Style {
     Style::default().bg(Color::Rgb(20, 38, 48))
 }
 
+pub(super) fn input_inactive_style() -> Style {
+    Style::default().bg(Color::Rgb(16, 28, 36))
+}
+
 pub(super) fn panel_block(background: Color, padding: u16) -> Block<'static> {
     Block::default()
         .style(Style::default().bg(background))

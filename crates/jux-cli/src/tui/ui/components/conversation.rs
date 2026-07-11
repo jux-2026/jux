@@ -4,7 +4,7 @@ use super::super::text::{
 };
 use super::super::theme::{
     COMMAND_POPUP_BACKGROUND, CONVERSATION_BACKGROUND, CONVERSATION_PADDING, STATUS_BAR_BACKGROUND,
-    USER_MESSAGE_BACKGROUND, input_line_style, panel_block,
+    USER_MESSAGE_BACKGROUND, input_inactive_style, input_line_style, panel_block,
 };
 use crate::tui::{
     AppState, MessageRole, SelectionPanel, TimelineStatus, TuiCodeChangeResult, TuiRunStatus,
@@ -271,7 +271,11 @@ fn render_input_area(
     let (cursor_line, cursor_column) = state.input_cursor_line_column();
     let cursor_line = cursor_line.saturating_add(u16::from(height >= 3));
     let vertical_scroll = cursor_line.saturating_sub(height.saturating_sub(1));
-    let style = active.then(input_line_style).unwrap_or_default();
+    let style = if active {
+        input_line_style()
+    } else {
+        input_inactive_style()
+    };
     frame.render_widget(
         Paragraph::new(lines)
             .style(style)
