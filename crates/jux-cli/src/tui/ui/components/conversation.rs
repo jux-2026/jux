@@ -116,10 +116,6 @@ fn prompt_panel(
                 lines.push(full_width_line("", content_width, background));
             }
             MessageRole::Assistant | MessageRole::Error => {
-                if message.role == MessageRole::Error {
-                    let label = if selected { "▶ Error" } else { "Error" };
-                    lines.push(Line::styled(label, Style::default().fg(Color::Red)));
-                }
                 append_spacing(&mut lines);
                 let markdown_width = content_width.saturating_sub(6);
                 lines.extend(
@@ -128,6 +124,13 @@ fn prompt_panel(
                         .into_iter()
                         .map(pad_assistant_line),
                 );
+                if let Some(metadata) = response_metadata_for_message(state, message) {
+                    append_spacing(&mut lines);
+                    lines.push(Line::styled(
+                        format!("\u{00a0}\u{00a0}\u{00a0}{metadata}"),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
                 append_spacing(&mut lines);
             }
         }
@@ -139,22 +142,18 @@ fn prompt_panel(
             &mut command_toggle_rows,
         );
     }
-    if state.run_status() != TuiRunStatus::Running
-        && let Some(metadata) = latest_assistant_response_metadata(state)
-    {
-        append_spacing(&mut lines);
-        lines.push(Line::styled(
-            format!("\u{00a0}\u{00a0}\u{00a0}{metadata}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
     if state.run_status() == TuiRunStatus::Running {
+        append_spacing(&mut lines);
         let (indicator, color) = generating_frame();
+        let (input_tokens, output_tokens) = state.estimated_token_usage();
         lines.push(Line::styled(
-            format!("   Generating {indicator}"),
+            format!(
+                "   Generating {indicator} · ~{} in / ~{} out",
+                format_compact_number(input_tokens),
+                format_compact_number(output_tokens)
+            ),
             Style::default().fg(color),
         ));
-        lines.push(Line::from(""));
     }
     if let Some(request) = state.pending_human_input() {
         let title = match request.kind {
@@ -272,6 +271,13 @@ fn append_timeline_items<'a>(
     lines: &mut Vec<Line<'a>>,
     command_toggle_rows: &mut Vec<(u16, usize)>,
 ) {
+    if state
+        .timeline()
+        .iter()
+        .any(|item| item.message_count == message_count && item.command.is_some())
+    {
+        append_spacing(lines);
+    }
     for (timeline_index, item) in state.timeline().iter().enumerate() {
         if item.message_count != message_count {
             continue;
@@ -285,7 +291,13 @@ fn append_timeline_items<'a>(
                 item.expanded,
                 content_width,
             ));
-            lines.push(Line::from(""));
+            let next_is_command = state
+                .timeline()
+                .get(timeline_index.saturating_add(1))
+                .is_some_and(|next| next.message_count == message_count && next.command.is_some());
+            if !next_is_command {
+                lines.push(Line::from(""));
+            }
             continue;
         }
         let status = match item.status {
@@ -322,21 +334,35 @@ fn pad_assistant_line(mut line: Line<'_>) -> Line<'_> {
     line
 }
 
-fn latest_assistant_response_metadata(state: &AppState) -> Option<String> {
-    let message = state
-        .messages()
+fn response_metadata_for_message(
+    state: &AppState,
+    message: &crate::tui::Message,
+) -> Option<String> {
+    let step = state
+        .steps()
         .iter()
-        .rev()
-        .find(|message| message.role == MessageRole::Assistant)?;
-    let usage = state.steps().iter().find_map(|step| match &step.payload {
-        StepPayload::AssistantResponse { usage, items, .. }
-            if assistant_text(items) == message.content =>
-        {
-            Some(usage)
-        }
+        .find(|step| match (&message.role, &step.payload) {
+            (MessageRole::Assistant, StepPayload::AssistantResponse { items, .. }) => {
+                assistant_text(items) == message.content
+            }
+            (MessageRole::Error, StepPayload::Error { message: error }) => {
+                error == &message.content
+            }
+            _ => false,
+        })?;
+    let elapsed = state
+        .runs()
+        .iter()
+        .find(|run| run.id == step.id.run_id())
+        .map(|run| run.updated_at.saturating_sub(run.created_at));
+    let usage = match &step.payload {
+        StepPayload::AssistantResponse { usage, .. } => Some(usage),
         _ => None,
-    });
-    format_response_metadata(usage, state.run_elapsed_millis())
+    };
+    let metadata = format_response_metadata(usage, elapsed)?;
+    (message.role == MessageRole::Error)
+        .then(|| format!("Failed · {metadata}"))
+        .or(Some(metadata))
 }
 
 fn generating_frame() -> (&'static str, Color) {
@@ -371,14 +397,33 @@ fn format_response_metadata(
     let mut parts = Vec::new();
     if let Some(usage) = usage {
         parts.push(format!(
-            "{} tokens ({} in, {} out)",
-            usage.total_tokens, usage.input_tokens, usage.output_tokens
+            "{} tokens ({} in / {} out)",
+            format_compact_number(usage.total_tokens),
+            format_compact_number(usage.input_tokens),
+            format_compact_number(usage.output_tokens)
         ));
     }
     if let Some(elapsed_millis) = elapsed_millis {
         parts.push(format_duration(elapsed_millis));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn format_compact_number(value: u64) -> String {
+    match value {
+        0..=999 => value.to_string(),
+        1_000..=999_999 => format_compact(value, 1_000, "k"),
+        _ => format_compact(value, 1_000_000, "M"),
+    }
+}
+
+fn format_compact(value: u64, divisor: u64, suffix: &str) -> String {
+    let scaled = value as f64 / divisor as f64;
+    if scaled >= 100.0 || (scaled.fract() == 0.0) {
+        format!("{scaled:.0}{suffix}")
+    } else {
+        format!("{scaled:.1}{suffix}")
+    }
 }
 
 fn format_duration(elapsed_millis: u128) -> String {

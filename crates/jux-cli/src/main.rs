@@ -138,15 +138,22 @@ enum LlmProviderName {
 }
 
 fn main() -> Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Run(args)) => handle_run(args, cli.output),
-        Some(Command::Skills(command)) => handle_skills(command, cli.output),
+        Some(Command::Run(args)) => {
+            init_tracing();
+            handle_run(args, cli.output)
+        }
+        Some(Command::Skills(command)) => {
+            init_tracing();
+            handle_skills(command, cli.output)
+        }
         Some(Command::Session(command)) => match command.command {
-            SessionSubcommand::Show(args) => handle_session_show(args, cli.output),
+            SessionSubcommand::Show(args) => {
+                init_tracing();
+                handle_session_show(args, cli.output)
+            }
         },
         None => {
             let workspace = env::current_dir().context("failed to determine current workspace")?;

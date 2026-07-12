@@ -109,6 +109,8 @@ pub struct AppState {
     session_id: Option<String>,
     run_id: Option<String>,
     run_elapsed_millis: Option<u128>,
+    estimated_input_tokens: u64,
+    estimated_output_tokens: u64,
     timeline: Vec<TimelineItem>,
     selected_timeline: Option<usize>,
     steps: Vec<Step>,
@@ -119,6 +121,7 @@ pub struct AppState {
     sessions: Vec<Session>,
     session_histories: Vec<SessionHistory>,
     session_panel_visible: bool,
+    pending_new_session: bool,
     session_search: String,
     session_rename: Option<String>,
     selected_session: usize,
@@ -354,6 +357,8 @@ impl AppState {
             session_id: None,
             run_id: None,
             run_elapsed_millis: None,
+            estimated_input_tokens: 0,
+            estimated_output_tokens: 0,
             timeline: Vec::new(),
             selected_timeline: None,
             steps: Vec::new(),
@@ -364,6 +369,7 @@ impl AppState {
             sessions: Vec::new(),
             session_histories: Vec::new(),
             session_panel_visible: false,
+            pending_new_session: false,
             session_search: String::new(),
             session_rename: None,
             selected_session: 0,
@@ -483,6 +489,9 @@ impl AppState {
 
     #[must_use]
     pub fn session_name(&self) -> Option<&str> {
+        if self.pending_new_session {
+            return Some("New session");
+        }
         let active_id = self.session_id.as_deref()?;
         self.sessions
             .iter()
@@ -498,6 +507,15 @@ impl AppState {
     #[must_use]
     pub fn run_elapsed_millis(&self) -> Option<u128> {
         self.run_elapsed_millis
+    }
+
+    pub fn estimated_token_usage(&self) -> (u64, u64) {
+        (self.estimated_input_tokens, self.estimated_output_tokens)
+    }
+
+    fn begin_token_estimate(&mut self, request: &str) {
+        self.estimated_input_tokens = estimate_tokens(request);
+        self.estimated_output_tokens = 0;
     }
 
     #[must_use]
@@ -585,6 +603,27 @@ impl AppState {
     #[must_use]
     pub fn session_panel_visible(&self) -> bool {
         self.session_panel_visible
+    }
+
+    pub fn pending_new_session(&self) -> bool {
+        self.pending_new_session
+    }
+
+    fn begin_new_session(&mut self) {
+        self.pending_new_session = true;
+        self.session_id = None;
+        self.run_id = None;
+        self.run_elapsed_millis = None;
+        self.messages.clear();
+        self.timeline.clear();
+        self.steps.clear();
+        self.input_history.clear();
+        self.input_history_index = None;
+        self.input_history_draft.clear();
+        self.run_status = TuiRunStatus::Idle;
+        self.session_panel_visible = false;
+        self.focused_panel = FocusedPanel::Conversation;
+        self.notify("New session");
     }
 
     #[must_use]
@@ -1068,9 +1107,16 @@ pub fn load_active_session_history(
     steps.sort_by_key(|step| step.id.to_string());
 
     state.session_id = Some(session.id.to_string());
+    state.pending_new_session = false;
     state.sessions = sessions;
     state.session_histories = session_histories;
     state.messages = messages_from_steps(&steps);
+    state.input_history = input_history_from_runs(&runs);
+    if state.input_history.is_empty() {
+        state.input_history = input_history_from_steps(&steps);
+    }
+    state.input_history_index = None;
+    state.input_history_draft.clear();
     state.steps = steps;
     state.timeline = command_timeline_from_steps(&state.steps);
     state.selected_timeline = None;
@@ -1112,6 +1158,13 @@ pub fn execute_session_command(
                 store.set_active_session(&replacement.id)?;
             }
         }
+        AppCommand::DeleteSession { session_id } => {
+            if state.session_id.as_deref() == Some(session_id.as_str()) {
+                let replacement = store.create_session(None)?;
+                store.set_active_session(&replacement.id)?;
+            }
+            store.delete_session(session_id)?;
+        }
         AppCommand::SwitchSession { session_id } => {
             store.set_active_session(session_id)?;
         }
@@ -1132,6 +1185,26 @@ pub fn execute_session_command(
         state.notify("Session switched");
     }
     Ok(true)
+}
+
+pub fn materialize_pending_new_session(
+    state: &mut AppState,
+    store: &SqliteWorkspaceStore,
+    request: &str,
+) -> Result<(), StoreError> {
+    if !state.pending_new_session {
+        return Ok(());
+    }
+    let session = store.create_session(None)?;
+    store.set_active_session(&session.id)?;
+    load_active_session_history(state, store)?;
+    state.input_history.push(request.to_owned());
+    state.messages.push(Message {
+        role: MessageRole::User,
+        content: request.to_owned(),
+    });
+    state.run_status = TuiRunStatus::Running;
+    Ok(())
 }
 
 pub fn execute_code_change_command(
@@ -1218,6 +1291,37 @@ fn messages_from_steps(steps: &[Step]) -> Vec<Message> {
         }
     }
     messages
+}
+
+fn input_history_from_steps(steps: &[Step]) -> Vec<String> {
+    let mut history = Vec::new();
+    for step in steps {
+        let StepPayload::UserMessage { content } = &step.payload else {
+            continue;
+        };
+        if history.last() != Some(content) {
+            history.push(content.clone());
+        }
+    }
+    history
+}
+
+fn input_history_from_runs(runs: &[Run]) -> Vec<String> {
+    let mut history = Vec::new();
+    for run in runs {
+        if history.last() != Some(&run.request) {
+            history.push(run.request.clone());
+        }
+    }
+    history
+}
+
+fn estimate_tokens(content: &str) -> u64 {
+    let units = content
+        .chars()
+        .map(|character| if character.is_ascii() { 1 } else { 2 })
+        .sum::<u64>();
+    units.div_ceil(4)
 }
 
 fn command_timeline_from_steps(steps: &[Step]) -> Vec<TimelineItem> {
@@ -1468,6 +1572,7 @@ pub enum AppCommand {
     RenameSession { session_id: SessionId, name: String },
     ToggleSessionLiked { session_id: SessionId },
     ArchiveSession { session_id: SessionId },
+    DeleteSession { session_id: SessionId },
     SwitchSession { session_id: SessionId },
     AcceptCodeChange,
     RejectCodeChange,
@@ -1554,6 +1659,9 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::AssistantMessage { content } => {
+            state.estimated_output_tokens = state
+                .estimated_output_tokens
+                .saturating_add(estimate_tokens(&content));
             state.messages.push(Message {
                 role: MessageRole::Assistant,
                 content,
@@ -1675,6 +1783,17 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             state.selected_session = 0;
             state.focused_panel = FocusedPanel::Conversation;
             None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }) if state.session_panel_visible => {
+            state
+                .selected_filtered_session()
+                .map(|session| AppCommand::DeleteSession {
+                    session_id: session.id.clone(),
+                })
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Esc, ..
@@ -2188,6 +2307,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 }
             }
             let request = std::mem::take(&mut state.input);
+            state.begin_token_estimate(&request);
             if state.input_history.last() != Some(&request) {
                 state.input_history.push(request.clone());
             }
@@ -2482,7 +2602,8 @@ fn execute_selected_slash_command(state: &mut AppState) -> SlashCommandExecution
             SlashCommandExecution::Executed(None)
         }
         SlashCommand::NewSession => {
-            SlashCommandExecution::Executed(Some(AppCommand::CreateSession { name: None }))
+            state.begin_new_session();
+            SlashCommandExecution::Executed(None)
         }
         SlashCommand::Session => {
             state.session_panel_visible = true;
@@ -3057,10 +3178,9 @@ fn truncate_timeline_detail_text(content: &str) -> String {
 
 fn timeline_item_from_agent_event(event: AgentEvent) -> Option<TimelineItem> {
     let (label, detail, arguments, output, command) = match event.data {
-        AgentEventData::LlmStarted | AgentEventData::LlmCompleted => {
-            ("LLM".to_owned(), None, None, None, None)
-        }
-        AgentEventData::LlmFailed { error } => ("LLM".to_owned(), Some(error), None, None, None),
+        AgentEventData::LlmStarted
+        | AgentEventData::LlmCompleted
+        | AgentEventData::LlmFailed { .. } => return None,
         AgentEventData::SkillsSelected { skills } => (
             "Active skills".to_owned(),
             None,

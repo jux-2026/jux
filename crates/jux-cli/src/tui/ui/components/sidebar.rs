@@ -1,4 +1,4 @@
-use super::super::text::{apply_text_selection, display_names};
+use super::super::text::apply_text_selection;
 use super::super::theme::{palette, panel_block};
 use crate::tui::{AppState, SelectionPanel, TuiRunStatus};
 use ratatui::style::{Color, Style};
@@ -101,55 +101,86 @@ pub(in crate::tui::ui) fn run_panel(state: &AppState) -> Paragraph<'_> {
         TuiRunStatus::Failed => "Failed",
         TuiRunStatus::Canceled => "Canceled",
     };
-    let lines = vec![
+    let run_count = state
+        .session_id()
+        .and_then(|id| {
+            state
+                .sessions()
+                .iter()
+                .find(|session| session.id.as_str() == id)
+        })
+        .and_then(|session| state.session_history(&session.id))
+        .map_or(0, |history| history.runs.len());
+    let mut lines = vec![
         Line::from("Jux"),
         Line::from(""),
-        Line::from(format!("Session: {}", state.session_name().unwrap_or("-"))),
-        Line::from(format!("Session ID: {}", state.session_id().unwrap_or("-"))),
-        Line::from(format!("Run: {}", state.run_id().unwrap_or("-"))),
+        section("Session"),
         Line::from(format!(
-            "Model: {}/{}",
-            state.runtime_info().model_provider,
-            state.runtime_info().model_name
+            "  {}",
+            state.session_name().unwrap_or("No session")
         )),
-        Line::from("Focus: Left/Right"),
-        Line::from(format!("Quit: {}", state.quit_shortcut_label())),
+        Line::styled(
+            format!("  {run_count} runs"),
+            Style::default().fg(Color::DarkGray),
+        ),
         Line::from(""),
-        Line::from(format!("Status: {status}")),
-        Line::from(format!("Activity: {}", activity_indicator(state))),
-        Line::from(format!("Progress: {}", run_progress(state))),
+        section("Run"),
         Line::from(state.run_elapsed_millis().map_or_else(
-            || "Elapsed: -".to_owned(),
-            |millis| format!("Elapsed: {millis} ms"),
+            || status.to_owned(),
+            |millis| format!("{status} · {}", format_duration(millis)),
         )),
+        Line::styled(
+            format!(
+                "  {}/{}",
+                state.runtime_info().model_provider,
+                state.runtime_info().model_name
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if state.run_status() == TuiRunStatus::Running
+        || state.run_status() == TuiRunStatus::WaitingForHumanInput
+    {
+        lines.extend([
+            Line::from(""),
+            section("Activity"),
+            Line::from(format!(
+                "{} {}",
+                activity_indicator(state),
+                run_progress(state)
+            )),
+        ]);
+    }
+    lines.extend([
         Line::from(""),
-        Line::from(format!("Workspace: {}", state.workspace_root.display())),
+        section("Environment"),
+        Line::from(format!("  FS  {}", state.runtime_info().sandbox.filesystem)),
+        Line::from(format!("  Net {}", state.runtime_info().sandbox.network)),
         Line::from(format!(
-            "Workspace ID: {}",
-            state.runtime_info().workspace_id.as_deref().unwrap_or("-")
-        )),
-        Line::from(format!(
-            "Filesystem: {}",
-            state.runtime_info().sandbox.filesystem
-        )),
-        Line::from(format!("Network: {}", state.runtime_info().sandbox.network)),
-        Line::from(format!(
-            "Native commands: {}",
+            "  Cmd {}",
             state.runtime_info().sandbox.native_commands
         )),
-        Line::from("Mode: TUI shell"),
-        Line::from("Tools: exec, lua, human_input"),
-        Line::from("Skills: call_skill"),
-        Line::from(format!(
-            "Selected skills: {}",
-            display_names(state.selected_skill_names())
-        )),
-        Line::from(format!(
-            "Active skills: {}",
-            display_names(state.active_skill_names())
-        )),
-    ];
+        Line::from(""),
+        Line::styled(
+            format!("← focus · {} quit", state.quit_shortcut_label()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
     sidebar_paragraph(state, lines)
+}
+
+fn section(title: &str) -> Line<'static> {
+    Line::styled(title.to_owned(), Style::default().fg(Color::Cyan))
+}
+
+fn format_duration(millis: u128) -> String {
+    if millis < 1_000 {
+        format!("{millis}ms")
+    } else if millis < 60_000 {
+        format!("{:.1}s", millis as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", millis as f64 / 60_000.0)
+    }
 }
 
 fn activity_indicator(state: &AppState) -> &'static str {

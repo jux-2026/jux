@@ -56,14 +56,6 @@ pub(super) fn truncate_timeline_detail(content: &str) -> String {
     truncated
 }
 
-pub(super) fn display_names(names: &[String]) -> String {
-    if names.is_empty() {
-        "-".to_owned()
-    } else {
-        names.join(", ")
-    }
-}
-
 pub(super) fn apply_text_selection<'a>(
     state: &AppState,
     panel: SelectionPanel,

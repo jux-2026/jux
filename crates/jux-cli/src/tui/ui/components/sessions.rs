@@ -5,6 +5,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SELECTED_BACKGROUND: Color = Color::Rgb(40, 52, 64);
 
@@ -33,25 +34,48 @@ pub(in crate::tui::ui) fn render(frame: &mut Frame<'_>, state: &AppState, area: 
     frame.render_widget(search, regions[0]);
 
     let width = regions[1].width.saturating_sub(1) as usize;
-    let mut lines = state
-        .filtered_sessions()
-        .into_iter()
-        .enumerate()
-        .map(|(index, session)| {
+    let sessions = state.filtered_sessions();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let mut lines = Vec::new();
+    const DAY_MILLIS: u128 = 24 * 60 * 60 * 1_000;
+    for group_index in 0..3 {
+        let group = sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| match group_index {
+                0 => session.liked,
+                1 => !session.liked && now.saturating_sub(session.updated_at) < DAY_MILLIS,
+                _ => !session.liked && now.saturating_sub(session.updated_at) >= DAY_MILLIS,
+            })
+            .collect::<Vec<_>>();
+        if group.is_empty() {
+            continue;
+        }
+        lines.push(Line::styled(
+            match group_index {
+                0 => " Pinned",
+                1 => " Today",
+                _ => " Earlier",
+            },
+            Style::default().fg(Color::Cyan),
+        ));
+        lines.extend(group.into_iter().map(|(index, session)| {
             let title = session.name.as_deref().unwrap_or("(unnamed)");
-            let title = if session.liked {
-                format!("♥ {title}")
-            } else {
-                format!("  {title}")
-            };
+            let age = relative_time(now.saturating_sub(session.updated_at));
+            let run_count = state
+                .session_history(&session.id)
+                .map_or(0, |history| history.runs.len());
+            let title = format!("{}  {run_count} runs · {age}", title);
             let style = if index == state.selected_session() {
                 Style::default().bg(SELECTED_BACKGROUND)
             } else {
                 Style::default()
             };
             Line::styled(format!(" {title:<width$}"), style)
-        })
-        .collect::<Vec<_>>();
+        }));
+    }
     if lines.is_empty() {
         lines.push(Line::styled(
             " No sessions match your search.",
@@ -63,8 +87,10 @@ pub(in crate::tui::ui) fn render(frame: &mut Frame<'_>, state: &AppState, area: 
         regions[1],
     );
     frame.render_widget(
-        Paragraph::new(" Ctrl+N new  Ctrl+A archive  ↑/↓ select  Enter switch  Ctrl+L like")
-            .style(Style::default().fg(Color::DarkGray).bg(background)),
+        Paragraph::new(
+            " Ctrl+N new  Ctrl+D delete  Ctrl+A archive  ↑/↓ select  Enter switch  Ctrl+L pin",
+        )
+        .style(Style::default().fg(Color::DarkGray).bg(background)),
         regions[2],
     );
 
@@ -75,4 +101,16 @@ pub(in crate::tui::ui) fn render(frame: &mut Frame<'_>, state: &AppState, area: 
         .saturating_add(query_width)
         .min(regions[0].right().saturating_sub(1));
     frame.set_cursor_position(Position::new(cursor_x, regions[0].y.saturating_add(1)));
+}
+
+fn relative_time(age_millis: u128) -> String {
+    let seconds = age_millis / 1_000;
+    match seconds {
+        0..=9 => "just now".to_owned(),
+        10..=59 => format!("{seconds}s ago"),
+        60..=3_599 => format!("{}m ago", seconds / 60),
+        3_600..=86_399 => format!("{}h ago", seconds / 3_600),
+        86_400..=604_799 => format!("{}d ago", seconds / 86_400),
+        _ => format!("{}w ago", seconds / 604_800),
+    }
 }

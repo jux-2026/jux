@@ -5,7 +5,8 @@ use jux_cli::tui::{
     AgentEventSender, AppAction, AppCommand, AppState, BackgroundRun, FocusedPanel, Message,
     MessageRole, RunResponse, SelectionPanel, TerminalEventDecoder, TuiRunRequest, TuiRunStatus,
     TuiRuntimeInfo, TuiSandboxSummary, TuiViewport, execute_code_change_command,
-    execute_session_command, load_active_session_history, render_app, update,
+    execute_session_command, load_active_session_history, materialize_pending_new_session,
+    render_app, update,
 };
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AssistantResponseItem,
@@ -1405,7 +1406,7 @@ fn tui_selects_and_executes_the_version_slash_command() {
 }
 
 #[test]
-fn tui_new_slash_command_creates_an_unnamed_session() {
+fn tui_new_slash_command_defers_creating_an_unnamed_session_until_submission() {
     let workspace = assert_fs::TempDir::new().expect("temp workspace exists");
     let store = SqliteWorkspaceStore::new(workspace.path());
     let original_session = store
@@ -1419,10 +1420,30 @@ fn tui_new_slash_command_creates_an_unnamed_session() {
     let command = update(
         &mut state,
         AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-    )
-    .expect("create command is emitted");
-    assert_eq!(command, AppCommand::CreateSession { name: None });
-    assert!(execute_session_command(&mut state, &store, &command).expect("session is created"));
+    );
+    assert_eq!(command, None);
+    assert!(state.pending_new_session());
+    assert_eq!(
+        store
+            .load_active_session()
+            .expect("active session loads")
+            .id,
+        original_session
+    );
+
+    type_text(&mut state, "new request");
+    let command = update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    assert_eq!(
+        command,
+        Some(AppCommand::StartRun {
+            request: "new request".to_owned()
+        })
+    );
+    materialize_pending_new_session(&mut state, &store, "new request")
+        .expect("new session materializes");
 
     let active_session = store.load_active_session().expect("active session loads");
     assert_ne!(active_session.id, original_session);
@@ -1465,7 +1486,7 @@ fn tui_does_not_start_a_second_run_while_running() {
     assert_eq!(state.input_text(), "second request");
     assert_eq!(state.messages().len(), 1);
     let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&buffer, "Status: Running");
+    assert_buffer_contains(&buffer, "Running");
 }
 
 #[test]
@@ -1497,7 +1518,7 @@ fn tui_cancels_the_running_run_with_escape() {
     assert_eq!(command, Some(AppCommand::CancelRun));
     assert_eq!(state.run_status(), TuiRunStatus::Canceled);
     let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&buffer, "Status: Canceled");
+    assert_buffer_contains(&buffer, "Canceled");
 }
 
 #[test]
@@ -1548,10 +1569,7 @@ fn tui_displays_waiting_run_status_and_metadata() {
 
     assert_eq!(state.run_status(), TuiRunStatus::WaitingForHumanInput);
     let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&buffer, "Status: Waiting");
-    assert_buffer_contains(&buffer, "Session ID: workspace-0001");
-    assert_buffer_contains(&buffer, "Run: workspace-0001-000001");
-    assert_buffer_contains(&buffer, "Elapsed: 250 ms");
+    assert_buffer_contains(&buffer, "Waiting · 250ms");
 }
 
 #[test]
@@ -1646,7 +1664,7 @@ fn tui_loads_active_session_history_from_the_workspace_store() {
     let buffer = render_to_buffer(&state, 80, 24);
     assert_buffer_contains(&buffer, "Historical request");
     assert_buffer_contains(&buffer, "Historical answer");
-    assert_buffer_contains(&buffer, &run.id.to_string());
+    assert_buffer_contains(&buffer, "1 runs");
 }
 
 #[test]
@@ -1929,7 +1947,7 @@ fn tui_session_slash_command_selects_and_switches_sessions() {
     );
     let switched = render_to_buffer(&state, 80, 24);
     assert_buffer_does_not_contain(&switched, "Search:");
-    assert_buffer_contains(&switched, "Session: feature-a");
+    assert_buffer_contains(&switched, "feature-a");
 }
 
 #[test]
@@ -2496,9 +2514,9 @@ fn tui_displays_the_completed_run_answer() {
 
     assert_eq!(state.run_status(), TuiRunStatus::Completed);
     let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&buffer, "Status: Completed");
+    assert_buffer_contains(&buffer, "Completed · 500ms");
     assert_buffer_contains(&buffer, "The requested change is complete.");
-    assert_buffer_contains(&buffer, "150 tokens (120 in, 30 out) · 500 ms");
+    assert_buffer_contains(&buffer, "150 tokens (120 in / 30 out) · 500 ms");
     let (command_row, _) =
         find_fragment_position(&buffer, "▶ $ ls /etc").expect("command is rendered");
     let (summary_row, _) = find_fragment_position(&buffer, "150 tokens")
@@ -2593,17 +2611,15 @@ fn tui_shell_renders_workspace_and_idle_status() {
     let buffer = render_to_buffer(&state, 80, 24);
 
     assert_buffer_contains(&buffer, "Jux");
-    assert_buffer_contains(&buffer, "Workspace: /workspace");
-    assert_buffer_contains(&buffer, "Status: Idle");
-    assert_buffer_contains(&buffer, "Quit: Ctrl+C");
-    assert_buffer_contains(&buffer, "Focus: Left/Right");
+    assert_buffer_contains(&buffer, "Environment");
+    assert_buffer_contains(&buffer, "Idle");
+    assert_buffer_contains(&buffer, "← focus · Ctrl+C quit");
     assert_buffer_does_not_contain(&buffer, "keys");
     assert_buffer_does_not_contain(&buffer, "Session - | Run -");
     assert_buffer_does_not_contain(&buffer, "conversation");
     assert_buffer_does_not_contain(&buffer, "status");
     assert_buffer_has_no_panel_frames(&buffer);
-    assert_buffer_fragment_has_background(&buffer, "Workspace: /workspace", sidebar_background());
-    assert_eq!(find_fragment_position(&buffer, "Session: -"), Some((4, 51)));
+    assert_buffer_fragment_has_background(&buffer, "Environment", sidebar_background());
     assert_eq!(find_fragment_position(&buffer, "▶"), Some((12, 48)));
     assert_input_block_has_background(&buffer, "> Start typing", input_active_background());
 }
@@ -2619,7 +2635,7 @@ fn tui_selects_the_status_panel_with_right_arrow() {
 
     assert_eq!(state.focused_panel(), FocusedPanel::Sidebar);
     let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_fragment_has_background(&buffer, "Workspace: /workspace", sidebar_background());
+    assert_buffer_fragment_has_background(&buffer, "Environment", sidebar_background());
     assert_input_block_does_not_have_background(
         &buffer,
         "> Start typing",
@@ -2641,7 +2657,7 @@ fn tui_returns_focus_to_the_conversation_with_left_arrow() {
 
     assert_eq!(state.focused_panel(), FocusedPanel::Conversation);
     let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_fragment_has_background(&buffer, "Workspace: /workspace", sidebar_background());
+    assert_buffer_fragment_has_background(&buffer, "Environment", sidebar_background());
     assert_input_block_has_background(&buffer, "> Start typing", input_active_background());
 }
 
@@ -2782,7 +2798,6 @@ fn tui_drags_the_divider_to_resize_both_panels() {
 
     let buffer = render_to_buffer(&state, 100, 24);
     assert_eq!(find_fragment_position(&buffer, "▶"), Some((12, 70)));
-    assert_eq!(find_fragment_position(&buffer, "Session: -"), Some((4, 73)));
 }
 
 #[test]
@@ -2803,7 +2818,7 @@ fn tui_toggles_the_sidebar_with_the_divider_arrow() {
 
     assert!(!state.sidebar_visible());
     let hidden = render_to_buffer(&state, 100, 24);
-    assert_buffer_does_not_contain(&hidden, "Workspace: /workspace");
+    assert_buffer_does_not_contain(&hidden, "Environment");
     assert_eq!(find_fragment_position(&hidden, "◀"), Some((12, 99)));
 
     update(
@@ -2816,7 +2831,7 @@ fn tui_toggles_the_sidebar_with_the_divider_arrow() {
 
     assert!(state.sidebar_visible());
     let visible = render_to_buffer(&state, 100, 24);
-    assert_buffer_contains(&visible, "Workspace: /workspace");
+    assert_buffer_contains(&visible, "Environment");
     assert_eq!(find_fragment_position(&visible, "▶"), Some((12, 60)));
 }
 
@@ -2865,14 +2880,12 @@ fn tui_displays_workspace_model_sandbox_and_summary_status() {
 
     let buffer = render_to_buffer(&state, 120, 30);
 
-    assert_buffer_contains(&buffer, "Workspace ID: workspace-1234");
-    assert_buffer_contains(&buffer, "Model: deepseek/deepseek-chat");
-    assert_buffer_contains(&buffer, "Filesystem: read-only");
-    assert_buffer_contains(&buffer, "Network: deny by default");
-    assert_buffer_contains(&buffer, "Native commands: disabled");
-    assert_buffer_contains(&buffer, "Session: -");
-    assert_buffer_contains(&buffer, "Run: -");
-    assert_buffer_contains(&buffer, "Status: Idle");
+    assert_buffer_contains(&buffer, "deepseek/deepseek-chat");
+    assert_buffer_contains(&buffer, "FS  read-only");
+    assert_buffer_contains(&buffer, "Net deny by default");
+    assert_buffer_contains(&buffer, "Cmd disabled");
+    assert_buffer_contains(&buffer, "No session");
+    assert_buffer_contains(&buffer, "Idle");
     assert_buffer_does_not_contain(&buffer, "Session - | Run -");
 }
 
@@ -3264,6 +3277,42 @@ fn tui_browses_input_history_and_restores_the_current_draft() {
         AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), "current draft");
+}
+
+#[test]
+fn tui_browses_persisted_session_input_history() {
+    let workspace = assert_fs::TempDir::new().expect("temp workspace exists");
+    let store = SqliteWorkspaceStore::new(workspace.path());
+    let _first_run = store
+        .create_run("first request".to_owned())
+        .expect("first run is created");
+    let _second_run = store
+        .create_run("second request".to_owned())
+        .expect("second run is created");
+
+    let mut state = AppState::new(workspace.path());
+    load_active_session_history(&mut state, &store).expect("history loads");
+    type_text(&mut state, "draft");
+
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+    );
+    assert_eq!(state.input_text(), "second request");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+    );
+    assert_eq!(state.input_text(), "first request");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    );
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    );
+    assert_eq!(state.input_text(), "draft");
 }
 
 #[test]

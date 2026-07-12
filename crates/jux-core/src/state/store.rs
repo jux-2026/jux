@@ -188,6 +188,25 @@ impl SqliteWorkspaceStore {
         Ok(session)
     }
 
+    pub fn delete_session(&self, session_id: &SessionId) -> Result<(), StoreError> {
+        self.load_session(session_id)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run_prefix = format!("{}-%", session_id.as_str());
+        transaction.execute("delete from steps where id like ?1", params![run_prefix])?;
+        transaction.execute("delete from runs where id like ?1", params![run_prefix])?;
+        transaction.execute(
+            "delete from session_context_items where session_id = ?1",
+            params![session_id.as_str()],
+        )?;
+        transaction.execute(
+            "delete from sessions where id = ?1",
+            params![session_id.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn set_active_session(&self, session_id: &SessionId) -> Result<Workspace, StoreError> {
         self.load_session(session_id)?;
         let mut workspace = self.load_workspace()?;
