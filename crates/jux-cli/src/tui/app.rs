@@ -2167,14 +2167,14 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Up, ..
-        }) if state.input.is_empty() || state.input_history_index.is_some() => {
+        }) if state.input_history_index.is_some() || !state.input.contains('\n') => {
             state.browse_input_history(true);
             None
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Down,
             ..
-        }) if state.input_history_index.is_some() => {
+        }) if state.input_history_index.is_some() || !state.input.contains('\n') => {
             state.browse_input_history(false);
             None
         }

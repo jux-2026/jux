@@ -3,13 +3,14 @@ use super::super::text::{
     apply_text_selection, full_width_line, padded_full_width_lines, truncate_timeline_detail,
 };
 use super::super::theme::{CONVERSATION_PADDING, palette, panel_block};
+use super::markdown::MarkdownRenderer;
 use crate::tui::{
     AppState, MessageRole, SelectionPanel, TimelineStatus, TuiCodeChangeResult, TuiRunStatus,
 };
 use jux_core::HumanInputKind;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -89,7 +90,7 @@ fn prompt_panel(
                     label.to_owned()
                 };
                 lines.push(Line::styled(label, Style::default().fg(color)));
-                lines.extend(markdown_lines(&message.content));
+                lines.extend(MarkdownRenderer::new(content_width).render(&message.content));
                 lines.push(Line::from(""));
             }
         }
@@ -225,87 +226,6 @@ fn prompt_panel(
         paragraph.scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
         scroll,
     )
-}
-
-fn markdown_lines(content: &str) -> Vec<Line<'static>> {
-    const CODE_BACKGROUND: Color = Color::Rgb(24, 28, 34);
-    let mut rendered = Vec::new();
-    let mut code_language: Option<String> = None;
-    for raw_line in content.lines() {
-        if let Some(language) = raw_line.strip_prefix("```") {
-            if code_language.is_some() {
-                code_language = None;
-            } else {
-                let language = if language.trim().is_empty() {
-                    "code"
-                } else {
-                    language.trim()
-                };
-                rendered.push(Line::styled(
-                    format!(" {language} "),
-                    Style::default().fg(Color::DarkGray).bg(CODE_BACKGROUND),
-                ));
-                code_language = Some(language.to_owned());
-            }
-            continue;
-        }
-        if code_language.is_some() {
-            rendered.push(Line::styled(
-                format!(" {raw_line}"),
-                Style::default().fg(Color::White).bg(CODE_BACKGROUND),
-            ));
-            continue;
-        }
-        if let Some(heading) = raw_line.strip_prefix("### ") {
-            rendered.push(Line::styled(
-                heading.to_owned(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        } else if let Some(heading) = raw_line
-            .strip_prefix("## ")
-            .or_else(|| raw_line.strip_prefix("# "))
-        {
-            rendered.push(Line::styled(
-                heading.to_owned(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        } else if let Some(quote) = raw_line.strip_prefix("> ") {
-            rendered.push(Line::styled(
-                format!("│ {quote}"),
-                Style::default()
-                    .fg(Color::Gray)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-        } else if let Some(item) = raw_line
-            .strip_prefix("- ")
-            .or_else(|| raw_line.strip_prefix("* "))
-        {
-            rendered.push(Line::from(format!("• {item}")));
-        } else if raw_line.starts_with('|') && raw_line.ends_with('|') {
-            let cells = raw_line
-                .trim_matches('|')
-                .split('|')
-                .map(str::trim)
-                .collect::<Vec<_>>();
-            if cells.iter().all(|cell| {
-                cell.chars()
-                    .all(|character| character == '-' || character == ':')
-            }) {
-                rendered.push(Line::from(
-                    cells.iter().map(|_| "───").collect::<Vec<_>>().join("┼"),
-                ));
-            } else {
-                rendered.push(Line::from(cells.join(" │ ")));
-            }
-        } else {
-            rendered.push(Line::from(raw_line.to_owned()));
-        }
-    }
-    rendered
 }
 
 fn render_conversation_scrollbar(

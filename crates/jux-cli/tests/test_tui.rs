@@ -2798,6 +2798,60 @@ fn tui_completes_commands_and_restores_submitted_input_history() {
 }
 
 #[test]
+fn tui_browses_input_history_and_restores_the_current_draft() {
+    let mut state = AppState::new("/workspace");
+    for request in ["first request", "second request"] {
+        type_text(&mut state, request);
+        update(
+            &mut state,
+            AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        update(&mut state, AppAction::RunCanceled);
+    }
+    type_text(&mut state, "current draft");
+
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+    );
+    assert_eq!(state.input_text(), "second request");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+    );
+    assert_eq!(state.input_text(), "first request");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    );
+    assert_eq!(state.input_text(), "second request");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    );
+    assert_eq!(state.input_text(), "current draft");
+}
+
+#[test]
+fn tui_keeps_up_and_down_for_cursor_movement_in_multiline_input() {
+    let mut state = AppState::new("/workspace");
+    type_text(&mut state, "first");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+    );
+    type_text(&mut state, "second");
+
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+    );
+    type_text(&mut state, "!");
+
+    assert_eq!(state.input_text(), "first!\nsecond");
+}
+
+#[test]
 fn tui_completes_inline_skill_references_for_the_next_run() {
     let mut state = AppState::new("/workspace");
     state.set_skill_catalog(SkillCatalog {
@@ -2825,7 +2879,7 @@ fn tui_renders_markdown_and_code_blocks_with_terminal_styles() {
     update(
         &mut state,
         AppAction::AssistantMessage {
-            content: "# Heading\n- item\n> quote\n```rust\nfn main() {}\n```\n| A | B |\n|---|---|"
+            content: "# Heading\n- item\n> quote\n```rust\nfn main() {}\n```\n| Command | 说明 |\n|---|---|\n| `cargo test` | 运行测试 |"
                 .to_owned(),
         },
     );
@@ -2834,7 +2888,15 @@ fn tui_renders_markdown_and_code_blocks_with_terminal_styles() {
     assert_buffer_contains(&buffer, "• item");
     assert_buffer_contains(&buffer, "│ quote");
     assert_buffer_contains(&buffer, "rust");
-    assert_buffer_contains(&buffer, "A │ B");
+    assert_buffer_contains(&buffer, "┌");
+    assert_buffer_contains(&buffer, "┬");
+    assert_buffer_contains(&buffer, "┐");
+    assert_buffer_contains(&buffer, "└");
+    assert_buffer_contains(&buffer, "┴");
+    assert_buffer_contains(&buffer, "┘");
+    assert_buffer_contains(&buffer, "cargo test");
+    assert_buffer_does_not_contain(&buffer, "`cargo test`");
+    assert_buffer_fragment_has_fg_bg(&buffer, "cargo test", Color::Yellow, Color::Rgb(38, 44, 52));
 }
 
 #[test]
