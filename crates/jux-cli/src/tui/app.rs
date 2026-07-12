@@ -857,7 +857,6 @@ impl AppState {
         self.indexed_files
             .iter()
             .filter(|path| fuzzy_path_match(path, &query))
-            .take(8)
             .map(String::as_str)
             .collect()
     }
@@ -867,7 +866,14 @@ impl AppState {
         self.selected_file_reference
     }
 
-    fn complete_file_reference(&mut self) {
+    pub(super) fn completed_file_reference_ranges(&self) -> Vec<(usize, usize)> {
+        reference_ranges(&self.input)
+            .into_iter()
+            .filter(|(start, end)| self.reference_path_exists(&self.input[*start..*end]))
+            .collect()
+    }
+
+    fn complete_file_reference(&mut self, finish_token: bool) {
         let Some(path) = self
             .file_reference_suggestions()
             .get(self.selected_file_reference)
@@ -878,11 +884,14 @@ impl AppState {
         let token_start = self.input[..self.cursor]
             .rfind(char::is_whitespace)
             .map_or(0, |index| index + 1);
-        let reference = if path.chars().any(char::is_whitespace) {
+        let mut reference = if path.chars().any(char::is_whitespace) {
             format!("@{{{path}}}")
         } else {
             format!("@{path}")
         };
+        if finish_token {
+            reference.push(' ');
+        }
         self.remember_undo_state();
         self.input
             .replace_range(token_start..self.cursor, &reference);
@@ -2056,7 +2065,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         AppAction::Key(KeyEvent {
             code: KeyCode::Tab, ..
         }) if !state.file_reference_suggestions().is_empty() => {
-            state.complete_file_reference();
+            state.complete_file_reference(false);
             None
         }
         AppAction::Key(KeyEvent {
@@ -2236,8 +2245,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             code: KeyCode::Up, ..
         }) if !state.file_reference_suggestions().is_empty() => {
             let count = state.file_reference_suggestions().len();
-            state.selected_file_reference = state
-                .selected_file_reference
+            state.selected_file_reference = (state.selected_file_reference % count)
                 .checked_sub(1)
                 .unwrap_or(count - 1);
             None
@@ -2319,7 +2327,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             code: KeyCode::Enter,
             ..
         }) if !state.file_reference_suggestions().is_empty() => {
-            state.complete_file_reference();
+            state.complete_file_reference(true);
             None
         }
         AppAction::Key(KeyEvent {

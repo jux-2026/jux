@@ -254,10 +254,78 @@ fn tui_completes_file_references_and_renders_suggestions() {
     assert_buffer_contains(&buffer, "@src/main.rs");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
-    assert_eq!(state.input_text(), "Please inspect @src/main.rs");
+    assert_eq!(state.input_text(), "Please inspect @src/main.rs ");
+    let completed = render_to_buffer(&state, 80, 24);
+    assert_buffer_fragment_has_foreground(&completed, "@src/main.rs", Color::Cyan);
+    assert_eq!(find_fragment_position(&completed, "@README.md"), None);
+}
+
+#[test]
+fn tui_file_reference_popup_clears_the_conversation_beneath_it() {
+    let mut state = AppState::new("/workspace");
+    update(
+        &mut state,
+        AppAction::AssistantMessage {
+            content: (0..14)
+                .map(|index| format!("UNDERLYING CONVERSATION TEXT {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        },
+    );
+    update(
+        &mut state,
+        AppAction::FileIndexUpdated(FileIndexSnapshot {
+            kind: FileIndexKind::Filesystem,
+            files: (0..8).map(|index| format!("src/file-{index}.rs")).collect(),
+        }),
+    );
+    type_text(&mut state, "@");
+
+    let buffer = render_to_buffer(&state, 80, 24);
+
+    assert_buffer_contains(&buffer, "@src/file-0.rs");
+    let (row, column) = find_fragment_position(&buffer, "@src/file-0.rs")
+        .expect("first file suggestion is rendered");
+    let content_end = column + "@src/file-0.rs".chars().count() as u16;
+    assert!(
+        (content_end..content_end + 12).all(|x| buffer
+            .cell((x, row))
+            .is_some_and(|cell| cell.symbol() == " ")),
+        "file popup leaves conversation text behind"
+    );
+}
+
+#[test]
+fn tui_file_reference_selection_scrolls_through_all_matches() {
+    let mut state = AppState::new("/workspace");
+    update(
+        &mut state,
+        AppAction::FileIndexUpdated(FileIndexSnapshot {
+            kind: FileIndexKind::Filesystem,
+            files: (0..12)
+                .map(|index| format!("src/file-{index:02}.rs"))
+                .collect(),
+        }),
+    );
+    type_text(&mut state, "@");
+    for _ in 0..8 {
+        update(
+            &mut state,
+            AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        );
+    }
+
+    let buffer = render_to_buffer(&state, 80, 24);
+    assert_buffer_contains(&buffer, "@src/file-08.rs");
+    assert_buffer_does_not_contain(&buffer, "@src/file-00.rs");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    assert_eq!(state.input_text(), "@src/file-08.rs ");
 }
 
 #[test]
@@ -3204,6 +3272,18 @@ fn assert_buffer_fragment_has_background(buffer: &Buffer, expected: &str, backgr
             .cell((column, y))
             .is_some_and(|cell| cell.bg == background)),
         "fragment {expected:?} does not have expected background"
+    );
+}
+
+fn assert_buffer_fragment_has_foreground(buffer: &Buffer, expected: &str, foreground: Color) {
+    let (y, x) = find_fragment_position(buffer, expected)
+        .unwrap_or_else(|| panic!("buffer does not contain fragment {expected:?}"));
+    let end = x + expected.chars().count() as u16;
+    assert!(
+        (x..end).all(|column| buffer
+            .cell((column, y))
+            .is_some_and(|cell| cell.fg == foreground)),
+        "fragment {expected:?} does not have expected foreground"
     );
 }
 

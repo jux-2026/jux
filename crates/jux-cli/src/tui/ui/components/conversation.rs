@@ -15,9 +15,11 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    Block, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_FILE_REFERENCE_ROWS: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConversationScroll {
@@ -586,19 +588,31 @@ fn render_file_reference_popup(
         return;
     }
     let available_height = input_top.saturating_sub(input_bounds.y);
-    let height = u16::try_from(suggestions.len())
-        .unwrap_or(available_height)
-        .saturating_add(2)
-        .min(available_height);
+    let visible_count = suggestions
+        .len()
+        .min(MAX_FILE_REFERENCE_ROWS)
+        .min(usize::from(available_height.saturating_sub(2)));
+    let height = u16::try_from(visible_count)
+        .unwrap_or_default()
+        .saturating_add(2);
     if height < 3 {
         return;
     }
+    let selected = state
+        .selected_file_reference()
+        .min(suggestions.len().saturating_sub(1));
+    let window_start = selected
+        .saturating_add(1)
+        .saturating_sub(visible_count)
+        .min(suggestions.len().saturating_sub(visible_count));
     let row_width = usize::from(input_bounds.width.saturating_sub(2));
     let lines = suggestions
         .iter()
         .enumerate()
+        .skip(window_start)
+        .take(visible_count)
         .map(|(index, path)| {
-            let style = if index == state.selected_file_reference() {
+            let style = if index == selected {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
             } else {
                 Style::default().fg(Color::Gray)
@@ -619,6 +633,7 @@ fn render_file_reference_popup(
         height,
     );
     let background = palette(state.theme()).popup;
+    frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
             .block(
@@ -728,6 +743,7 @@ fn input_lines(state: &AppState) -> Vec<Line<'_>> {
             ),
         ])];
     }
+    let mut line_start = 0;
     state
         .input_text()
         .split('\n')
@@ -738,7 +754,39 @@ fn input_lines(state: &AppState) -> Vec<Line<'_>> {
             } else {
                 Span::raw("   ")
             };
-            Line::from(vec![prefix, Span::raw(line)])
+            let mut spans = vec![prefix];
+            spans.extend(highlighted_file_references(state, line, line_start));
+            line_start += line.len() + 1;
+            Line::from(spans)
         })
         .collect()
+}
+
+fn highlighted_file_references<'a>(
+    state: &AppState,
+    line: &'a str,
+    line_start: usize,
+) -> Vec<Span<'a>> {
+    let line_end = line_start + line.len();
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in state.completed_file_reference_ranges() {
+        if start < line_start || end > line_end {
+            continue;
+        }
+        let local_start = start - line_start;
+        let local_end = end - line_start;
+        if cursor < local_start {
+            spans.push(Span::raw(&line[cursor..local_start]));
+        }
+        spans.push(Span::styled(
+            &line[local_start..local_end],
+            Style::default().fg(Color::Cyan),
+        ));
+        cursor = local_end;
+    }
+    if cursor < line.len() {
+        spans.push(Span::raw(&line[cursor..]));
+    }
+    spans
 }
