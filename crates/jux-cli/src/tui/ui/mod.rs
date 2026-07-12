@@ -19,7 +19,7 @@ pub fn render_app(frame: &mut Frame<'_>, state: &AppState) {
     render_workspace(frame, state, frame.area());
 }
 
-pub(crate) use self::components::conversation::conversation_max_scroll;
+pub(crate) use self::components::conversation::{command_toggle_at, conversation_max_scroll};
 
 fn render_workspace(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     if area.width < 20 || area.height < 6 {

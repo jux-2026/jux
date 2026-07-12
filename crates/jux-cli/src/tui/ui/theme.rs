@@ -6,7 +6,6 @@ pub(super) const CONVERSATION_BACKGROUND: Color = Color::Rgb(12, 18, 24);
 pub(super) const SIDEBAR_BACKGROUND: Color = Color::Rgb(18, 24, 32);
 pub(super) const DIVIDER_BACKGROUND: Color = Color::Rgb(24, 32, 42);
 pub(super) const COMMAND_POPUP_BACKGROUND: Color = Color::Rgb(28, 36, 46);
-pub(super) const USER_MESSAGE_BACKGROUND: Color = Color::Rgb(24, 34, 44);
 pub(super) const STATUS_BAR_BACKGROUND: Color = Color::Rgb(18, 28, 36);
 pub(super) const CONVERSATION_PADDING: u16 = 1;
 
@@ -16,7 +15,6 @@ pub(super) struct ThemePalette {
     pub sidebar: Color,
     pub divider: Color,
     pub popup: Color,
-    pub user_message: Color,
     pub status: Color,
     pub input: Color,
     pub input_inactive: Color,
@@ -29,7 +27,6 @@ pub(super) fn palette(theme: TuiTheme) -> ThemePalette {
             sidebar: SIDEBAR_BACKGROUND,
             divider: DIVIDER_BACKGROUND,
             popup: COMMAND_POPUP_BACKGROUND,
-            user_message: USER_MESSAGE_BACKGROUND,
             status: STATUS_BAR_BACKGROUND,
             input: Color::Rgb(20, 38, 48),
             input_inactive: Color::Rgb(16, 28, 36),
@@ -39,7 +36,6 @@ pub(super) fn palette(theme: TuiTheme) -> ThemePalette {
             sidebar: Color::Rgb(8, 8, 8),
             divider: Color::White,
             popup: Color::Rgb(32, 32, 32),
-            user_message: Color::Rgb(48, 48, 48),
             status: Color::Rgb(24, 24, 24),
             input: Color::Rgb(0, 48, 64),
             input_inactive: Color::Rgb(16, 16, 16),

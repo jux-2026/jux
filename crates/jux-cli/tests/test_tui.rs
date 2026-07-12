@@ -334,8 +334,7 @@ fn tui_displays_the_submitted_user_request() {
 
     let buffer = render_to_buffer(&state, 80, 24);
 
-    assert_buffer_contains(&buffer, "You");
-    assert_buffer_contains(&buffer, "Explain this workspace");
+    assert_buffer_contains(&buffer, "> Explain this workspace");
 }
 
 #[test]
@@ -361,8 +360,7 @@ fn tui_displays_the_agent_response() {
         },
     );
 
-    let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&buffer, "Jux");
+    let buffer = render_to_buffer(&state, 80, 40);
     assert_buffer_contains(&buffer, "The workspace contains two crates.");
     let (user_row, _) =
         find_fragment_position(&buffer, "User request").expect("user message is rendered");
@@ -374,7 +372,7 @@ fn tui_displays_the_agent_response() {
             .expect("second assistant response is rendered");
     assert_eq!(
         find_fragment_position(&buffer, "User request"),
-        Some((3, 2))
+        Some((2, 4))
     );
     assert_eq!(
         buffer.cell((1, user_row)).map(|cell| cell.symbol()),
@@ -384,8 +382,8 @@ fn tui_displays_the_agent_response() {
         buffer.cell((46, user_row)).map(|cell| cell.symbol()),
         Some("\u{00a0}")
     );
-    for row in user_row.saturating_sub(2)..=user_row.saturating_add(1) {
-        assert_row_has_background(&buffer, row, 1, 47, user_message_background());
+    for row in user_row.saturating_sub(1)..=user_row.saturating_add(1) {
+        assert_row_has_background(&buffer, row, 1, 47, input_active_background());
     }
     assert_row_has_background(
         &buffer,
@@ -408,6 +406,131 @@ fn tui_displays_the_agent_response() {
         47,
         conversation_background(),
     );
+}
+
+#[test]
+fn tui_keeps_commands_in_their_conversation_order() {
+    let mut state = AppState::new("/workspace");
+    update(
+        &mut state,
+        AppAction::AssistantMessage {
+            content: "First response".to_owned(),
+        },
+    );
+    update(
+        &mut state,
+        AppAction::AgentEvent(AgentEvent::new(
+            AgentEventId::tool(1, "exec", 1),
+            AgentEventKind::Started,
+            AgentEventData::ToolStarted {
+                name: "exec".to_owned(),
+                call_id: Some("call-1".to_owned()),
+                arguments: serde_json::json!({ "program": "first", "args": [] }),
+            },
+        )),
+    );
+    update(
+        &mut state,
+        AppAction::AssistantMessage {
+            content: "Second response".to_owned(),
+        },
+    );
+    update(
+        &mut state,
+        AppAction::AgentEvent(AgentEvent::new(
+            AgentEventId::tool(1, "exec", 2),
+            AgentEventKind::Started,
+            AgentEventData::ToolStarted {
+                name: "exec".to_owned(),
+                call_id: Some("call-2".to_owned()),
+                arguments: serde_json::json!({ "program": "second", "args": [] }),
+            },
+        )),
+    );
+
+    let buffer = render_to_buffer(&state, 100, 40);
+    let first_response =
+        find_fragment_position(&buffer, "First response").expect("first response is rendered");
+    let first_command =
+        find_fragment_position(&buffer, "▶ $ first").expect("first command is rendered");
+    let second_response =
+        find_fragment_position(&buffer, "Second response").expect("second response is rendered");
+    let second_command =
+        find_fragment_position(&buffer, "▶ $ second").expect("second command is rendered");
+    assert!(
+        first_response.0 < first_command.0
+            && first_command.0 < second_response.0
+            && second_response.0 < second_command.0
+    );
+}
+
+#[test]
+fn tui_keeps_persisted_commands_visible_when_a_run_finishes() {
+    let mut state = AppState::new("/workspace");
+    type_text(&mut state, "Inspect the workspace");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    let run_id = RunId::from("workspace-0001-000001".to_owned());
+    let steps = vec![
+        Step::new(
+            StepId::new(&run_id, 1),
+            StepKind::UserMessage,
+            StepPayload::UserMessage {
+                content: "Inspect the workspace".to_owned(),
+            },
+        ),
+        assistant_step(&run_id, 2, "I will inspect the workspace."),
+        assistant_step(&run_id, 3, "I need one command."),
+        Step::new(
+            StepId::new(&run_id, 4),
+            StepKind::AssistantResponse,
+            StepPayload::AssistantResponse {
+                message_id: None,
+                usage: LlmUsage::default(),
+                items: vec![AssistantResponseItem::ToolCall {
+                    id: "tool-1".to_owned(),
+                    call_id: Some("call-1".to_owned()),
+                    name: "exec".to_owned(),
+                    arguments: serde_json::json!({ "program": "ls", "args": [] }),
+                }],
+            },
+        ),
+        Step::new(
+            StepId::new(&run_id, 5),
+            StepKind::ToolResult,
+            StepPayload::ToolResult {
+                id: "tool-1".to_owned(),
+                call_id: Some("call-1".to_owned()),
+                content: serde_json::json!({
+                    "success": true,
+                    "exit_code": 0,
+                    "stdout": "Cargo.toml",
+                    "stderr": ""
+                }),
+            },
+        ),
+        assistant_step(&run_id, 6, "Inspection complete."),
+    ];
+
+    update(
+        &mut state,
+        AppAction::RunFinished {
+            response: RunResponse {
+                session_id: "workspace-0001".to_owned(),
+                run_id: run_id.to_string(),
+                status: CoreRunStatus::Completed,
+                created_at: 1_000,
+                updated_at: 1_500,
+                answer: Some("Inspection complete.".to_owned()),
+                steps,
+            },
+        },
+    );
+
+    let buffer = render_to_buffer(&state, 100, 40);
+    assert_buffer_contains(&buffer, "▶ $ ls");
 }
 
 #[test]
@@ -448,7 +571,7 @@ fn tui_scrolls_through_messages_longer_than_the_viewport() {
         },
     );
     let scrolled = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&scrolled, "response-5");
+    assert_buffer_contains(&scrolled, "response-8");
     assert_buffer_does_not_contain(&scrolled, "response-11");
     assert!(scrollbar_thumb_start(&scrolled, 47) < initial_thumb_row);
     update(
@@ -714,10 +837,10 @@ fn tui_updates_llm_lifecycle_in_the_timeline() {
             AgentEventData::LlmCompleted,
         )),
     );
-    assert_eq!(state.timeline().len(), 1);
+    assert!(state.timeline().is_empty());
     let completed = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&completed, "LLM");
-    assert_buffer_contains(&completed, "Completed");
+    assert_buffer_does_not_contain(&completed, "LLM");
+    assert_buffer_does_not_contain(&completed, "Completed");
 }
 
 #[test]
@@ -754,9 +877,27 @@ fn tui_updates_tool_lifecycle_and_keeps_its_output() {
             AgentEventData::ToolStarted {
                 name: "exec".to_owned(),
                 call_id: Some("call-1".to_owned()),
-                arguments: serde_json::json!({ "command": "cargo test" }),
+                arguments: serde_json::json!({ "program": "cargo", "args": ["test"] }),
             },
         )),
+    );
+    let running = render_to_buffer(&state, 80, 24);
+    let (running_row, running_column) =
+        find_fragment_position(&running, "▶ $ cargo test").expect("running command is rendered");
+    let running_color = running
+        .cell((running_column, running_row))
+        .map(|cell| cell.fg)
+        .expect("running command icon has a color");
+    assert!(
+        [
+            Color::Rgb(70, 130, 180),
+            Color::Rgb(64, 170, 190),
+            Color::Rgb(80, 200, 170),
+            Color::Rgb(190, 210, 90),
+            Color::Rgb(230, 180, 70),
+            Color::Rgb(170, 110, 190),
+        ]
+        .contains(&running_color)
     );
     update(
         &mut state,
@@ -765,7 +906,12 @@ fn tui_updates_tool_lifecycle_and_keeps_its_output() {
             AgentEventKind::Output,
             AgentEventData::ToolOutput {
                 name: "exec".to_owned(),
-                content: serde_json::json!({ "stdout": "tests passed" }),
+                content: serde_json::json!({
+                    "success": true,
+                    "exit_code": 0,
+                    "stdout": "tests passed",
+                    "stderr": ""
+                }),
             },
         )),
     );
@@ -783,9 +929,15 @@ fn tui_updates_tool_lifecycle_and_keeps_its_output() {
 
     assert_eq!(state.timeline().len(), 1);
     let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&buffer, "Tool: exec");
-    assert_buffer_contains(&buffer, "Completed");
-    assert_buffer_contains(&buffer, "tests passed");
+    assert_buffer_contains(&buffer, "$ cargo test");
+    assert_buffer_does_not_contain(&buffer, "Succeeded");
+    assert_buffer_does_not_contain(&buffer, "exit 0");
+    assert_buffer_does_not_contain(&buffer, "stdout 1 line(s)");
+    assert_buffer_does_not_contain(&buffer, "tests passed");
+    assert_buffer_does_not_contain(&buffer, "╭");
+    assert_buffer_does_not_contain(&buffer, "╮");
+    assert_buffer_fragment_has_fg_bg(&buffer, "cargo", Color::Yellow, Color::Rgb(20, 28, 36));
+    assert_buffer_fragment_has_fg_bg(&buffer, "▶", Color::Green, Color::Rgb(20, 28, 36));
 }
 
 #[test]
@@ -800,7 +952,7 @@ fn tui_expands_tool_arguments_and_output() {
             AgentEventData::ToolStarted {
                 name: "exec".to_owned(),
                 call_id: Some("call-1".to_owned()),
-                arguments: serde_json::json!({ "command": "cargo test" }),
+                arguments: serde_json::json!({ "program": "cargo", "args": ["test"] }),
             },
         )),
     );
@@ -812,7 +964,9 @@ fn tui_expands_tool_arguments_and_output() {
             AgentEventData::ToolOutput {
                 name: "exec".to_owned(),
                 content: serde_json::json!({
+                    "success": true,
                     "stdout": "all tests passed",
+                    "stderr": "",
                     "exit_code": 0
                 }),
             },
@@ -820,41 +974,168 @@ fn tui_expands_tool_arguments_and_output() {
     );
 
     let collapsed = render_to_buffer(&state, 80, 24);
-    assert_buffer_does_not_contain(&collapsed, "Arguments:");
-
-    update(
-        &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-    );
+    assert_buffer_contains(&collapsed, "▶ $ cargo test");
+    assert_buffer_does_not_contain(&collapsed, "all tests passed");
     update(
         &mut state,
         AppAction::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
     );
+    assert_eq!(state.input_text(), " ");
+    let collapsed = render_to_buffer(&state, 80, 24);
+    let (toggle_row, command_column) =
+        find_fragment_position(&collapsed, "cargo").expect("command is rendered");
+
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                command_column,
+                toggle_row,
+            ),
+            viewport: TuiViewport {
+                width: 80,
+                height: 24,
+            },
+        },
+    );
 
     let expanded = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&expanded, "Arguments:");
-    assert_buffer_contains(&expanded, "cargo test");
-    assert_buffer_contains(&expanded, "Output:");
+    assert_buffer_contains(&expanded, "▼ $ cargo test");
+    assert_buffer_contains(&expanded, "stdout");
+    assert_buffer_contains(&expanded, "stderr");
     assert_buffer_contains(&expanded, "all tests passed");
+    assert_buffer_contains(&expanded, "No standard error");
+    let (expanded_row, _) =
+        find_fragment_position(&expanded, "▼ $ cargo test").expect("expanded command is rendered");
+    let (_, divider_column) =
+        find_fragment_position(&expanded, "▶").expect("conversation divider is rendered");
+    assert_row_has_background(
+        &expanded,
+        expanded_row,
+        1,
+        divider_column.saturating_sub(1),
+        Color::Rgb(24, 38, 48),
+    );
 }
 
 #[test]
-fn tui_truncates_long_tool_output() {
+fn tui_renders_long_tool_output_without_truncating_it() {
     let mut state = AppState::new("/workspace");
+    let event_id = AgentEventId::tool(1, "exec", 1);
     update(
         &mut state,
         AppAction::AgentEvent(AgentEvent::new(
-            AgentEventId::tool(1, "exec", 1),
+            event_id.clone(),
+            AgentEventKind::Started,
+            AgentEventData::ToolStarted {
+                name: "exec".to_owned(),
+                call_id: Some("call-1".to_owned()),
+                arguments: serde_json::json!({ "program": "cat", "args": ["large.txt"] }),
+            },
+        )),
+    );
+    update(
+        &mut state,
+        AppAction::AgentEvent(AgentEvent::new(
+            event_id,
             AgentEventKind::Output,
             AgentEventData::ToolOutput {
                 name: "exec".to_owned(),
-                content: serde_json::json!({ "stdout": "中".repeat(500) }),
+                content: serde_json::json!({
+                    "success": true,
+                    "exit_code": 0,
+                    "stdout": format!("{}\nEND OF OUTPUT", "中".repeat(500)),
+                    "stderr": ""
+                }),
+            },
+        )),
+    );
+    let collapsed = render_to_buffer(&state, 120, 30);
+    let (toggle_row, toggle_column) =
+        find_fragment_position(&collapsed, "▶").expect("fold button is rendered");
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                toggle_column,
+                toggle_row,
+            ),
+            viewport: TuiViewport {
+                width: 120,
+                height: 30,
+            },
+        },
+    );
+
+    let buffer = render_to_buffer(&state, 120, 30);
+    assert_buffer_contains(&buffer, "END OF OUTPUT");
+    assert_buffer_does_not_contain(&buffer, "[truncated]");
+}
+
+#[test]
+fn tui_renders_failed_command_status_and_stderr() {
+    let mut state = AppState::new("/workspace");
+    let event_id = AgentEventId::tool(1, "exec", 1);
+    update(
+        &mut state,
+        AppAction::AgentEvent(AgentEvent::new(
+            event_id.clone(),
+            AgentEventKind::Started,
+            AgentEventData::ToolStarted {
+                name: "exec".to_owned(),
+                call_id: Some("call-1".to_owned()),
+                arguments: serde_json::json!({
+                    "program": "cat",
+                    "args": ["missing file.txt"]
+                }),
+            },
+        )),
+    );
+    update(
+        &mut state,
+        AppAction::AgentEvent(AgentEvent::new(
+            event_id,
+            AgentEventKind::Output,
+            AgentEventData::ToolOutput {
+                name: "exec".to_owned(),
+                content: serde_json::json!({
+                    "success": false,
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": "cat: missing file.txt: No such file"
+                }),
             },
         )),
     );
 
-    let buffer = render_to_buffer(&state, 120, 30);
-    assert_buffer_contains(&buffer, "[truncated]");
+    let collapsed = render_to_buffer(&state, 100, 30);
+    assert_buffer_contains(&collapsed, "'missing file.txt'");
+    assert_buffer_does_not_contain(&collapsed, "Failed");
+    assert_buffer_does_not_contain(&collapsed, "exit 1");
+    assert_buffer_does_not_contain(&collapsed, "stderr 1 line(s)");
+    assert_buffer_contains(&collapsed, "cat: missing file.txt: No such file");
+    assert_buffer_fragment_has_fg_bg(&collapsed, "▶", Color::Red, Color::Rgb(20, 28, 36));
+    let (toggle_row, toggle_column) =
+        find_fragment_position(&collapsed, "▶").expect("fold button is rendered");
+
+    update(
+        &mut state,
+        AppAction::Mouse {
+            event: mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                toggle_column,
+                toggle_row,
+            ),
+            viewport: TuiViewport {
+                width: 100,
+                height: 30,
+            },
+        },
+    );
+    let expanded = render_to_buffer(&state, 100, 30);
+    assert_buffer_contains(&expanded, "cat: missing file.txt: No such file");
 }
 
 #[test]
@@ -1366,6 +1647,90 @@ fn tui_loads_active_session_history_from_the_workspace_store() {
     assert_buffer_contains(&buffer, "Historical request");
     assert_buffer_contains(&buffer, "Historical answer");
     assert_buffer_contains(&buffer, &run.id.to_string());
+}
+
+#[test]
+fn tui_restores_persisted_command_output_when_loading_a_session() {
+    let workspace = assert_fs::TempDir::new().expect("temp workspace exists");
+    let store = SqliteWorkspaceStore::new(workspace.path());
+    let run = store
+        .create_run("Inspect files".to_owned())
+        .expect("run is created");
+    store
+        .append_step(
+            &run.id,
+            StepKind::AssistantResponse,
+            StepPayload::AssistantResponse {
+                message_id: Some("message-1".to_owned()),
+                usage: LlmUsage::default(),
+                items: vec![AssistantResponseItem::ToolCall {
+                    id: "tool-1".to_owned(),
+                    call_id: Some("call-1".to_owned()),
+                    name: "exec".to_owned(),
+                    arguments: serde_json::json!({
+                        "program": "ls",
+                        "args": ["-la"]
+                    }),
+                }],
+            },
+        )
+        .expect("tool call is persisted");
+    store
+        .append_step(
+            &run.id,
+            StepKind::ToolResult,
+            StepPayload::ToolResult {
+                id: "tool-1".to_owned(),
+                call_id: Some("call-1".to_owned()),
+                content: serde_json::json!({
+                    "success": true,
+                    "exit_code": 0,
+                    "stdout": "README.md\nsrc",
+                    "stderr": ""
+                }),
+            },
+        )
+        .expect("tool result is persisted");
+    store
+        .update_run_status(&run.id, CoreRunStatus::Completed)
+        .expect("run completes");
+
+    let mut restored = AppState::new(workspace.path());
+    load_active_session_history(&mut restored, &store).expect("history loads");
+
+    let command = restored.timeline()[0]
+        .command
+        .as_ref()
+        .expect("command is restored");
+    assert_eq!(command.program, "ls");
+    assert_eq!(command.args, ["-la"]);
+    assert_eq!(command.exit_code, Some(0));
+    assert_eq!(command.stdout, "README.md\nsrc");
+    assert!(!restored.timeline()[0].expanded);
+    let collapsed = render_to_buffer(&restored, 100, 30);
+    assert_buffer_contains(&collapsed, "▶ $ ls -la");
+    assert_buffer_does_not_contain(&collapsed, "stdout 2 line(s)");
+    assert_buffer_does_not_contain(&collapsed, "README.md");
+    let (toggle_row, toggle_column) =
+        find_fragment_position(&collapsed, "▶").expect("fold button is rendered");
+
+    update(
+        &mut restored,
+        AppAction::Mouse {
+            event: mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                toggle_column,
+                toggle_row,
+            ),
+            viewport: TuiViewport {
+                width: 100,
+                height: 30,
+            },
+        },
+    );
+    let expanded = render_to_buffer(&restored, 100, 30);
+    assert_buffer_contains(&expanded, "▼ $ ls -la");
+    assert_buffer_contains(&expanded, "README.md");
 }
 
 #[test]
@@ -2066,6 +2431,24 @@ fn tui_distinguishes_operation_confirmation_from_clarification() {
 #[test]
 fn tui_displays_the_completed_run_answer() {
     let mut state = AppState::new("/workspace");
+    let run_id = RunId::from("workspace-0001-000001".to_owned());
+    let response_step = Step::new(
+        StepId::new(&run_id, 1),
+        StepKind::AssistantResponse,
+        StepPayload::AssistantResponse {
+            message_id: Some("message-1".to_owned()),
+            usage: LlmUsage {
+                input_tokens: 120,
+                output_tokens: 30,
+                total_tokens: 150,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+            items: vec![AssistantResponseItem::Text {
+                content: "The requested change is complete.".to_owned(),
+            }],
+        },
+    );
 
     update(
         &mut state,
@@ -2077,15 +2460,55 @@ fn tui_displays_the_completed_run_answer() {
                 created_at: 1_000,
                 updated_at: 1_500,
                 answer: Some("The requested change is complete.".to_owned()),
-                steps: Vec::new(),
+                steps: vec![response_step],
             },
         },
+    );
+    let command_event_id = AgentEventId::tool(1, "exec", 1);
+    update(
+        &mut state,
+        AppAction::AgentEvent(AgentEvent::new(
+            command_event_id.clone(),
+            AgentEventKind::Started,
+            AgentEventData::ToolStarted {
+                name: "exec".to_owned(),
+                call_id: Some("call-1".to_owned()),
+                arguments: serde_json::json!({ "program": "ls", "args": ["/etc"] }),
+            },
+        )),
+    );
+    update(
+        &mut state,
+        AppAction::AgentEvent(AgentEvent::new(
+            command_event_id,
+            AgentEventKind::Output,
+            AgentEventData::ToolOutput {
+                name: "exec".to_owned(),
+                content: serde_json::json!({
+                    "success": true,
+                    "exit_code": 0,
+                    "stdout": "hosts",
+                    "stderr": ""
+                }),
+            },
+        )),
     );
 
     assert_eq!(state.run_status(), TuiRunStatus::Completed);
     let buffer = render_to_buffer(&state, 80, 24);
     assert_buffer_contains(&buffer, "Status: Completed");
     assert_buffer_contains(&buffer, "The requested change is complete.");
+    assert_buffer_contains(&buffer, "150 tokens (120 in, 30 out) · 500 ms");
+    let (command_row, _) =
+        find_fragment_position(&buffer, "▶ $ ls /etc").expect("command is rendered");
+    let (summary_row, _) = find_fragment_position(&buffer, "150 tokens")
+        .expect("response summary is rendered after the command");
+    assert!(command_row < summary_row);
+    assert_eq!(
+        find_fragment_position(&buffer, "The requested change is complete.")
+            .map(|(_, column)| column),
+        Some(4)
+    );
 }
 
 #[test]
@@ -2239,21 +2662,21 @@ fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
     update(
         &mut state,
         AppAction::Mouse {
-            event: mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            event: mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 2),
             viewport,
         },
     );
     update(
         &mut state,
         AppAction::Mouse {
-            event: mouse_event(MouseEventKind::Drag(MouseButton::Left), 90, 1),
+            event: mouse_event(MouseEventKind::Drag(MouseButton::Left), 90, 2),
             viewport,
         },
     );
     let command = update(
         &mut state,
         AppAction::Mouse {
-            event: mouse_event(MouseEventKind::Up(MouseButton::Left), 90, 1),
+            event: mouse_event(MouseEventKind::Up(MouseButton::Left), 90, 2),
             viewport,
         },
     );
@@ -2261,7 +2684,8 @@ fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
     assert_eq!(
         command,
         Some(AppCommand::CopyText {
-            content: "Jux".to_owned(),
+            content: "\u{00a0}\u{00a0}\u{00a0}Selectable message\u{00a0}\u{00a0}\u{00a0}"
+                .to_owned(),
         })
     );
     assert_eq!(
@@ -2269,7 +2693,7 @@ fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
         Some(SelectionPanel::Conversation)
     );
     let buffer = render_to_buffer(&state, 100, 24);
-    assert_buffer_fragment_has_fg_bg(&buffer, "Jux", Color::Black, Color::Yellow);
+    assert_buffer_fragment_has_fg_bg(&buffer, "Selectable message", Color::Black, Color::Yellow);
     let completed_selection = state.text_selection();
     let command = update(
         &mut state,
@@ -2759,12 +3183,22 @@ fn sidebar_background() -> Color {
     Color::Rgb(18, 24, 32)
 }
 
-fn user_message_background() -> Color {
-    Color::Rgb(24, 34, 44)
-}
-
 fn input_background() -> Color {
     Color::Rgb(20, 38, 48)
+}
+
+fn assistant_step(run_id: &RunId, index: u64, content: &str) -> Step {
+    Step::new(
+        StepId::new(run_id, index),
+        StepKind::AssistantResponse,
+        StepPayload::AssistantResponse {
+            message_id: None,
+            usage: LlmUsage::default(),
+            items: vec![AssistantResponseItem::Text {
+                content: content.to_owned(),
+            }],
+        },
+    )
 }
 
 fn status_bar_background() -> Color {
@@ -3022,7 +3456,7 @@ fn tui_searches_conversation_and_cycles_matching_messages() {
         AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     let first = render_to_buffer(&state, 100, 30);
-    assert_buffer_contains(&first, "▶ You");
+    assert_buffer_contains(&first, "▶ first needle");
     type_text(&mut state, "/search needle");
     update(
         &mut state,

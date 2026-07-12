@@ -24,6 +24,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 #[allow(dead_code)]
@@ -153,82 +154,91 @@ fn run_app_loop(
             }
             continue;
         }
-        if let Ok(event) = event_handler.recv() {
-            let event = match event {
-                TuiEvent::ScrollDelta { delta, .. } => {
-                    let starts_new_scroll = pending_scroll_delta == 0;
-                    pending_scroll_delta = pending_scroll_delta.saturating_add(delta);
-                    if starts_new_scroll && pending_scroll_delta != 0 {
-                        next_frame = Instant::now();
-                    }
-                    continue;
-                }
-                TuiEvent::Terminal(event) => event,
-                TuiEvent::Closed => break,
-            };
-            // Clicks, drags, and keyboard input must be visible immediately;
-            // only wheel bursts are intentionally deferred/coalesced.
-            if !matches!(event, Event::Mouse(mouse) if matches!(
-                mouse.kind,
-                crossterm::event::MouseEventKind::ScrollUp
-                    | crossterm::event::MouseEventKind::ScrollDown
-            )) {
-                next_frame = Instant::now();
-            }
-            let action = match event {
-                Event::Key(key) if key.kind != KeyEventKind::Release => Some(AppAction::Key(key)),
-                Event::Mouse(event) => {
-                    let size = terminal.size()?;
-                    Some(AppAction::Mouse {
-                        event,
-                        viewport: TuiViewport {
-                            width: size.width,
-                            height: size.height,
-                        },
-                    })
-                }
-                _ => None,
-            };
-            let Some(action) = action else {
-                continue;
-            };
-            if let Some(command) = update(state, action) {
-                if execute_code_change_command(state, &command)? {
-                    continue;
-                }
-                if execute_session_command(state, store, &command)? {
-                    continue;
-                }
-                match command {
-                    AppCommand::StartRun { request } => {
-                        active_run = Some(BackgroundRun::start(
-                            TuiRunRequest::new(request, state.selected_skill_names().to_vec()),
-                            Arc::clone(&run_handler),
-                        ));
-                    }
-                    AppCommand::CancelRun => {
-                        if let Some(run) = &active_run {
-                            run.cancel();
+        let input_wait = next_frame
+            .saturating_duration_since(Instant::now())
+            .min(EVENT_POLL_INTERVAL);
+        match event_handler.recv_timeout(input_wait) {
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+            Ok(event) => {
+                let event = match event {
+                    TuiEvent::ScrollDelta { delta, .. } => {
+                        let starts_new_scroll = pending_scroll_delta == 0;
+                        pending_scroll_delta = pending_scroll_delta.saturating_add(delta);
+                        if starts_new_scroll && pending_scroll_delta != 0 {
+                            next_frame = Instant::now();
                         }
+                        continue;
                     }
-                    AppCommand::RequestCodeChanges { feedback } => {
-                        let request = format!(
-                            "Revise the current code change proposal.\nFeedback: {feedback}"
-                        );
-                        active_run = Some(BackgroundRun::start(
-                            TuiRunRequest::new(request, state.selected_skill_names().to_vec()),
-                            Arc::clone(&run_handler),
-                        ));
+                    TuiEvent::Terminal(event) => event,
+                    TuiEvent::Closed => break,
+                };
+                // Clicks, drags, and keyboard input must be visible immediately;
+                // only wheel bursts are intentionally deferred/coalesced.
+                if !matches!(event, Event::Mouse(mouse) if matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::ScrollUp
+                        | crossterm::event::MouseEventKind::ScrollDown
+                )) {
+                    next_frame = Instant::now();
+                }
+                let action = match event {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        Some(AppAction::Key(key))
                     }
-                    AppCommand::CreateSession { .. }
-                    | AppCommand::RenameActiveSession { .. }
-                    | AppCommand::RenameSession { .. }
-                    | AppCommand::ToggleSessionLiked { .. }
-                    | AppCommand::ArchiveSession { .. }
-                    | AppCommand::SwitchSession { .. }
-                    | AppCommand::AcceptCodeChange
-                    | AppCommand::RejectCodeChange => {}
-                    AppCommand::CopyText { content } => copy_text_to_clipboard(&content)?,
+                    Event::Mouse(event) => {
+                        let size = terminal.size()?;
+                        Some(AppAction::Mouse {
+                            event,
+                            viewport: TuiViewport {
+                                width: size.width,
+                                height: size.height,
+                            },
+                        })
+                    }
+                    _ => None,
+                };
+                let Some(action) = action else {
+                    continue;
+                };
+                if let Some(command) = update(state, action) {
+                    if execute_code_change_command(state, &command)? {
+                        continue;
+                    }
+                    if execute_session_command(state, store, &command)? {
+                        continue;
+                    }
+                    match command {
+                        AppCommand::StartRun { request } => {
+                            active_run = Some(BackgroundRun::start(
+                                TuiRunRequest::new(request, state.selected_skill_names().to_vec()),
+                                Arc::clone(&run_handler),
+                            ));
+                        }
+                        AppCommand::CancelRun => {
+                            if let Some(run) = &active_run {
+                                run.cancel();
+                            }
+                        }
+                        AppCommand::RequestCodeChanges { feedback } => {
+                            let request = format!(
+                                "Revise the current code change proposal.\nFeedback: {feedback}"
+                            );
+                            active_run = Some(BackgroundRun::start(
+                                TuiRunRequest::new(request, state.selected_skill_names().to_vec()),
+                                Arc::clone(&run_handler),
+                            ));
+                        }
+                        AppCommand::CreateSession { .. }
+                        | AppCommand::RenameActiveSession { .. }
+                        | AppCommand::RenameSession { .. }
+                        | AppCommand::ToggleSessionLiked { .. }
+                        | AppCommand::ArchiveSession { .. }
+                        | AppCommand::SwitchSession { .. }
+                        | AppCommand::AcceptCodeChange
+                        | AppCommand::RejectCodeChange => {}
+                        AppCommand::CopyText { content } => copy_text_to_clipboard(&content)?,
+                    }
                 }
             }
         }

@@ -6,7 +6,7 @@
 //! decoded [`crossterm::event::Event`] values and must not parse ANSI sequences themselves.
 
 use crossterm::event::{self, Event};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -95,6 +95,11 @@ impl EventHandler {
     /// Waits for the next event.
     pub fn recv(&self) -> Result<TuiEvent, mpsc::RecvError> {
         self.receiver.recv()
+    }
+
+    /// Waits for the next event until the application must process background work.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<TuiEvent, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
     }
 
     /// Returns the next event without blocking.

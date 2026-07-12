@@ -3,11 +3,13 @@ use super::super::text::{
     apply_text_selection, full_width_line, padded_full_width_lines, truncate_timeline_detail,
 };
 use super::super::theme::{CONVERSATION_PADDING, palette, panel_block};
+use super::command_output;
 use super::markdown::MarkdownRenderer;
 use crate::tui::{
     AppState, MessageRole, SelectionPanel, TimelineStatus, TuiCodeChangeResult, TuiRunStatus,
+    TuiViewport,
 };
-use jux_core::HumanInputKind;
+use jux_core::{AssistantResponseItem, HumanInputKind, LlmUsage, StepPayload};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style};
@@ -15,12 +17,47 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ConversationScroll {
     offset: u16,
     total_rows: u16,
     visible_rows: u16,
+    command_toggle_rows: Vec<(u16, usize)>,
+}
+
+pub(crate) fn command_toggle_at(
+    state: &AppState,
+    viewport: TuiViewport,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let area = Rect::new(
+        0,
+        0,
+        state.conversation_panel_width(viewport.width),
+        viewport.height,
+    );
+    let layout = ConversationLayout::calculate(state, area);
+    if column <= layout.history.x
+        || column >= layout.history.right().saturating_sub(1)
+        || row <= layout.history.y
+        || row >= layout.history.bottom().saturating_sub(1)
+    {
+        return None;
+    }
+    let (_, scroll) = prompt_panel(
+        state,
+        layout.history.width.saturating_sub(2),
+        layout.history.height.saturating_sub(2),
+    );
+    let visible_row = row.saturating_sub(layout.history.y.saturating_add(1));
+    let content_row = scroll.offset.saturating_add(visible_row);
+    scroll
+        .command_toggle_rows
+        .iter()
+        .find_map(|(toggle_row, index)| (*toggle_row == content_row).then_some(*index))
 }
 
 pub(crate) fn conversation_max_scroll(state: &AppState, area: Rect) -> u16 {
@@ -57,78 +94,65 @@ fn prompt_panel(
     visible_rows: u16,
 ) -> (Paragraph<'_>, ConversationScroll) {
     let mut lines = Vec::new();
+    let mut command_toggle_rows = Vec::new();
     let colors = palette(state.theme());
+    append_timeline_items(
+        state,
+        0,
+        content_width,
+        &mut lines,
+        &mut command_toggle_rows,
+    );
     for (message_index, message) in state.messages().iter().enumerate() {
         let selected = state.selected_message() == Some(message_index);
         match message.role {
             MessageRole::User => {
-                let background = Style::default().bg(colors.user_message);
+                let background = Style::default().bg(colors.input);
                 lines.push(full_width_line("", content_width, background));
-                lines.extend(padded_full_width_lines(
-                    if selected { "▶ You" } else { "You" },
-                    content_width,
-                    background.fg(Color::Cyan),
-                ));
-                lines.extend(
-                    message
-                        .content
-                        .split('\n')
-                        .flat_map(|line| padded_full_width_lines(line, content_width, background)),
-                );
+                lines.extend(message.content.split('\n').flat_map(|line| {
+                    let marker = if selected { "▶" } else { ">" };
+                    padded_full_width_lines(&format!("{marker} {line}"), content_width, background)
+                }));
                 lines.push(full_width_line("", content_width, background));
-                lines.push(Line::from(""));
             }
             MessageRole::Assistant | MessageRole::Error => {
-                let (label, color) = match message.role {
-                    MessageRole::Assistant => ("Jux", Color::Cyan),
-                    MessageRole::Error => ("Error", Color::Red),
-                    MessageRole::User => unreachable!(),
-                };
-                let label = if selected {
-                    format!("▶ {label}")
-                } else {
-                    label.to_owned()
-                };
-                lines.push(Line::styled(label, Style::default().fg(color)));
-                lines.extend(MarkdownRenderer::new(content_width).render(&message.content));
-                lines.push(Line::from(""));
+                if message.role == MessageRole::Error {
+                    let label = if selected { "▶ Error" } else { "Error" };
+                    lines.push(Line::styled(label, Style::default().fg(Color::Red)));
+                }
+                append_spacing(&mut lines);
+                let markdown_width = content_width.saturating_sub(6);
+                lines.extend(
+                    MarkdownRenderer::new(markdown_width)
+                        .render(&message.content)
+                        .into_iter()
+                        .map(pad_assistant_line),
+                );
+                append_spacing(&mut lines);
             }
         }
+        append_timeline_items(
+            state,
+            message_index.saturating_add(1),
+            content_width,
+            &mut lines,
+            &mut command_toggle_rows,
+        );
     }
-    for item in state.timeline() {
-        let status = match item.status {
-            TimelineStatus::Running => "Running",
-            TimelineStatus::Output => "Output",
-            TimelineStatus::Completed => "Completed",
-            TimelineStatus::Failed => "Failed",
-        };
-        lines.push(Line::from(format!("{}  {status}", item.label)));
-        if let Some(detail) = &item.detail {
-            lines.push(Line::from(detail.as_str()));
-        }
-        if item.expanded {
-            if let Some(arguments) = &item.arguments {
-                lines.push(Line::from("Arguments:"));
-                let arguments = truncate_timeline_detail(arguments);
-                lines.extend(arguments.lines().map(|line| Line::from(line.to_owned())));
-            }
-            if let Some(output) = &item.output {
-                lines.push(Line::from("Output:"));
-                let output = truncate_timeline_detail(output);
-                lines.extend(output.lines().map(|line| Line::from(line.to_owned())));
-            }
-        } else if let Some(output) = &item.output {
-            let summary = output.split_whitespace().collect::<Vec<_>>().join(" ");
-            lines.push(Line::from(truncate_timeline_detail(&summary)));
-        }
-    }
-    if !state.timeline().is_empty() {
-        lines.push(Line::from(""));
+    if state.run_status() != TuiRunStatus::Running
+        && let Some(metadata) = latest_assistant_response_metadata(state)
+    {
+        append_spacing(&mut lines);
+        lines.push(Line::styled(
+            format!("\u{00a0}\u{00a0}\u{00a0}{metadata}"),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
     if state.run_status() == TuiRunStatus::Running {
+        let (indicator, color) = generating_frame();
         lines.push(Line::styled(
-            "Generating ▌",
-            Style::default().fg(Color::Cyan),
+            format!("   Generating {indicator}"),
+            Style::default().fg(color),
         ));
         lines.push(Line::from(""));
     }
@@ -221,11 +245,153 @@ fn prompt_panel(
         offset: u16::try_from(offset).unwrap_or(u16::MAX),
         total_rows: u16::try_from(total_rows).unwrap_or(u16::MAX),
         visible_rows,
+        command_toggle_rows,
     };
     (
         paragraph.scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
         scroll,
     )
+}
+
+fn append_spacing(lines: &mut Vec<Line<'_>>) {
+    if lines.last().is_none_or(line_has_content) {
+        lines.push(Line::from(""));
+    }
+}
+
+fn line_has_content(line: &Line<'_>) -> bool {
+    line.spans
+        .iter()
+        .any(|span| !span.content.as_ref().is_empty())
+}
+
+fn append_timeline_items<'a>(
+    state: &'a AppState,
+    message_count: usize,
+    content_width: u16,
+    lines: &mut Vec<Line<'a>>,
+    command_toggle_rows: &mut Vec<(u16, usize)>,
+) {
+    for (timeline_index, item) in state.timeline().iter().enumerate() {
+        if item.message_count != message_count {
+            continue;
+        }
+        if let Some(command) = &item.command {
+            command_toggle_rows.push((rendered_row_count(lines, content_width), timeline_index));
+            lines.extend(command_output::render(
+                command,
+                item.status,
+                item.detail.as_deref(),
+                item.expanded,
+                content_width,
+            ));
+            lines.push(Line::from(""));
+            continue;
+        }
+        let status = match item.status {
+            TimelineStatus::Running => "Running",
+            TimelineStatus::Output => "Output",
+            TimelineStatus::Completed => "Completed",
+            TimelineStatus::Failed => "Failed",
+        };
+        lines.push(Line::from(format!("{}  {status}", item.label)));
+        if let Some(detail) = &item.detail {
+            lines.push(Line::from(detail.as_str()));
+        }
+        if item.expanded {
+            if let Some(arguments) = &item.arguments {
+                lines.push(Line::from("Arguments:"));
+                let arguments = truncate_timeline_detail(arguments);
+                lines.extend(arguments.lines().map(|line| Line::from(line.to_owned())));
+            }
+            if let Some(output) = &item.output {
+                lines.push(Line::from("Output:"));
+                let output = truncate_timeline_detail(output);
+                lines.extend(output.lines().map(|line| Line::from(line.to_owned())));
+            }
+        } else if let Some(output) = &item.output {
+            let summary = output.split_whitespace().collect::<Vec<_>>().join(" ");
+            lines.push(Line::from(truncate_timeline_detail(&summary)));
+        }
+    }
+}
+
+fn pad_assistant_line(mut line: Line<'_>) -> Line<'_> {
+    line.spans.insert(0, Span::raw("\u{00a0}\u{00a0}\u{00a0}"));
+    line.spans.push(Span::raw("\u{00a0}\u{00a0}\u{00a0}"));
+    line
+}
+
+fn latest_assistant_response_metadata(state: &AppState) -> Option<String> {
+    let message = state
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Assistant)?;
+    let usage = state.steps().iter().find_map(|step| match &step.payload {
+        StepPayload::AssistantResponse { usage, items, .. }
+            if assistant_text(items) == message.content =>
+        {
+            Some(usage)
+        }
+        _ => None,
+    });
+    format_response_metadata(usage, state.run_elapsed_millis())
+}
+
+fn generating_frame() -> (&'static str, Color) {
+    const FRAMES: [(&str, Color); 6] = [
+        ("·", Color::Rgb(70, 130, 180)),
+        ("∙", Color::Rgb(64, 170, 190)),
+        ("●", Color::Rgb(80, 200, 170)),
+        ("∙", Color::Rgb(190, 210, 90)),
+        ("·", Color::Rgb(230, 180, 70)),
+        (" ", Color::Rgb(170, 110, 190)),
+    ];
+    let frame = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() / 120);
+    FRAMES[(frame as usize) % FRAMES.len()]
+}
+
+fn assistant_text(items: &[AssistantResponseItem]) -> String {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            AssistantResponseItem::Text { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn format_response_metadata(
+    usage: Option<&LlmUsage>,
+    elapsed_millis: Option<u128>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(usage) = usage {
+        parts.push(format!(
+            "{} tokens ({} in, {} out)",
+            usage.total_tokens, usage.input_tokens, usage.output_tokens
+        ));
+    }
+    if let Some(elapsed_millis) = elapsed_millis {
+        parts.push(format_duration(elapsed_millis));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn format_duration(elapsed_millis: u128) -> String {
+    if elapsed_millis < 1_000 {
+        format!("{elapsed_millis} ms")
+    } else {
+        format!("{:.1} s", elapsed_millis as f64 / 1_000.0)
+    }
+}
+
+fn rendered_row_count(lines: &[Line<'_>], content_width: u16) -> u16 {
+    let paragraph = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
+    u16::try_from(paragraph.line_count(content_width)).unwrap_or(u16::MAX)
 }
 
 fn render_conversation_scrollbar(

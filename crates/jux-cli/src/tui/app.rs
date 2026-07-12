@@ -8,6 +8,7 @@ use jux_core::{
     SkillCatalog, SkillDefinition, SkillOverride, SqliteWorkspaceStore, Step, StepPayload,
     StoreError, TuiShortcutConfig, TuiTheme, latest_human_input_request,
 };
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -249,12 +250,38 @@ pub enum TuiRunStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimelineItem {
     pub id: String,
+    pub message_count: usize,
     pub label: String,
     pub status: TimelineStatus,
     pub detail: Option<String>,
     pub arguments: Option<String>,
     pub output: Option<String>,
     pub expanded: bool,
+    pub command: Option<TuiCommandExecution>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiCommandExecution {
+    pub program: String,
+    pub args: Vec<String>,
+    pub success: Option<bool>,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Deserialize)]
+struct TuiCommandArguments {
+    program: String,
+    args: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct TuiCommandOutput {
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -476,6 +503,11 @@ impl AppState {
     #[must_use]
     pub fn timeline(&self) -> &[TimelineItem] {
         &self.timeline
+    }
+
+    #[must_use]
+    pub fn selected_timeline(&self) -> Option<usize> {
+        self.selected_timeline
     }
 
     #[must_use]
@@ -1040,6 +1072,8 @@ pub fn load_active_session_history(
     state.session_histories = session_histories;
     state.messages = messages_from_steps(&steps);
     state.steps = steps;
+    state.timeline = command_timeline_from_steps(&state.steps);
+    state.selected_timeline = None;
     state.audit_items = audit_items_from_steps(&state.steps);
     state.runs = runs;
     state.run_status = TuiRunStatus::Idle;
@@ -1184,6 +1218,78 @@ fn messages_from_steps(steps: &[Step]) -> Vec<Message> {
         }
     }
     messages
+}
+
+fn command_timeline_from_steps(steps: &[Step]) -> Vec<TimelineItem> {
+    let mut timeline = Vec::new();
+    let mut command_indexes = HashMap::new();
+    let mut message_count = 0;
+    for step in steps {
+        match &step.payload {
+            StepPayload::UserMessage { .. } | StepPayload::Error { .. } => {
+                message_count += 1;
+            }
+            StepPayload::AssistantResponse { items, .. } => {
+                if !assistant_response_text(items).is_empty() {
+                    message_count += 1;
+                }
+                for item in items {
+                    let AssistantResponseItem::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                        ..
+                    } = item
+                    else {
+                        continue;
+                    };
+                    if name != "exec" {
+                        continue;
+                    }
+                    let Some(command) = command_from_arguments(arguments) else {
+                        continue;
+                    };
+                    command_indexes.insert(id.clone(), timeline.len());
+                    timeline.push(TimelineItem {
+                        id: format!("persisted:{id}"),
+                        message_count,
+                        label: "Tool: exec".to_owned(),
+                        status: TimelineStatus::Running,
+                        detail: None,
+                        arguments: None,
+                        output: None,
+                        expanded: false,
+                        command: Some(command),
+                    });
+                }
+            }
+            StepPayload::ToolResult { id, content, .. } => {
+                let Some(index) = command_indexes.get(id).copied() else {
+                    continue;
+                };
+                let item = &mut timeline[index];
+                if let Some(output) = command_from_output(content) {
+                    item.command = merge_command_execution(item.command.take(), Some(output));
+                    item.status = TimelineStatus::Completed;
+                } else {
+                    item.status = TimelineStatus::Failed;
+                    item.detail = Some(format_json(content));
+                }
+            }
+            _ => {}
+        }
+    }
+    timeline
+}
+
+fn assistant_response_text(items: &[AssistantResponseItem]) -> String {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            AssistantResponseItem::Text { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn audit_items_from_steps(steps: &[Step]) -> Vec<AuditItem> {
@@ -1398,6 +1504,12 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             if let AgentEventData::SkillsSelected { skills } = &event.data {
                 state.active_skill_names = skills.clone();
             }
+            if matches!(&event.data, AgentEventData::LlmCompleted) {
+                let completed_id = event.id.to_string();
+                state.timeline.retain(|item| item.id != completed_id);
+                state.selected_timeline = None;
+                return None;
+            }
             if let AgentEventData::ToolOutput { name, content } = &event.data
                 && name == PROPOSE_CODE_CHANGE_TOOL_NAME
                 && let Ok(proposal) = serde_json::from_value::<CodeChangeProposal>(content.clone())
@@ -1408,6 +1520,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 state.code_change_result = None;
             }
             if let Some(mut item) = timeline_item_from_agent_event(event) {
+                item.message_count = state.messages.len();
                 match state
                     .timeline
                     .iter()
@@ -1428,6 +1541,10 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                         if item.output.is_none() {
                             item.output = state.timeline[index].output.clone();
                         }
+                        item.command = merge_command_execution(
+                            state.timeline[index].command.clone(),
+                            item.command,
+                        );
                         item.expanded = state.timeline[index].expanded;
                         state.timeline[index] = item;
                     }
@@ -1459,18 +1576,19 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 Some(response.updated_at.saturating_sub(response.created_at));
             state.steps = response.steps;
             state.steps.sort_by_key(|step| step.id.to_string());
+            let run_steps = state.steps.clone();
+            let message_base = merge_run_messages(state, &run_steps, response.answer.as_deref());
+            state.timeline = command_timeline_from_steps(&state.steps);
+            for item in &mut state.timeline {
+                item.message_count = item.message_count.saturating_add(message_base);
+            }
+            state.selected_timeline = None;
             state.audit_items = audit_items_from_steps(&state.steps);
             state.pending_human_input = waiting_for_human_input
                 .then(|| latest_human_input_request(&state.steps))
                 .flatten();
             state.selected_human_option = 0;
             state.human_input_error = None;
-            if let Some(content) = response.answer {
-                state.messages.push(Message {
-                    role: MessageRole::Assistant,
-                    content,
-                });
-            }
             state.runtime_logs.push(TuiRuntimeLog {
                 title: format!("Run finished: {:?}", state.run_status),
                 detail: state.run_id.clone(),
@@ -1665,17 +1783,6 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::Key(KeyEvent {
-            code: KeyCode::Tab, ..
-        }) => {
-            if !state.timeline.is_empty() {
-                let next = state
-                    .selected_timeline
-                    .map_or(0, |index| (index + 1) % state.timeline.len());
-                state.selected_timeline = Some(next);
-            }
-            None
-        }
-        AppAction::Key(KeyEvent {
             code: KeyCode::Char(' '),
             ..
         }) if state.skill_panel_visible => {
@@ -1689,18 +1796,6 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 } else {
                     state.selected_skill_names.push(skill.name.clone());
                 }
-            }
-            None
-        }
-        AppAction::Key(KeyEvent {
-            code: KeyCode::Char(' '),
-            ..
-        }) if state.selected_timeline.is_some() => {
-            if let Some(item) = state
-                .selected_timeline
-                .and_then(|index| state.timeline.get_mut(index))
-            {
-                item.expanded = !item.expanded;
             }
             None
         }
@@ -2293,6 +2388,33 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
     }
 }
 
+fn merge_run_messages(state: &mut AppState, steps: &[Step], answer: Option<&str>) -> usize {
+    let mut run_messages = messages_from_steps(steps);
+    if let Some(answer) = answer
+        && run_messages.last().is_none_or(|message| {
+            message.role != MessageRole::Assistant || message.content != answer
+        })
+    {
+        run_messages.push(Message {
+            role: MessageRole::Assistant,
+            content: answer.to_owned(),
+        });
+    }
+    let message_base = run_messages
+        .iter()
+        .find(|message| message.role == MessageRole::User)
+        .and_then(|request| {
+            state
+                .messages
+                .iter()
+                .rposition(|message| message == request)
+        })
+        .unwrap_or(state.messages.len());
+    state.messages.truncate(message_base);
+    state.messages.extend(run_messages);
+    message_base
+}
+
 fn is_quit_shortcut(state: &AppState, key: KeyEvent) -> bool {
     let character = match state.runtime_info.shortcuts.quit {
         QuitShortcut::CtrlC => 'c',
@@ -2474,6 +2596,14 @@ fn handle_mouse_event(
     }
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(index) =
+                super::ui::command_toggle_at(state, viewport, event.column, event.row)
+            {
+                if let Some(item) = state.timeline.get_mut(index) {
+                    item.expanded = !item.expanded;
+                }
+                return None;
+            }
             if state.session_panel_visible && event.row >= 3 {
                 let index = usize::from(event.row.saturating_sub(3));
                 if let Some(session_id) = state
@@ -2804,28 +2934,53 @@ fn slice_chars(line: &str, start: usize, end: usize) -> String {
 
 fn conversation_text_lines(state: &AppState) -> Vec<String> {
     let mut lines = Vec::new();
-    for message in state.messages() {
+    append_timeline_text_lines(state, 0, &mut lines);
+    for (message_index, message) in state.messages().iter().enumerate() {
         match message.role {
             MessageRole::User => {
                 lines.push(String::new());
-                lines.push("You".to_owned());
-                lines.extend(message.content.split('\n').map(str::to_owned));
-                lines.push(String::new());
+                let marker = if state.selected_message() == Some(message_index) {
+                    "▶"
+                } else {
+                    ">"
+                };
+                lines.extend(
+                    message
+                        .content
+                        .split('\n')
+                        .map(|line| format!("\u{00a0}{marker} {line}")),
+                );
                 lines.push(String::new());
             }
-            MessageRole::Assistant | MessageRole::Error => {
-                let label = match message.role {
-                    MessageRole::Assistant => "Jux",
-                    MessageRole::Error => "Error",
-                    MessageRole::User => unreachable!(),
-                };
-                lines.push(label.to_owned());
+            MessageRole::Assistant => {
+                lines.push(String::new());
+                lines.extend(
+                    message.content.lines().map(|line| {
+                        format!("\u{00a0}\u{00a0}\u{00a0}{line}\u{00a0}\u{00a0}\u{00a0}")
+                    }),
+                );
+                lines.push(String::new());
+            }
+            MessageRole::Error => {
+                lines.push("Error".to_owned());
                 lines.extend(message.content.lines().map(str::to_owned));
                 lines.push(String::new());
             }
         }
+        append_timeline_text_lines(state, message_index.saturating_add(1), &mut lines);
     }
-    for item in state.timeline() {
+    if !state.timeline().is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn append_timeline_text_lines(state: &AppState, message_count: usize, lines: &mut Vec<String>) {
+    for item in state
+        .timeline()
+        .iter()
+        .filter(|item| item.message_count == message_count)
+    {
         let status = match item.status {
             TimelineStatus::Running => "Running",
             TimelineStatus::Output => "Output",
@@ -2841,10 +2996,6 @@ fn conversation_text_lines(state: &AppState) -> Vec<String> {
             lines.push(truncate_timeline_detail_text(&summary));
         }
     }
-    if !state.timeline().is_empty() {
-        lines.push(String::new());
-    }
-    lines
 }
 
 fn sidebar_text_lines(state: &AppState) -> Vec<String> {
@@ -2905,16 +3056,17 @@ fn truncate_timeline_detail_text(content: &str) -> String {
 }
 
 fn timeline_item_from_agent_event(event: AgentEvent) -> Option<TimelineItem> {
-    let (label, detail, arguments, output) = match event.data {
+    let (label, detail, arguments, output, command) = match event.data {
         AgentEventData::LlmStarted | AgentEventData::LlmCompleted => {
-            ("LLM".to_owned(), None, None, None)
+            ("LLM".to_owned(), None, None, None, None)
         }
-        AgentEventData::LlmFailed { error } => ("LLM".to_owned(), Some(error), None, None),
+        AgentEventData::LlmFailed { error } => ("LLM".to_owned(), Some(error), None, None, None),
         AgentEventData::SkillsSelected { skills } => (
             "Active skills".to_owned(),
             None,
             None,
             Some(skills.join(", ")),
+            None,
         ),
         AgentEventData::ToolStarted {
             name, arguments, ..
@@ -2927,17 +3079,23 @@ fn timeline_item_from_agent_event(event: AgentEvent) -> Option<TimelineItem> {
             } else {
                 format!("Tool: {name}")
             };
-            (label, None, Some(format_json(&arguments)), None)
+            let command = (name == "exec")
+                .then(|| command_from_arguments(&arguments))
+                .flatten();
+            (label, None, Some(format_json(&arguments)), None, command)
         }
         AgentEventData::ToolCompleted { name, .. } => {
-            (tool_or_skill_label(&name), None, None, None)
+            (tool_or_skill_label(&name), None, None, None, None)
         }
         AgentEventData::ToolOutput { name, content } => {
             let output = (name != PROPOSE_CODE_CHANGE_TOOL_NAME).then(|| format_json(&content));
-            (tool_or_skill_label(&name), None, None, output)
+            let command = (name == "exec")
+                .then(|| command_from_output(&content))
+                .flatten();
+            (tool_or_skill_label(&name), None, None, output, command)
         }
         AgentEventData::ToolFailed { name, error, .. } => {
-            (tool_or_skill_label(&name), Some(error), None, None)
+            (tool_or_skill_label(&name), Some(error), None, None, None)
         }
         _ => return None,
     };
@@ -2949,13 +3107,62 @@ fn timeline_item_from_agent_event(event: AgentEvent) -> Option<TimelineItem> {
     };
     Some(TimelineItem {
         id: event.id.to_string(),
+        message_count: 0,
         label,
         status,
         detail,
         arguments,
         output,
         expanded: false,
+        command,
     })
+}
+
+fn command_from_arguments(value: &serde_json::Value) -> Option<TuiCommandExecution> {
+    let arguments = serde_json::from_value::<TuiCommandArguments>(value.clone()).ok()?;
+    Some(TuiCommandExecution {
+        program: arguments.program,
+        args: arguments.args,
+        success: None,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+    })
+}
+
+fn command_from_output(value: &serde_json::Value) -> Option<TuiCommandExecution> {
+    let output = serde_json::from_value::<TuiCommandOutput>(value.clone()).ok()?;
+    Some(TuiCommandExecution {
+        program: String::new(),
+        args: Vec::new(),
+        success: Some(output.success),
+        exit_code: output.exit_code,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+fn merge_command_execution(
+    existing: Option<TuiCommandExecution>,
+    incoming: Option<TuiCommandExecution>,
+) -> Option<TuiCommandExecution> {
+    match (existing, incoming) {
+        (Some(mut existing), Some(incoming)) => {
+            if !incoming.program.is_empty() {
+                existing.program = incoming.program;
+                existing.args = incoming.args;
+            }
+            if incoming.success.is_some() {
+                existing.success = incoming.success;
+                existing.exit_code = incoming.exit_code;
+                existing.stdout = incoming.stdout;
+                existing.stderr = incoming.stderr;
+            }
+            Some(existing)
+        }
+        (existing, None) => existing,
+        (None, incoming) => incoming,
+    }
 }
 
 fn format_json(value: &serde_json::Value) -> String {
