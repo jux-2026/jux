@@ -1,8 +1,9 @@
 use super::ui::conversation_max_scroll;
 use super::{
     AppAction, AppCommand, AppState, BackgroundRun, RunHandler, RunResponse, TuiRunRequest,
-    TuiRuntimeInfo, TuiViewport, execute_code_change_command, execute_session_command,
-    load_active_session_history, materialize_pending_new_session, render_app, update,
+    TuiRuntimeInfo, TuiViewport, assign_default_session_title, execute_code_change_command,
+    execute_session_command, load_active_session_history, materialize_pending_new_session,
+    render_app, update,
 };
 use super::{EventHandler, TuiEvent};
 use anyhow::Result;
@@ -211,6 +212,7 @@ fn run_app_loop(
                     match command {
                         AppCommand::StartRun { request } => {
                             materialize_pending_new_session(state, store, &request)?;
+                            assign_default_session_title(state, store, &request)?;
                             active_run = Some(BackgroundRun::start(
                                 TuiRunRequest::new(request, state.selected_skill_names().to_vec()),
                                 Arc::clone(&run_handler),

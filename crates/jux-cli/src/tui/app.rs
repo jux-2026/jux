@@ -1207,6 +1207,33 @@ pub fn materialize_pending_new_session(
     Ok(())
 }
 
+pub fn assign_default_session_title(
+    state: &mut AppState,
+    store: &SqliteWorkspaceStore,
+    request: &str,
+) -> Result<(), StoreError> {
+    let Some(session_id) = state.session_id.clone() else {
+        return Ok(());
+    };
+    let Some(session) = state
+        .sessions
+        .iter_mut()
+        .find(|session| session.id.as_str() == session_id)
+    else {
+        return Ok(());
+    };
+    if session
+        .name
+        .as_deref()
+        .is_some_and(|name| name != "default")
+    {
+        return Ok(());
+    }
+    let title = generated_session_title(request);
+    *session = store.rename_session(&session.id, Some(title))?;
+    Ok(())
+}
+
 pub fn execute_code_change_command(
     state: &mut AppState,
     command: &AppCommand,
@@ -1701,26 +1728,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
                 title: format!("Run finished: {:?}", state.run_status),
                 detail: state.run_id.clone(),
             });
-            let should_generate_title = state.run_status == TuiRunStatus::Completed
-                && state.runs.is_empty()
-                && state.sessions.iter().any(|session| {
-                    Some(session.id.as_str()) == state.session_id.as_deref()
-                        && session.name.as_deref().is_none_or(|name| name == "default")
-                });
-            should_generate_title
-                .then(|| {
-                    state
-                        .messages
-                        .iter()
-                        .find(|message| message.role == MessageRole::User)
-                        .map(|message| generated_session_title(&message.content))
-                })
-                .flatten()
-                .zip(state.session_id.as_ref())
-                .map(|(name, session_id)| AppCommand::RenameSession {
-                    session_id: SessionId::from(session_id.clone()),
-                    name,
-                })
+            None
         }
         AppAction::RunFailed { error } => {
             state.pending_escape_action = None;
