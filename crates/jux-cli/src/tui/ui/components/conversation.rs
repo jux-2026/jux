@@ -486,6 +486,7 @@ fn render_input_area(
     );
     render_slash_command_popup(frame, state, popup_bounds, area.y);
     render_inline_skill_popup(frame, state, popup_bounds, area.y);
+    render_file_reference_popup(frame, state, popup_bounds, area.y);
     let mut lines = Vec::new();
     if height >= 3 {
         lines.push(Line::from(""));
@@ -570,6 +571,62 @@ fn render_inline_skill_popup(
                     .padding(Padding::uniform(1)),
             )
             .style(Style::default().bg(palette(state.theme()).popup)),
+        area,
+    );
+}
+
+fn render_file_reference_popup(
+    frame: &mut Frame<'_>,
+    state: &AppState,
+    input_bounds: Rect,
+    input_top: u16,
+) {
+    let suggestions = state.file_reference_suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+    let available_height = input_top.saturating_sub(input_bounds.y);
+    let height = u16::try_from(suggestions.len())
+        .unwrap_or(available_height)
+        .saturating_add(2)
+        .min(available_height);
+    if height < 3 {
+        return;
+    }
+    let row_width = usize::from(input_bounds.width.saturating_sub(2));
+    let lines = suggestions
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let style = if index == state.selected_file_reference() {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Line::styled(
+                format!("@{path}")
+                    .chars()
+                    .take(row_width)
+                    .collect::<String>(),
+                style,
+            )
+        })
+        .collect::<Vec<_>>();
+    let area = Rect::new(
+        input_bounds.x,
+        input_top.saturating_sub(height),
+        input_bounds.width,
+        height,
+    );
+    let background = palette(state.theme()).popup;
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .style(Style::default().bg(background))
+                    .padding(Padding::uniform(1)),
+            )
+            .style(Style::default().bg(background)),
         area,
     );
 }

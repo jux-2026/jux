@@ -2,11 +2,11 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use jux_cli::tui::{
-    AgentEventSender, AppAction, AppCommand, AppState, BackgroundRun, FocusedPanel, Message,
-    MessageRole, RunResponse, SelectionPanel, TerminalEventDecoder, TuiRunRequest, TuiRunStatus,
-    TuiRuntimeInfo, TuiSandboxSummary, TuiViewport, execute_code_change_command,
-    execute_session_command, load_active_session_history, materialize_pending_new_session,
-    render_app, update,
+    AgentEventSender, AppAction, AppCommand, AppState, BackgroundRun, FileIndexKind,
+    FileIndexService, FileIndexSnapshot, FocusedPanel, Message, MessageRole, RunResponse,
+    SelectionPanel, TerminalEventDecoder, TuiRunRequest, TuiRunStatus, TuiRuntimeInfo,
+    TuiSandboxSummary, TuiViewport, execute_code_change_command, execute_session_command,
+    load_active_session_history, materialize_pending_new_session, render_app, update,
 };
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AssistantResponseItem,
@@ -19,7 +19,9 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Position;
 use ratatui::style::Color;
+use std::fs;
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -234,6 +236,133 @@ fn tui_deletes_text_around_the_cursor() {
     );
 
     assert_eq!(state.input_text(), "ab");
+}
+
+#[test]
+fn tui_completes_file_references_and_renders_suggestions() {
+    let mut state = AppState::new("/workspace");
+    update(
+        &mut state,
+        AppAction::FileIndexUpdated(FileIndexSnapshot {
+            kind: FileIndexKind::Filesystem,
+            files: vec!["README.md".to_owned(), "src/main.rs".to_owned()],
+        }),
+    );
+    type_text(&mut state, "Please inspect @mai");
+
+    let buffer = render_to_buffer(&state, 80, 24);
+    assert_buffer_contains(&buffer, "@src/main.rs");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+    );
+
+    assert_eq!(state.input_text(), "Please inspect @src/main.rs");
+}
+
+#[test]
+fn tui_deletes_a_file_reference_as_one_input_unit() {
+    let snapshot = FileIndexSnapshot {
+        kind: FileIndexKind::Filesystem,
+        files: vec!["docs/My File.md".to_owned(), "src/main.rs".to_owned()],
+    };
+    let mut backspace_state = AppState::new("/workspace");
+    update(
+        &mut backspace_state,
+        AppAction::FileIndexUpdated(snapshot.clone()),
+    );
+    type_text(&mut backspace_state, "@src/main.rs");
+    update(
+        &mut backspace_state,
+        AppAction::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+    );
+    assert_eq!(backspace_state.input_text(), "");
+
+    let mut delete_state = AppState::new("/workspace");
+    update(&mut delete_state, AppAction::FileIndexUpdated(snapshot));
+    type_text(&mut delete_state, "@My");
+    update(
+        &mut delete_state,
+        AppAction::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+    );
+    assert_eq!(delete_state.input_text(), "@{docs/My File.md}");
+    update(
+        &mut delete_state,
+        AppAction::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+    );
+    update(
+        &mut delete_state,
+        AppAction::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+    );
+    assert_eq!(delete_state.input_text(), "");
+}
+
+#[test]
+fn file_index_service_indexes_and_refreshes_non_git_workspaces() {
+    let workspace = assert_fs::TempDir::new().expect("temp workspace exists");
+    fs::create_dir(workspace.path().join("src")).expect("source directory is created");
+    fs::write(workspace.path().join("src/main.rs"), "fn main() {}")
+        .expect("source file is written");
+    fs::create_dir(workspace.path().join(".git")).expect("git metadata directory is created");
+    fs::write(workspace.path().join(".git/config"), "not a repository")
+        .expect("git metadata file is written");
+
+    let service = FileIndexService::start(workspace.path().to_path_buf());
+    let initial = service
+        .recv_timeout(Duration::from_secs(3))
+        .expect("initial file index arrives");
+    assert_eq!(initial.kind, FileIndexKind::Filesystem);
+    assert_eq!(initial.files, vec!["src/main.rs"]);
+
+    fs::write(workspace.path().join("README.md"), "# Workspace").expect("new file is written");
+    let refreshed = wait_for_file(&service, "README.md");
+    assert!(refreshed.files.contains(&"src/main.rs".to_owned()));
+}
+
+#[test]
+fn file_index_service_uses_git_tracked_files_and_gitignore_rules() {
+    let workspace = assert_fs::TempDir::new().expect("temp workspace exists");
+    fs::write(workspace.path().join("tracked.rs"), "fn tracked() {}")
+        .expect("tracked file is written");
+    fs::write(workspace.path().join("ignored.log"), "ignored").expect("ignored file is written");
+    fs::write(workspace.path().join(".gitignore"), "*.log\n").expect("gitignore is written");
+    assert!(
+        ProcessCommand::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+            .expect("git init runs")
+            .success()
+    );
+    assert!(
+        ProcessCommand::new("git")
+            .args(["add", "tracked.rs", ".gitignore"])
+            .current_dir(workspace.path())
+            .status()
+            .expect("git add runs")
+            .success()
+    );
+
+    let service = FileIndexService::start(workspace.path().to_path_buf());
+    let snapshot = service
+        .recv_timeout(Duration::from_secs(3))
+        .expect("git file index arrives");
+
+    assert_eq!(snapshot.kind, FileIndexKind::Git);
+    assert_eq!(snapshot.files, vec![".gitignore", "tracked.rs"]);
+
+    fs::write(workspace.path().join("new.rs"), "fn new_file() {}")
+        .expect("new tracked file is written");
+    assert!(
+        ProcessCommand::new("git")
+            .args(["add", "new.rs"])
+            .current_dir(workspace.path())
+            .status()
+            .expect("second git add runs")
+            .success()
+    );
+    let refreshed = wait_for_file(&service, "new.rs");
+    assert!(!refreshed.files.contains(&"ignored.log".to_owned()));
 }
 
 #[test]
@@ -2951,6 +3080,18 @@ fn type_text(state: &mut AppState, text: &str) {
             AppAction::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
         );
     }
+}
+
+fn wait_for_file(service: &FileIndexService, expected: &str) -> FileIndexSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Some(snapshot) = service.recv_timeout(Duration::from_millis(500))
+            && snapshot.files.iter().any(|path| path == expected)
+        {
+            return snapshot;
+        }
+    }
+    panic!("file index did not include {expected}");
 }
 
 fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {

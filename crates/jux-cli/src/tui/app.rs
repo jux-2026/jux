@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
+use super::FileIndexSnapshot;
 use super::RunResponse;
 
 const DEFAULT_CONVERSATION_WIDTH_PERCENT: u16 = 60;
@@ -149,6 +150,8 @@ pub struct AppState {
     conversation_width_percent: u16,
     selected_slash_command: usize,
     selected_inline_skill: usize,
+    indexed_files: Vec<String>,
+    selected_file_reference: usize,
     slash_commands_dismissed: bool,
     pending_escape_action: Option<PendingEscapeAction>,
     notification: Option<(String, Instant)>,
@@ -397,6 +400,8 @@ impl AppState {
             conversation_width_percent: DEFAULT_CONVERSATION_WIDTH_PERCENT,
             selected_slash_command: 0,
             selected_inline_skill: 0,
+            indexed_files: Vec::new(),
+            selected_file_reference: 0,
             slash_commands_dismissed: false,
             pending_escape_action: None,
             notification: None,
@@ -831,6 +836,60 @@ impl AppState {
         self.selected_inline_skill
     }
 
+    pub(crate) fn set_file_index(&mut self, snapshot: FileIndexSnapshot) {
+        self.indexed_files = snapshot.files;
+        self.selected_file_reference = 0;
+    }
+
+    #[must_use]
+    pub(super) fn file_reference_suggestions(&self) -> Vec<&str> {
+        let token_start = self.input[..self.cursor]
+            .rfind(char::is_whitespace)
+            .map_or(0, |index| index + 1);
+        let token = &self.input[token_start..self.cursor];
+        let Some(query) = token.strip_prefix('@') else {
+            return Vec::new();
+        };
+        if query.starts_with('{') {
+            return Vec::new();
+        }
+        let query = query.to_lowercase();
+        self.indexed_files
+            .iter()
+            .filter(|path| fuzzy_path_match(path, &query))
+            .take(8)
+            .map(String::as_str)
+            .collect()
+    }
+
+    #[must_use]
+    pub(super) fn selected_file_reference(&self) -> usize {
+        self.selected_file_reference
+    }
+
+    fn complete_file_reference(&mut self) {
+        let Some(path) = self
+            .file_reference_suggestions()
+            .get(self.selected_file_reference)
+            .map(|path| (*path).to_owned())
+        else {
+            return;
+        };
+        let token_start = self.input[..self.cursor]
+            .rfind(char::is_whitespace)
+            .map_or(0, |index| index + 1);
+        let reference = if path.chars().any(char::is_whitespace) {
+            format!("@{{{path}}}")
+        } else {
+            format!("@{path}")
+        };
+        self.remember_undo_state();
+        self.input
+            .replace_range(token_start..self.cursor, &reference);
+        self.cursor = token_start + reference.len();
+        self.selected_file_reference = 0;
+    }
+
     fn complete_inline_skill(&mut self) {
         let Some(name) = self
             .inline_skill_suggestions()
@@ -916,6 +975,7 @@ impl AppState {
         self.cursor = 0;
         self.selected_slash_command = 0;
         self.selected_inline_skill = 0;
+        self.selected_file_reference = 0;
         self.slash_commands_dismissed = false;
         self.pending_escape_action = None;
         self.input_history_index = None;
@@ -928,6 +988,7 @@ impl AppState {
         self.cursor += character.len_utf8();
         self.selected_slash_command = 0;
         self.selected_inline_skill = 0;
+        self.selected_file_reference = 0;
         self.slash_commands_dismissed = false;
     }
 
@@ -976,6 +1037,13 @@ impl AppState {
     }
 
     fn delete_before_cursor(&mut self) {
+        if let Some((start, end)) = self.file_reference_range_at(self.cursor, true) {
+            self.remember_undo_state();
+            self.input.drain(start..end);
+            self.cursor = start;
+            self.selected_file_reference = 0;
+            return;
+        }
         let Some((index, _)) = self.input[..self.cursor].char_indices().next_back() else {
             return;
         };
@@ -987,6 +1055,13 @@ impl AppState {
     }
 
     fn delete_at_cursor(&mut self) {
+        if let Some((start, end)) = self.file_reference_range_at(self.cursor, false) {
+            self.remember_undo_state();
+            self.input.drain(start..end);
+            self.cursor = start;
+            self.selected_file_reference = 0;
+            return;
+        }
         let Some(character) = self.input[self.cursor..].chars().next() else {
             return;
         };
@@ -995,6 +1070,28 @@ impl AppState {
             .drain(self.cursor..self.cursor + character.len_utf8());
         self.selected_slash_command = 0;
         self.slash_commands_dismissed = false;
+    }
+
+    fn file_reference_range_at(&self, cursor: usize, backwards: bool) -> Option<(usize, usize)> {
+        let probe = if backwards {
+            cursor.checked_sub(1)?
+        } else {
+            cursor
+        };
+        reference_ranges(&self.input)
+            .into_iter()
+            .find(|(start, end)| {
+                let contains = *start <= probe && probe < *end;
+                contains && self.reference_path_exists(&self.input[*start..*end])
+            })
+    }
+
+    fn reference_path_exists(&self, reference: &str) -> bool {
+        let path = reference
+            .strip_prefix("@{")
+            .and_then(|path| path.strip_suffix('}'))
+            .or_else(|| reference.strip_prefix('@'));
+        path.is_some_and(|path| self.indexed_files.iter().any(|indexed| indexed == path))
     }
 
     fn remember_undo_state(&mut self) {
@@ -1351,6 +1448,48 @@ fn estimate_tokens(content: &str) -> u64 {
     units.div_ceil(4)
 }
 
+fn fuzzy_path_match(path: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let path = path.to_lowercase();
+    if path.contains(query) {
+        return true;
+    }
+    let mut characters = path.chars();
+    query.chars().all(|query_character| {
+        characters
+            .by_ref()
+            .any(|character| character == query_character)
+    })
+}
+
+fn reference_ranges(input: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = input[offset..].find('@') {
+        let start = offset + relative;
+        let remainder = &input[start..];
+        let end = if let Some(braced) = remainder.strip_prefix("@{") {
+            braced.find('}').map(|index| start + 2 + index + 1)
+        } else {
+            Some(
+                remainder
+                    .char_indices()
+                    .skip(1)
+                    .find(|(_, character)| character.is_whitespace())
+                    .map_or(input.len(), |(index, _)| start + index),
+            )
+        };
+        let Some(end) = end else {
+            break;
+        };
+        ranges.push((start, end));
+        offset = end.max(start + 1);
+    }
+    ranges
+}
+
 fn command_timeline_from_steps(steps: &[Step]) -> Vec<TimelineItem> {
     let mut timeline = Vec::new();
     let mut command_indexes = HashMap::new();
@@ -1569,6 +1708,7 @@ fn tui_run_status(status: &RunStatus) -> TuiRunStatus {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppAction {
+    FileIndexUpdated(FileIndexSnapshot),
     Key(KeyEvent),
     Mouse {
         event: MouseEvent,
@@ -1616,6 +1756,10 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         state.pending_escape_action = None;
     }
     match action {
+        AppAction::FileIndexUpdated(snapshot) => {
+            state.set_file_index(snapshot);
+            None
+        }
         AppAction::Mouse { event, viewport } => handle_mouse_event(state, event, viewport),
         AppAction::Key(KeyEvent {
             kind: KeyEventKind::Release,
@@ -1910,6 +2054,12 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::Key(KeyEvent {
+            code: KeyCode::Tab, ..
+        }) if !state.file_reference_suggestions().is_empty() => {
+            state.complete_file_reference();
+            None
+        }
+        AppAction::Key(KeyEvent {
             code: KeyCode::Char(' '),
             ..
         }) if state.skill_panel_visible => {
@@ -2083,6 +2233,24 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::Key(KeyEvent {
+            code: KeyCode::Up, ..
+        }) if !state.file_reference_suggestions().is_empty() => {
+            let count = state.file_reference_suggestions().len();
+            state.selected_file_reference = state
+                .selected_file_reference
+                .checked_sub(1)
+                .unwrap_or(count - 1);
+            None
+        }
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Down,
+            ..
+        }) if !state.file_reference_suggestions().is_empty() => {
+            let count = state.file_reference_suggestions().len();
+            state.selected_file_reference = (state.selected_file_reference + 1) % count;
+            None
+        }
+        AppAction::Key(KeyEvent {
             code: KeyCode::Left,
             ..
         }) if state.input.is_empty() && state.code_change_review.is_some() => {
@@ -2147,6 +2315,13 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             .map(|session| AppCommand::SwitchSession {
                 session_id: session.id.clone(),
             }),
+        AppAction::Key(KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        }) if !state.file_reference_suggestions().is_empty() => {
+            state.complete_file_reference();
+            None
+        }
         AppAction::Key(KeyEvent {
             code: KeyCode::Enter,
             ..

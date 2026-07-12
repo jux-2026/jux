@@ -1,9 +1,9 @@
 use super::ui::conversation_max_scroll;
 use super::{
-    AppAction, AppCommand, AppState, BackgroundRun, RunHandler, RunResponse, TuiRunRequest,
-    TuiRuntimeInfo, TuiViewport, assign_default_session_title, execute_code_change_command,
-    execute_session_command, load_active_session_history, materialize_pending_new_session,
-    render_app, update,
+    AppAction, AppCommand, AppState, BackgroundRun, FileIndexService, RunHandler, RunResponse,
+    TuiRunRequest, TuiRuntimeInfo, TuiViewport, assign_default_session_title,
+    execute_code_change_command, execute_session_command, load_active_session_history,
+    materialize_pending_new_session, render_app, update,
 };
 use super::{EventHandler, TuiEvent};
 use anyhow::Result;
@@ -120,12 +120,17 @@ fn run_app_loop(
     run_handler: Arc<dyn RunHandler>,
 ) -> Result<()> {
     let mut active_run: Option<BackgroundRun> = None;
+    let file_index = FileIndexService::start(state.workspace_root.clone());
     let event_handler = EventHandler::new();
     // Temporary 10 FPS cap for comparing terminal output responsiveness.
     let target_frame = Duration::from_millis(100);
     let mut next_frame = Instant::now();
     let mut pending_scroll_delta: i32 = 0;
     while !state.should_quit {
+        if let Some(snapshot) = file_index.try_recv_latest() {
+            update(state, AppAction::FileIndexUpdated(snapshot));
+            next_frame = Instant::now();
+        }
         if Instant::now() >= next_frame {
             if pending_scroll_delta != 0 {
                 state.apply_scroll_delta(pending_scroll_delta);
