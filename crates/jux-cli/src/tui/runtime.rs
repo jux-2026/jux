@@ -80,8 +80,10 @@ where
     }
 }
 
+const AGENT_EVENT_CHANNEL_CAPACITY: usize = 256;
+
 #[derive(Clone)]
-pub struct AgentEventSender(mpsc::Sender<AgentEvent>);
+pub struct AgentEventSender(mpsc::SyncSender<AgentEvent>);
 
 impl AgentEventSender {
     pub fn send(&self, event: AgentEvent) {
@@ -101,7 +103,7 @@ impl BackgroundRun {
     pub fn start(request: impl Into<TuiRunRequest>, handler: Arc<dyn RunHandler>) -> Self {
         let request = request.into();
         let (sender, receiver) = mpsc::channel();
-        let (event_sender, event_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::sync_channel(AGENT_EVENT_CHANNEL_CAPACITY);
         let (cancellation, token) = run_cancellation_pair();
         let cancel_requested = Arc::new(AtomicBool::new(false));
         std::thread::spawn(move || {

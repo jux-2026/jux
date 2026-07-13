@@ -718,12 +718,14 @@ where
     let skill_catalog = load_skill_catalog(store.root())?;
     let skills = skill_catalog.skills;
     let requested_skills = select_explicit_skills(&skills, &options.explicit_skills)?;
+    let stream_model_output = options.stream || event_sender.is_some();
     let policy = runtime_policy
         .unwrap_or_else(|| RuntimePolicy::workspace_default(store.root().to_path_buf()));
     let context = jux_core::RunLoopContext::new(store, model, policy)
         .with_instructions(instructions)
         .with_skills(skills)
-        .with_requested_skills(requested_skills);
+        .with_requested_skills(requested_skills)
+        .with_model_streaming(stream_model_output);
     let run_loop = RunLoop::with_context(context);
     if let Some(event_sender) = event_sender {
         let mut events = ChannelAgentEventSink(event_sender);
@@ -934,6 +936,15 @@ fn event_message(data: &AgentEventData) -> String {
         AgentEventData::LlmStarted => "llm".to_owned(),
         AgentEventData::LlmCompleted => "llm".to_owned(),
         AgentEventData::LlmFailed { error } => format!("error={error:?}"),
+        AgentEventData::AssistantTextDelta { content } => format!("content={content:?}"),
+        AgentEventData::AssistantReasoningDelta { content } => {
+            format!("reasoning={content:?}")
+        }
+        AgentEventData::ToolCallDelta { call_id, content } => {
+            format!("call_id={call_id:?} content={content:?}")
+        }
+        AgentEventData::UsageDelta { usage } => format!("usage={usage:?}"),
+        AgentEventData::OutputCompleted => "output".to_owned(),
         AgentEventData::ToolStarted { name, call_id, .. } => tool_message(name, call_id),
         AgentEventData::ToolOutput { name, content } => format!("tool={name:?} content={content}"),
         AgentEventData::ToolCompleted { name, call_id } => tool_message(name, call_id),

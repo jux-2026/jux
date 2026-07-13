@@ -17,6 +17,7 @@ pub use self::cancellation::{RunCancellationHandle, RunCancellationToken, run_ca
 pub use self::context::RunLoopContext;
 pub use self::event::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AgentEventSink, NoopAgentEventSink,
+    SequencedAgentEventSink,
 };
 
 use crate::state::{
@@ -25,14 +26,14 @@ use crate::state::{
 };
 use crate::state::{SqliteWorkspaceStore, StoreError};
 use crate::tools::{HUMAN_INPUT_TOOL_NAME, execute_tool, tool_definitions};
+use futures::StreamExt;
 use futures::future::Abortable;
 use rig::OneOrMany;
-use rig::completion::{
-    CompletionError, CompletionModel, CompletionResponse, ToolDefinition, Usage,
-};
+use rig::completion::{CompletionError, CompletionModel, GetTokenUsage, ToolDefinition, Usage};
 use rig::message::{
     AssistantContent, Message, ToolCall, ToolFunction, ToolResult, ToolResultContent,
 };
+use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
@@ -111,6 +112,15 @@ where
     }
 
     pub async fn run_with_events(
+        &self,
+        request: String,
+        events: &mut impl AgentEventSink,
+    ) -> Result<RunLoopOutput, RunLoopError> {
+        let mut events = SequencedAgentEventSink::new(events);
+        self.run_with_sequenced_events(request, &mut events).await
+    }
+
+    async fn run_with_sequenced_events(
         &self,
         request: String,
         events: &mut impl AgentEventSink,
@@ -298,7 +308,7 @@ where
         run: &Run,
         iteration_index: usize,
         events: &mut impl AgentEventSink,
-    ) -> Result<CompletionResponse<M::Response>, RunLoopError> {
+    ) -> Result<LlmResponse, RunLoopError> {
         let llm_request = self.llm_request_or_fail(run, iteration_index, events)?;
         let history_len = llm_request.history.len();
         tracing::debug!(run_id = %run.id, history_len, "built llm completion request");
@@ -316,21 +326,105 @@ where
             .messages(llm_request.history)
             .tools(llm_request.tools)
             .build();
-        let response = self
-            .context
-            .model
-            .completion(request)
-            .await
-            .map_err(|error| {
-                self.fail_completion_call(run.clone(), error, events, iteration_index)
-                    .expect_err("completion failure returns a run-loop error")
-            })?;
+        let response = if self.context.stream_model_output {
+            self.stream_completion(run, request, events, iteration_index)
+                .await?
+        } else {
+            let response = self
+                .context
+                .model
+                .completion(request)
+                .await
+                .map_err(|error| {
+                    self.fail_completion_call(run.clone(), error, events, iteration_index)
+                        .expect_err("completion failure returns a run-loop error")
+                })?;
+            LlmResponse {
+                choice: response.choice,
+                usage: response.usage,
+                message_id: response.message_id,
+            }
+        };
         events.emit(AgentEvent::new(
             llm_id,
             AgentEventKind::Completed,
             AgentEventData::LlmCompleted,
         ));
         Ok(response)
+    }
+
+    async fn stream_completion(
+        &self,
+        run: &Run,
+        request: rig::completion::CompletionRequest,
+        events: &mut impl AgentEventSink,
+        iteration_index: usize,
+    ) -> Result<LlmResponse, RunLoopError> {
+        let mut stream = self.context.model.stream(request).await.map_err(|error| {
+            self.fail_completion_call(run.clone(), error, events, iteration_index)
+                .expect_err("streaming completion failure returns a run-loop error")
+        })?;
+        let llm_id = AgentEventId::llm(iteration_index, 1);
+        let mut usage = Usage::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                self.fail_completion_call(run.clone(), error, events, iteration_index)
+                    .expect_err("streaming completion failure returns a run-loop error")
+            })?;
+            let data = match chunk {
+                StreamedAssistantContent::Text(text) => {
+                    Some(AgentEventData::AssistantTextDelta { content: text.text })
+                }
+                StreamedAssistantContent::Reasoning(reasoning) => {
+                    Some(AgentEventData::AssistantReasoningDelta {
+                        content: reasoning.display_text(),
+                    })
+                }
+                StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                    Some(AgentEventData::AssistantReasoningDelta { content: reasoning })
+                }
+                StreamedAssistantContent::ToolCallDelta {
+                    internal_call_id,
+                    content,
+                    ..
+                } => Some(AgentEventData::ToolCallDelta {
+                    call_id: internal_call_id,
+                    content: match content {
+                        ToolCallDeltaContent::Name(name) | ToolCallDeltaContent::Delta(name) => {
+                            name
+                        }
+                    },
+                }),
+                StreamedAssistantContent::Final(response) => {
+                    if let Some(final_usage) = response.token_usage() {
+                        usage = final_usage;
+                        Some(AgentEventData::UsageDelta {
+                            usage: usage.into(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                StreamedAssistantContent::ToolCall { .. } => None,
+            };
+            if let Some(data) = data {
+                events.emit(AgentEvent::new(
+                    llm_id.clone(),
+                    AgentEventKind::Output,
+                    data,
+                ));
+            }
+        }
+        events.emit(AgentEvent::new(
+            llm_id,
+            AgentEventKind::Completed,
+            AgentEventData::OutputCompleted,
+        ));
+        Ok(LlmResponse {
+            choice: stream.choice.clone(),
+            usage,
+            message_id: stream.message_id.clone(),
+        })
     }
 
     fn llm_request_or_fail(
@@ -1296,6 +1390,12 @@ struct LlmCompletionRequest {
     prompt: Message,
     history: Vec<Message>,
     tools: Vec<ToolDefinition>,
+}
+
+struct LlmResponse {
+    choice: OneOrMany<AssistantContent>,
+    usage: Usage,
+    message_id: Option<String>,
 }
 
 fn step_to_chat_message(step: &Step) -> Option<Message> {

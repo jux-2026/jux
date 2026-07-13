@@ -23,6 +23,7 @@ pub struct RunLoopContext<M> {
     pub skills: Vec<SkillDefinition>,
     pub requested_skills: Vec<SkillDefinition>,
     pub active_skills: Vec<SkillDefinition>,
+    pub stream_model_output: bool,
 }
 
 impl<M> RunLoopContext<M> {
@@ -36,6 +37,7 @@ impl<M> RunLoopContext<M> {
             skills: Vec::new(),
             requested_skills: Vec::new(),
             active_skills: Vec::new(),
+            stream_model_output: false,
         }
     }
 
@@ -60,6 +62,12 @@ impl<M> RunLoopContext<M> {
     #[must_use]
     pub fn with_active_skills(mut self, active_skills: Vec<SkillDefinition>) -> Self {
         self.active_skills = active_skills;
+        self
+    }
+
+    #[must_use]
+    pub fn with_model_streaming(mut self, enabled: bool) -> Self {
+        self.stream_model_output = enabled;
         self
     }
 

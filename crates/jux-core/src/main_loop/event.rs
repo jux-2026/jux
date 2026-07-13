@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display};
 
+use crate::util::time::now_millis;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 /// Hierarchical event id used by streamed run-loop events.
 ///
@@ -52,7 +54,10 @@ impl Display for AgentEventId {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 /// Streamed event emitted by the run loop.
 pub struct AgentEvent {
+    pub sequence: u64,
+    pub timestamp: u128,
     pub id: AgentEventId,
+    pub parent_id: Option<AgentEventId>,
     pub kind: AgentEventKind,
     pub data: AgentEventData,
 }
@@ -60,7 +65,22 @@ pub struct AgentEvent {
 impl AgentEvent {
     #[must_use]
     pub fn new(id: AgentEventId, kind: AgentEventKind, data: AgentEventData) -> Self {
-        Self { id, kind, data }
+        let parent_id = id.parent();
+        Self {
+            sequence: 0,
+            timestamp: now_millis(),
+            id,
+            parent_id,
+            kind,
+            data,
+        }
+    }
+}
+
+impl AgentEventId {
+    fn parent(&self) -> Option<Self> {
+        let (parent, _) = self.0.rsplit_once('.')?;
+        Some(Self(parent.to_owned()))
     }
 }
 
@@ -99,6 +119,20 @@ pub enum AgentEventData {
     LlmFailed {
         error: String,
     },
+    AssistantTextDelta {
+        content: String,
+    },
+    AssistantReasoningDelta {
+        content: String,
+    },
+    ToolCallDelta {
+        call_id: String,
+        content: String,
+    },
+    UsageDelta {
+        usage: crate::state::LlmUsage,
+    },
+    OutputCompleted,
     ToolStarted {
         name: String,
         call_id: Option<String>,
@@ -122,6 +156,33 @@ pub enum AgentEventData {
 /// Receives streamed run-loop events.
 pub trait AgentEventSink {
     fn emit(&mut self, event: AgentEvent);
+}
+
+/// Assigns one monotonic sequence to every event emitted by a run.
+pub struct SequencedAgentEventSink<'a, S> {
+    inner: &'a mut S,
+    next_sequence: u64,
+}
+
+impl<'a, S> SequencedAgentEventSink<'a, S> {
+    #[must_use]
+    pub fn new(inner: &'a mut S) -> Self {
+        Self {
+            inner,
+            next_sequence: 1,
+        }
+    }
+}
+
+impl<S> AgentEventSink for SequencedAgentEventSink<'_, S>
+where
+    S: AgentEventSink,
+{
+    fn emit(&mut self, mut event: AgentEvent) {
+        event.sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.inner.emit(event);
+    }
 }
 
 #[derive(Default)]

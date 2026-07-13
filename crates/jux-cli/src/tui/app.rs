@@ -101,6 +101,7 @@ pub struct AppState {
     input_history_draft: String,
     undo_input: Option<(String, usize)>,
     messages: Vec<Message>,
+    streaming_assistant_message: Option<usize>,
     selected_message: Option<usize>,
     conversation_search: Option<String>,
     conversation_scroll_from_bottom: u16,
@@ -368,6 +369,7 @@ impl AppState {
             input_history_draft: String::new(),
             undo_input: None,
             messages: Vec::new(),
+            streaming_assistant_message: None,
             selected_message: None,
             conversation_search: None,
             conversation_scroll_from_bottom: 0,
@@ -1862,6 +1864,22 @@ fn update_inner(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             if let AgentEventData::SkillsSelected { skills } = &event.data {
                 state.active_skill_names = skills.clone();
             }
+            if let AgentEventData::AssistantTextDelta { content } = &event.data {
+                state.estimated_output_tokens = state
+                    .estimated_output_tokens
+                    .saturating_add(estimate_tokens(content));
+                match state.streaming_assistant_message {
+                    Some(index) => state.messages[index].content.push_str(content),
+                    None => {
+                        state.messages.push(Message {
+                            role: MessageRole::Assistant,
+                            content: content.clone(),
+                        });
+                        state.streaming_assistant_message = Some(state.messages.len() - 1);
+                    }
+                }
+                return None;
+            }
             if matches!(&event.data, AgentEventData::LlmCompleted) {
                 let completed_id = event.id.to_string();
                 state.timeline.retain(|item| item.id != completed_id);
@@ -1923,6 +1941,11 @@ fn update_inner(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         }
         AppAction::RunFinished { response } => {
             state.pending_escape_action = None;
+            if let Some(index) = state.streaming_assistant_message.take()
+                && index < state.messages.len()
+            {
+                state.messages.remove(index);
+            }
             let waiting_for_human_input = response.status == RunStatus::WaitingForHumanInput;
             state.run_status = match response.status {
                 RunStatus::Running => TuiRunStatus::Running,

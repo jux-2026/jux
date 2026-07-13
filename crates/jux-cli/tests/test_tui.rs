@@ -709,6 +709,27 @@ fn tui_keeps_commands_in_their_conversation_order() {
 }
 
 #[test]
+fn tui_appends_streamed_assistant_text_deltas() {
+    let mut state = AppState::new("/workspace");
+
+    for content in ["Hello", " world"] {
+        update(
+            &mut state,
+            AppAction::AgentEvent(AgentEvent::new(
+                AgentEventId::llm(1, 1),
+                AgentEventKind::Output,
+                AgentEventData::AssistantTextDelta {
+                    content: content.to_owned(),
+                },
+            )),
+        );
+    }
+
+    assert_eq!(state.messages().len(), 1);
+    assert_eq!(state.messages()[0].content, "Hello world");
+}
+
+#[test]
 fn tui_keeps_persisted_commands_visible_when_a_run_finishes() {
     let mut state = AppState::new("/workspace");
     type_text(&mut state, "Inspect the workspace");

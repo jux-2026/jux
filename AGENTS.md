@@ -14,9 +14,17 @@ The current runtime foundation includes:
 - Basic build, test, format, lint, and Git hook quality commands.
 - Minimal Workspace, Session, Run, and Step concepts.
 - SQLite-backed local state under the workspace `.jux` directory.
-- Minimal `jux run` command backed by Rig and the DeepSeek provider.
+- Multi-iteration `jux run` execution backed by Rig and the DeepSeek provider.
+- Native, Lua, and WASM-backed tools with runtime policy checks.
+- Skill discovery, explicit and model-selected invocation, isolated transcripts, and resume.
+- Human clarification and confirmation with persisted wait-and-resume behavior.
+- A Ratatui client with session management, run timelines, cancellation, and code-change review.
 
-Do not add policy, patch review, tool execution, approvals, resume, MCP, Skill, TUI, or Tauri behavior until the roadmap and runtime design are updated first.
+The runtime evolution plan is defined in the root repository's
+`docs/prd文档/agent-runtime-evolution.md` and `docs/TODO.md`. New context,
+streaming, execution-graph, parallelism, approval, Plan, and Skill behavior must
+follow those documents. Do not add MCP or Tauri behavior until their roadmap
+dependencies are complete and their product design is updated first.
 
 ## Directory Structure
 

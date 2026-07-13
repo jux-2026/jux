@@ -10,7 +10,7 @@ use rig::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage, Usage,
 };
 use rig::message::{AssistantContent, Reasoning, ToolCall, ToolFunction};
-use rig::streaming::StreamingCompletionResponse;
+use rig::streaming::{RawStreamingChoice, StreamingCompletionResponse};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
@@ -792,6 +792,41 @@ fn run_loop_streams_hierarchical_events() {
     assert!(event_ids.contains(&"run.iteration.1.tool.lua.1".to_owned()));
     assert!(events.contains(AgentEventKind::Output, "run.iteration.1.tool.lua.1"));
     assert!(events.contains(AgentEventKind::Completed, "run"));
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        (1..=events.events.len() as u64).collect::<Vec<_>>()
+    );
+    assert!(events.events.iter().all(|event| event.timestamp > 0));
+}
+
+#[test]
+fn run_loop_streams_text_deltas_and_persists_the_aggregated_response() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::fixed_text("Streamed text");
+    let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let context = RunLoopContext::new(store, model, policy).with_model_streaming(true);
+    let run_loop = RunLoop::with_context(context);
+    let mut events = VecAgentEventSink::default();
+
+    let output = futures::executor::block_on(
+        run_loop.run_with_events("Stream content".to_owned(), &mut events),
+    )
+    .expect("streaming run succeeds");
+
+    assert!(events.events.iter().any(|event| matches!(
+        &event.data,
+        jux_core::AgentEventData::AssistantTextDelta { content }
+            if content == "Streamed text"
+    )));
+    assert_eq!(output.answer.as_deref(), Some("Streamed text"));
+    assert_eq!(
+        output.steps[1].payload.to_assistant_text(),
+        Some("Streamed text")
+    );
 }
 
 #[test]
@@ -1173,11 +1208,36 @@ impl CompletionModel for TestModel {
 
     async fn stream(
         &self,
-        _request: CompletionRequest,
+        request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
-        Err(CompletionError::ProviderError(
-            "test streaming is not implemented".to_owned(),
-        ))
+        let request_json = serde_json::to_string(&request).expect("request serializes");
+        self.recorded_requests
+            .lock()
+            .expect("recorded requests lock is available")
+            .push(request_json);
+        let response = self
+            .responses
+            .lock()
+            .expect("responses lock is available")
+            .remove(0)
+            .map_err(CompletionError::ProviderError)?;
+        let mut chunks = Vec::new();
+        for content in response {
+            match content {
+                AssistantContent::Text(text) => {
+                    chunks.push(Ok(RawStreamingChoice::Message(text.text)));
+                }
+                _ => {
+                    return Err(CompletionError::ProviderError(
+                        "test streaming only supports text".to_owned(),
+                    ));
+                }
+            }
+        }
+        chunks.push(Ok(RawStreamingChoice::FinalResponse(TestStreamingResponse)));
+        Ok(StreamingCompletionResponse::stream(Box::pin(
+            futures::stream::iter(chunks),
+        )))
     }
 }
 

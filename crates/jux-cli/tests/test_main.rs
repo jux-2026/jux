@@ -1045,24 +1045,13 @@ fn start_deepseek_mock_sequence(
         let mut requests = Vec::new();
         for content in contents {
             let (mut stream, _) = listener.accept().expect("mock server accepts request");
-            requests.push(read_http_request(&mut stream));
-            let choice = deepseek_choice(content);
-            let body = serde_json::json!({
-                "choices": [choice],
-                "usage": {
-                    "completion_tokens": 0,
-                    "prompt_tokens": 0,
-                    "prompt_cache_hit_tokens": 0,
-                    "prompt_cache_miss_tokens": 0,
-                    "total_tokens": 0
-                }
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
+            let request = read_http_request(&mut stream);
+            let response = if request.contains("\"stream\":true") {
+                deepseek_streaming_response(content)
+            } else {
+                deepseek_json_response(content)
+            };
+            requests.push(request);
             stream
                 .write_all(response.as_bytes())
                 .expect("mock server writes response");
@@ -1074,6 +1063,67 @@ fn start_deepseek_mock_sequence(
         base_url: format!("http://{address}"),
         handle,
     }
+}
+
+fn deepseek_json_response(content: DeepseekMockResponse) -> String {
+    let choice = deepseek_choice(content);
+    let body = serde_json::json!({
+        "choices": [choice],
+        "usage": deepseek_usage()
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn deepseek_streaming_response(content: DeepseekMockResponse) -> String {
+    let delta = match content {
+        DeepseekMockResponse::Text(content) => serde_json::json!({ "content": content }),
+        DeepseekMockResponse::ToolCall {
+            id,
+            name,
+            arguments,
+        } => serde_json::json!({
+            "tool_calls": [{
+                "index": 0,
+                "id": id,
+                "function": {
+                    "name": name,
+                    "arguments": arguments.to_string()
+                }
+            }]
+        }),
+    };
+    let content_event = serde_json::json!({
+        "id": "mock-stream",
+        "model": "deepseek-chat",
+        "choices": [{ "delta": delta }]
+    });
+    let usage_event = serde_json::json!({
+        "id": "mock-stream",
+        "model": "deepseek-chat",
+        "choices": [],
+        "usage": deepseek_usage()
+    });
+    let body = format!("data: {content_event}\n\ndata: {usage_event}\n\ndata: [DONE]\n\n");
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\ncontent-length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn deepseek_usage() -> serde_json::Value {
+    serde_json::json!({
+        "completion_tokens": 0,
+        "prompt_tokens": 0,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 0,
+        "total_tokens": 0
+    })
 }
 
 fn deepseek_choice(response: DeepseekMockResponse) -> serde_json::Value {
