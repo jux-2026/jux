@@ -10,6 +10,11 @@ use crate::tools::ToolExecutionContext;
 /// top-level infrastructure and policy required by the run loop, including
 /// persistence, LLM access, and execution permissions.
 ///
+/// This type is dependency context, not the prompt sent to the model. Model
+/// context is projected separately from persisted session context and visible
+/// steps. Keeping those meanings separate prevents infrastructure handles,
+/// policy state, or an unbounded session history from leaking into prompts.
+///
 /// Lower-level modules should not depend on this concrete type directly unless
 /// they are part of the run-loop layer. Tool, WASM, and future native execution
 /// modules should depend on their own context traits instead. `RunLoopContext`

@@ -70,6 +70,11 @@ impl Session {
 /// Session context stores stable prompt material, such as the system prompt and
 /// tool definitions. It is separate from run steps so the same context can be
 /// reused across multiple user requests.
+///
+/// This table is currently the materialized static portion of a prompt. It must
+/// not become a second conversation log: user, assistant, and tool history is
+/// projected from steps. Future context budgeting, provenance, and source
+/// snapshots should deepen that projection rather than copying history here.
 pub struct SessionContextItem {
     pub session_id: SessionId,
     pub sequence: u64,
@@ -228,6 +233,10 @@ pub enum StepPayload {
         items: Vec<AssistantResponseItem>,
     },
     AssistantOutputCheckpoint {
+        /// Text observed by a client before a streaming call was canceled.
+        ///
+        /// A checkpoint is display and recovery state, not a completed model
+        /// message. It therefore remains invisible to later LLM requests.
         content: String,
     },
     ToolResult {

@@ -95,6 +95,9 @@ where
         events: &mut impl AgentEventSink,
         cancellation: RunCancellationToken,
     ) -> Result<RunLoopOutput, RunLoopError> {
+        // Observe deltas without persisting each token. Cancellation writes the
+        // accumulated text once as a recovery checkpoint; normal completion
+        // persists the authoritative assistant response instead.
         let mut checkpointing_events = PartialOutputEventSink::new(events);
         match Abortable::new(
             self.run_with_events(request, &mut checkpointing_events),
@@ -859,6 +862,10 @@ where
         events: &mut impl AgentEventSink,
         output: &serde_json::Value,
     ) {
+        // The current exec adapter returns a completed structured result. This
+        // seam emits bounded stdout/stderr chunks so clients do not need to
+        // understand that result schema. A future streaming adapter can emit
+        // the same event while its process is still running.
         if tool_call.name != "exec" {
             return;
         }
@@ -1027,6 +1034,10 @@ where
     }
 
     fn build_completion_request(&self, run: &Run) -> Result<LlmCompletionRequest, RunLoopError> {
+        // Project prompts from two fact sources: static session context and
+        // LLM-visible steps. Skill transcripts, errors, and canceled-output
+        // checkpoints remain available for recovery/audit but do not cross the
+        // model-context seam.
         let context = self
             .context
             .store

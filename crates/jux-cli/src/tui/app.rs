@@ -1872,6 +1872,9 @@ fn update_inner(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::AgentEvent(event) => {
+            // Reducers may receive retried or replayed events. Sequence zero is
+            // reserved for legacy/local events; sequenced runtime events are
+            // applied at most once per background execution.
             if event.sequence > 0 && matches!(&event.data, AgentEventData::RunStarted { .. }) {
                 state.last_agent_event_sequence = 0;
             }

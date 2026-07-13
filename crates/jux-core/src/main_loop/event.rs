@@ -1,3 +1,11 @@
+//! Typed, hierarchical events emitted while a run is executing.
+//!
+//! Events are a transient client protocol, while persisted [`crate::state::Step`]
+//! values are the durable fact source. High-frequency deltas are intentionally
+//! aggregated before persistence. Clients use `sequence` for ordered,
+//! idempotent reduction and use the final persisted step to reconcile their
+//! rendered state.
+
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display};
 
@@ -54,6 +62,10 @@ impl Display for AgentEventId {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 /// Streamed event emitted by the run loop.
 pub struct AgentEvent {
+    /// Monotonic position within one active event stream.
+    ///
+    /// A resumed run opens a new stream, so clients reset their cursor when
+    /// they start that background execution.
     pub sequence: u64,
     pub timestamp: u128,
     pub id: AgentEventId,

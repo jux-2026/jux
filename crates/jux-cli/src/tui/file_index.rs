@@ -27,6 +27,11 @@ pub struct FileIndexService {
 }
 
 impl FileIndexService {
+    /// Starts indexing without blocking the TUI thread on Git or filesystem IO.
+    ///
+    /// The worker publishes an initial snapshot before watcher setup, then
+    /// reconciles once after registration. Reconciliation closes the race where
+    /// files change after the first snapshot but before notifications are active.
     #[must_use]
     pub fn start(root: PathBuf) -> Self {
         let (sender, receiver) = mpsc::channel();
@@ -54,6 +59,8 @@ impl FileIndexService {
 
 impl Drop for FileIndexService {
     fn drop(&mut self) {
+        // Explicit shutdown prevents detached watcher threads from accumulating
+        // across session switches, tests, or repeated TUI construction.
         let _ = self.shutdown.send(());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
