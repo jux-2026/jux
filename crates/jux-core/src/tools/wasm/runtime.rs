@@ -7,7 +7,8 @@
 
 use super::assets::WasmAsset;
 use super::capability::{
-    WasmerRuntimeCapabilities, apply_runner_capabilities, apply_runtime_capabilities,
+    GUEST_WORKSPACE_DIRECTORY, WasmerRuntimeCapabilities, apply_runner_capabilities,
+    apply_runtime_capabilities,
 };
 use super::commands::{
     COREUTILS_ASSET, WasmCommandOutput, WasmCommandRequest, is_supported_coreutils_command,
@@ -305,7 +306,7 @@ fn run_wasi_command(
         .with_stdin(Box::<NullFile>::default())
         .with_stdout(Box::new(invocation.stdout))
         .with_stderr(Box::new(invocation.stderr))
-        .with_current_dir("/");
+        .with_current_dir(GUEST_WORKSPACE_DIRECTORY);
     apply_runner_capabilities(&mut runner, capabilities, invocation.host_directory);
 
     runner.run_command(

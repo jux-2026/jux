@@ -536,9 +536,37 @@ fn run_loop_executes_exec_tool_call_and_returns_structured_output() {
     assert_eq!(exec_output["stdout"], "hello");
     assert_eq!(exec_output["stderr"], "");
     assert!(requests[0].contains("\"name\":\"exec\""));
+    assert!(requests[0].contains("Always use workspace-relative paths"));
     assert!(requests[0].contains("success"));
     assert!(requests[0].contains("exit_code"));
     assert!(requests[1].contains("hello"));
+}
+
+#[test]
+fn run_loop_normalizes_legacy_workspace_paths_before_sending_session_history() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let execution_root = temp_workspace_root();
+    std::fs::write(execution_root.join("hello.txt"), "hello").expect("fixture file is written");
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "call_1",
+            "exec",
+            serde_json::json!({ "program": "cat", "args": ["/workspace/hello.txt"] }),
+        ))]),
+        Ok(vec![AssistantContent::text("First run complete")]),
+        Ok(vec![AssistantContent::text("Second run complete")]),
+    ]);
+    let policy = RuntimePolicy::workspace_default(execution_root);
+    let run_loop = RunLoop::with_context(RunLoopContext::new(store, model.clone(), policy));
+
+    futures::executor::block_on(run_loop.run("Read @/workspace/hello.txt".to_owned()))
+        .expect("first run succeeds");
+    futures::executor::block_on(run_loop.run("Continue".to_owned())).expect("second run succeeds");
+    let requests = model.recorded_requests();
+
+    assert!(requests[2].contains("@hello.txt"));
+    assert!(requests[2].contains("\"args\":[\"hello.txt\"]"));
+    assert!(!requests[2].contains("/workspace/hello.txt"));
 }
 
 #[test]

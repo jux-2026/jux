@@ -857,6 +857,10 @@ impl AppState {
         self.indexed_files
             .iter()
             .filter(|path| fuzzy_path_match(path, &query))
+            // Keep the limit in the query itself. Collecting every match and
+            // truncating in the popup made each render allocate a workspace-
+            // sized candidate list, which noticeably delayed text input.
+            .take(8)
             .map(String::as_str)
             .collect()
     }

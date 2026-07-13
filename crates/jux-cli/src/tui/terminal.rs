@@ -126,20 +126,33 @@ fn run_app_loop(
     let target_frame = Duration::from_millis(100);
     let mut next_frame = Instant::now();
     let mut pending_scroll_delta: i32 = 0;
+    let mut conversation_layout_dirty = true;
+    let mut previous_terminal_size = None;
     while !state.should_quit {
         if let Some(snapshot) = file_index.try_recv_latest() {
             update(state, AppAction::FileIndexUpdated(snapshot));
             next_frame = Instant::now();
         }
         if Instant::now() >= next_frame {
+            let size = terminal.size()?;
+            if previous_terminal_size != Some(size) {
+                conversation_layout_dirty = true;
+                previous_terminal_size = Some(size);
+            }
+            // Building the conversation layout parses the complete persisted
+            // history. Recomputing its scroll range before every input-frame
+            // used to build that history twice per keystroke. Only structural
+            // conversation or viewport changes need a new maximum.
+            if conversation_layout_dirty {
+                let conversation_width = state.conversation_panel_width(size.width);
+                let area = ratatui::layout::Rect::new(0, 0, conversation_width, size.height);
+                state.clamp_conversation_scroll_to(conversation_max_scroll(state, area));
+                conversation_layout_dirty = false;
+            }
             if pending_scroll_delta != 0 {
                 state.apply_scroll_delta(pending_scroll_delta);
                 pending_scroll_delta = 0;
             }
-            let size = terminal.size()?;
-            let conversation_width = state.conversation_panel_width(size.width);
-            let area = ratatui::layout::Rect::new(0, 0, conversation_width, size.height);
-            state.clamp_conversation_scroll_to(conversation_max_scroll(state, area));
             let draw_started = Instant::now();
             terminal.draw(|frame| render_app(frame, state))?;
             let draw_elapsed = draw_started.elapsed();
@@ -147,6 +160,7 @@ fn run_app_loop(
         }
         while let Some(event) = active_run.as_ref().and_then(BackgroundRun::try_recv_event) {
             update(state, AppAction::AgentEvent(event));
+            conversation_layout_dirty = true;
         }
         if let Some(result) = active_run.as_ref().and_then(BackgroundRun::try_recv) {
             let was_canceled = active_run
@@ -158,6 +172,7 @@ fn run_app_loop(
             } else {
                 apply_run_result(state, result);
             }
+            conversation_layout_dirty = true;
             continue;
         }
         let input_wait = next_frame
@@ -172,6 +187,7 @@ fn run_app_loop(
                         let starts_new_scroll = pending_scroll_delta == 0;
                         pending_scroll_delta = pending_scroll_delta.saturating_add(delta);
                         if starts_new_scroll && pending_scroll_delta != 0 {
+                            conversation_layout_dirty = true;
                             next_frame = Instant::now();
                         }
                         continue;
@@ -207,6 +223,9 @@ fn run_app_loop(
                 let Some(action) = action else {
                     continue;
                 };
+                if action_changes_conversation_layout(state, &action) {
+                    conversation_layout_dirty = true;
+                }
                 if let Some(command) = update(state, action) {
                     if execute_code_change_command(state, &command)? {
                         continue;
@@ -253,6 +272,23 @@ fn run_app_loop(
         }
     }
     Ok(())
+}
+
+fn action_changes_conversation_layout(state: &AppState, action: &AppAction) -> bool {
+    // Editing the input and moving its cursor do not change history geometry.
+    // Keep these actions out of the expensive conversation layout path.
+    match action {
+        AppAction::FileIndexUpdated(_) => false,
+        AppAction::Key(key) => match key.code {
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::Tab => false,
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => false,
+            KeyCode::Up | KeyCode::Down => state.input_text().is_empty(),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => false,
+            _ => true,
+        },
+        AppAction::Mouse { .. } => true,
+        _ => true,
+    }
 }
 
 #[allow(dead_code)]

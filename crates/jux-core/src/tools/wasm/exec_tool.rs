@@ -27,7 +27,9 @@ impl JuxTool for WasmExecTool {
             name: EXEC_TOOL_NAME.to_owned(),
             description: format!(
                 "Execute one command from the Jux WASI runtime. Provide the command name in \
-                program and each argument as a separate string in args. Available commands: {}. \
+                program and each argument as a separate string in args. The current working \
+                directory is the project workspace. Always use workspace-relative paths for \
+                project files; do not convert them to absolute paths. Available commands: {}. \
                 Do not use shell syntax such as &&, ||, ;, |, >, <, backticks, $(), wildcard \
                 expansion, or newlines. The tool returns structured execution data as JSON: \
                 success, exit_code, stdout, and stderr.",

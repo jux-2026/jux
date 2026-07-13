@@ -17,6 +17,8 @@ use wasmer_wasix::runtime::package_loader::BuiltinPackageLoader;
 use wasmer_wasix::runtime::resolver::InMemorySource;
 use wasmer_wasix::{PluggableRuntime, UnsupportedVirtualNetworking};
 
+pub(super) const GUEST_WORKSPACE_DIRECTORY: &str = "/workspace";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Concrete capabilities that Jux provides to the Wasmer runtime.
 ///
@@ -133,7 +135,7 @@ pub(super) fn apply_runner_capabilities(
         WasmFilesystemCapability::MappedHostDirectory => {
             runner.with_mapped_directories([MappedDirectory {
                 host: host_directory,
-                guest: "/".to_owned(),
+                guest: GUEST_WORKSPACE_DIRECTORY.to_owned(),
             }]);
         }
     }

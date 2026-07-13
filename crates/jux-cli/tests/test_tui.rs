@@ -261,6 +261,23 @@ fn tui_completes_file_references_and_renders_suggestions() {
     let completed = render_to_buffer(&state, 80, 24);
     assert_buffer_fragment_has_foreground(&completed, "@src/main.rs", Color::Cyan);
     assert_eq!(find_fragment_position(&completed, "@README.md"), None);
+    let command = update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    assert_eq!(
+        command,
+        Some(AppCommand::StartRun {
+            request: "Please inspect @src/main.rs ".to_owned(),
+        })
+    );
+    assert_eq!(
+        state
+            .messages()
+            .last()
+            .map(|message| message.content.as_str()),
+        Some("Please inspect @src/main.rs ")
+    );
 }
 
 #[test]
@@ -299,7 +316,7 @@ fn tui_file_reference_popup_clears_the_conversation_beneath_it() {
 }
 
 #[test]
-fn tui_file_reference_selection_scrolls_through_all_matches() {
+fn tui_file_reference_selection_stays_within_the_visible_matches() {
     let mut state = AppState::new("/workspace");
     update(
         &mut state,
@@ -319,13 +336,13 @@ fn tui_file_reference_selection_scrolls_through_all_matches() {
     }
 
     let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&buffer, "@src/file-08.rs");
-    assert_buffer_does_not_contain(&buffer, "@src/file-00.rs");
+    assert_buffer_contains(&buffer, "@src/file-00.rs");
+    assert_buffer_does_not_contain(&buffer, "@src/file-08.rs");
     update(
         &mut state,
         AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
-    assert_eq!(state.input_text(), "@src/file-08.rs ");
+    assert_eq!(state.input_text(), "@src/file-00.rs ");
 }
 
 #[test]
@@ -363,6 +380,35 @@ fn tui_deletes_a_file_reference_as_one_input_unit() {
         AppAction::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
     );
     assert_eq!(delete_state.input_text(), "");
+}
+
+#[test]
+fn tui_submits_braced_file_references_as_workspace_relative_paths() {
+    let mut state = AppState::new("/workspace");
+    update(
+        &mut state,
+        AppAction::FileIndexUpdated(FileIndexSnapshot {
+            kind: FileIndexKind::Filesystem,
+            files: vec!["docs/My File.md".to_owned()],
+        }),
+    );
+    type_text(&mut state, "Read @My");
+    update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+
+    let command = update(
+        &mut state,
+        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+
+    assert_eq!(
+        command,
+        Some(AppCommand::StartRun {
+            request: "Read @{docs/My File.md} ".to_owned(),
+        })
+    );
 }
 
 #[test]

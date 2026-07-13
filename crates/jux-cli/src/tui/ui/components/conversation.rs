@@ -97,6 +97,7 @@ fn prompt_panel(
 ) -> (Paragraph<'_>, ConversationScroll) {
     let mut lines = Vec::new();
     let mut command_toggle_rows = Vec::new();
+    let mut rendered_rows = RenderedRowCounter::default();
     let colors = palette(state.theme());
     append_timeline_items(
         state,
@@ -104,6 +105,7 @@ fn prompt_panel(
         content_width,
         &mut lines,
         &mut command_toggle_rows,
+        &mut rendered_rows,
     );
     for (message_index, message) in state.messages().iter().enumerate() {
         let selected = state.selected_message() == Some(message_index);
@@ -142,6 +144,7 @@ fn prompt_panel(
             content_width,
             &mut lines,
             &mut command_toggle_rows,
+            &mut rendered_rows,
         );
     }
     if state.run_status() == TuiRunStatus::Running {
@@ -272,6 +275,7 @@ fn append_timeline_items<'a>(
     content_width: u16,
     lines: &mut Vec<Line<'a>>,
     command_toggle_rows: &mut Vec<(u16, usize)>,
+    rendered_rows: &mut RenderedRowCounter,
 ) {
     if state
         .timeline()
@@ -285,7 +289,7 @@ fn append_timeline_items<'a>(
             continue;
         }
         if let Some(command) = &item.command {
-            command_toggle_rows.push((rendered_row_count(lines, content_width), timeline_index));
+            command_toggle_rows.push((rendered_rows.count(lines, content_width), timeline_index));
             lines.extend(command_output::render(
                 command,
                 item.status,
@@ -436,9 +440,28 @@ fn format_duration(elapsed_millis: u128) -> String {
     }
 }
 
-fn rendered_row_count(lines: &[Line<'_>], content_width: u16) -> u16 {
-    let paragraph = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
-    u16::try_from(paragraph.line_count(content_width)).unwrap_or(u16::MAX)
+#[derive(Default)]
+struct RenderedRowCounter {
+    counted_lines: usize,
+    rows: u16,
+}
+
+impl RenderedRowCounter {
+    fn count(&mut self, lines: &[Line<'_>], content_width: u16) -> u16 {
+        // Command hit-testing needs the wrapped row before each command. Do
+        // not call `line_count` for the complete prefix here: sessions with
+        // many commands then repeatedly process the same earlier lines and
+        // turn conversation rendering into O(commands * history). Counting
+        // only newly appended lines keeps the whole layout pass linear.
+        let new_lines = &lines[self.counted_lines..];
+        if !new_lines.is_empty() {
+            let paragraph = Paragraph::new(new_lines.to_vec()).wrap(Wrap { trim: false });
+            let rows = u16::try_from(paragraph.line_count(content_width)).unwrap_or(u16::MAX);
+            self.rows = self.rows.saturating_add(rows);
+            self.counted_lines = lines.len();
+        }
+        self.rows
+    }
 }
 
 fn render_conversation_scrollbar(

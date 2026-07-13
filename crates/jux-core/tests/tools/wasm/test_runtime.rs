@@ -49,6 +49,38 @@ fn wasmer_runtime_runs_coreutils_command() {
 }
 
 #[test]
+fn wasmer_runtime_mounts_deep_workspace_paths_without_package_conflicts() {
+    let root = temp_workspace_root();
+    let directory = root.join("crates/jux-cli/src/tui/ui");
+    std::fs::create_dir_all(&directory).expect("nested fixture directory is created");
+    std::fs::write(
+        directory.join("layout.rs"),
+        "pub struct ConversationLayout;",
+    )
+    .expect("nested fixture file is written");
+    let runtime = WasmerRuntime::new();
+
+    let pwd = runtime
+        .run_coreutils_command(WasmCommandRequest {
+            program: "pwd".to_owned(),
+            args: Vec::new(),
+            host_directory: root.clone(),
+        })
+        .expect("pwd runs");
+    let file = runtime
+        .run_coreutils_command(WasmCommandRequest {
+            program: "cat".to_owned(),
+            args: vec!["/workspace/crates/jux-cli/src/tui/ui/layout.rs".to_owned()],
+            host_directory: root,
+        })
+        .expect("cat runs");
+
+    assert_eq!(pwd.stdout.trim(), "/workspace");
+    assert!(file.success);
+    assert_eq!(file.stdout, "pub struct ConversationLayout;");
+}
+
+#[test]
 fn wasmer_runtime_exposes_default_capabilities() {
     let runtime = WasmerRuntime::new();
 

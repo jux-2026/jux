@@ -1300,7 +1300,9 @@ struct LlmCompletionRequest {
 
 fn step_to_chat_message(step: &Step) -> Option<Message> {
     match &step.payload {
-        StepPayload::UserMessage { content } => Some(Message::user(content.clone())),
+        StepPayload::UserMessage { content } => {
+            Some(Message::user(workspace_relative_references(content)))
+        }
         StepPayload::AssistantResponse {
             message_id, items, ..
         } => assistant_response_to_chat_message(message_id, items),
@@ -1359,10 +1361,8 @@ fn assistant_response_item_to_chat_content(
             name,
             arguments,
         } => {
-            let tool_call = ToolCall::new(
-                id.clone(),
-                ToolFunction::new(name.clone(), arguments.clone()),
-            );
+            let arguments = workspace_relative_exec_arguments(name, arguments);
+            let tool_call = ToolCall::new(id.clone(), ToolFunction::new(name.clone(), arguments));
             let tool_call = match call_id {
                 Some(call_id) => tool_call.with_call_id(call_id.clone()),
                 None => tool_call,
@@ -1371,6 +1371,42 @@ fn assistant_response_item_to_chat_content(
         }
         AssistantResponseItem::Reasoning { .. } => None,
     }
+}
+
+fn workspace_relative_references(content: &str) -> String {
+    content
+        .replace("@{/workspace/", "@{")
+        .replace("@/workspace/", "@")
+}
+
+fn workspace_relative_exec_arguments(
+    name: &str,
+    arguments: &serde_json::Value,
+) -> serde_json::Value {
+    let mut arguments = arguments.clone();
+    if name != "exec" {
+        return arguments;
+    }
+    let Some(paths) = arguments
+        .get_mut("args")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return arguments;
+    };
+    for path in paths {
+        let Some(value) = path.as_str() else {
+            continue;
+        };
+        let relative = if value == "/workspace" {
+            Some(".")
+        } else {
+            value.strip_prefix("/workspace/")
+        };
+        if let Some(relative) = relative {
+            *path = serde_json::Value::String(relative.to_owned());
+        }
+    }
+    arguments
 }
 
 fn session_context_item_to_chat_message(
