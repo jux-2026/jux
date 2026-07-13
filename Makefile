@@ -1,4 +1,4 @@
-.PHONY: build test fmt lint quick-check check
+.PHONY: build test fmt lint quick-check check release-plan
 
 build:
 	cargo build --workspace
@@ -15,3 +15,7 @@ lint:
 quick-check: fmt lint
 
 check: quick-check test
+
+release-plan:
+	dist generate --check
+	dist plan

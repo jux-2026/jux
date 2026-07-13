@@ -59,6 +59,7 @@ make fmt
 make lint
 make quick-check
 make check
+make release-plan
 ```
 
 Equivalent direct commands:
@@ -73,6 +74,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 `make quick-check` is the default pre-commit quality gate. It runs format checks and lint checks.
 
 `make check` is the full quality gate for pre-push and merge readiness. It runs format checks, lint checks, and tests.
+
+`make release-plan` verifies that the cargo-dist GitHub Actions workflow is current and previews the release artifacts for the workspace version.
 
 The repository stores Git hooks in `.githooks`. Enable them in a checkout with:
 

@@ -9,7 +9,7 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/jux-project/jux"
+repository = "https://github.com/jux-2026/jux"
 rust-version = "1.91"
 
 [workspace.dependencies]
@@ -42,3 +42,8 @@ reqwest = { version = "0.12.28", default-features = false, features = ["blocking
 wasmer-types = "7.1.0"
 wasmer-package = "0.701.0"
 wasmer-wasix = "0.701.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

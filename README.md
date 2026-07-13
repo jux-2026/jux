@@ -21,6 +21,52 @@ jux
 └── README.md
 ```
 
+## Install
+
+Prebuilt binaries are published through GitHub Releases for macOS, Linux, and
+Windows.
+
+Install on macOS or Linux with the shell installer:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/jux-2026/jux/releases/latest/download/jux-installer.sh | sh
+```
+
+Install on Windows with PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/jux-2026/jux/releases/latest/download/jux-installer.ps1 | iex"
+```
+
+Release archives and SHA-256 checksums can also be downloaded directly from
+the [GitHub Releases](https://github.com/jux-2026/jux/releases) page.
+
+Verify the installation with:
+
+```sh
+jux --version
+```
+
+## Release Process
+
+Releases are built by the generated cargo-dist GitHub Actions workflow. A tag
+whose version matches the Cargo workspace version publishes the platform
+archives, checksums, and both installers:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Before pushing a release tag, run the full quality gate and inspect the release
+plan:
+
+```sh
+make check
+make release-plan
+```
+
 ## Commands
 
 ```sh
@@ -30,6 +76,7 @@ make fmt
 make lint
 make quick-check
 make check
+make release-plan
 ```
 
 The direct Cargo equivalents are:
@@ -69,14 +116,14 @@ Run a request through the minimal local agent loop:
 
 ```sh
 export JUX_DEEPSEEK_API_KEY="..."
-cargo run -p jux-cli -- run "Explain this project" --workspace /path/to/workspace
+cargo run -p jux -- run "Explain this project" --workspace /path/to/workspace
 ```
 
 Structured output is available from the top-level `--output` option:
 
 ```sh
-cargo run -p jux-cli -- --output json run "Explain this project"
-cargo run -p jux-cli -- --output yaml run "Explain this project"
+cargo run -p jux -- --output json run "Explain this project"
+cargo run -p jux -- --output yaml run "Explain this project"
 ```
 
 The command initializes `.jux/state.db`, creates the active Workspace and

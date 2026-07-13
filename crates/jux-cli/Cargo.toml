@@ -1,10 +1,19 @@
 [package]
-name = "jux-cli"
+name = "jux"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "A secure, auditable, and extensible AI coding agent"
+homepage = "https://github.com/jux-2026/jux"
+readme = "../../README.md"
+keywords = ["ai", "agent", "coding", "cli", "tui"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "jux_cli"
+path = "src/lib.rs"
 
 [[bin]]
 name = "jux"

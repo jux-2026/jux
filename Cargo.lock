@@ -2166,7 +2166,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jux-cli"
+name = "jux"
 version = "0.1.0"
 dependencies = [
  "anyhow",
