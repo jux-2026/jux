@@ -316,7 +316,7 @@ fn tui_file_reference_popup_clears_the_conversation_beneath_it() {
 }
 
 #[test]
-fn tui_file_reference_selection_stays_within_the_visible_matches() {
+fn tui_file_reference_selection_scrolls_through_all_matches() {
     let mut state = AppState::new("/workspace");
     update(
         &mut state,
@@ -336,13 +336,13 @@ fn tui_file_reference_selection_stays_within_the_visible_matches() {
     }
 
     let buffer = render_to_buffer(&state, 80, 24);
-    assert_buffer_contains(&buffer, "@src/file-00.rs");
-    assert_buffer_does_not_contain(&buffer, "@src/file-08.rs");
+    assert_buffer_contains(&buffer, "@src/file-08.rs");
+    assert_buffer_does_not_contain(&buffer, "@src/file-00.rs");
     update(
         &mut state,
         AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
-    assert_eq!(state.input_text(), "@src/file-00.rs ");
+    assert_eq!(state.input_text(), "@src/file-08.rs ");
 }
 
 #[test]

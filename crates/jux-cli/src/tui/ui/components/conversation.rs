@@ -606,13 +606,12 @@ fn render_file_reference_popup(
     input_bounds: Rect,
     input_top: u16,
 ) {
-    let suggestions = state.file_reference_suggestions();
-    if suggestions.is_empty() {
+    let suggestion_count = state.file_reference_suggestion_count();
+    if suggestion_count == 0 {
         return;
     }
     let available_height = input_top.saturating_sub(input_bounds.y);
-    let visible_count = suggestions
-        .len()
+    let visible_count = suggestion_count
         .min(MAX_FILE_REFERENCE_ROWS)
         .min(usize::from(available_height.saturating_sub(2)));
     let height = u16::try_from(visible_count)
@@ -623,30 +622,27 @@ fn render_file_reference_popup(
     }
     let selected = state
         .selected_file_reference()
-        .min(suggestions.len().saturating_sub(1));
+        .min(suggestion_count.saturating_sub(1));
     let window_start = selected
         .saturating_add(1)
         .saturating_sub(visible_count)
-        .min(suggestions.len().saturating_sub(visible_count));
+        .min(suggestion_count.saturating_sub(visible_count));
     let row_width = usize::from(input_bounds.width.saturating_sub(2));
-    let lines = suggestions
-        .iter()
-        .enumerate()
-        .skip(window_start)
-        .take(visible_count)
-        .map(|(index, path)| {
+    let lines = (window_start..window_start + visible_count)
+        .filter_map(|index| {
+            let path = state.file_reference_suggestion(index)?;
             let style = if index == selected {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
             } else {
                 Style::default().fg(Color::Gray)
             };
-            Line::styled(
+            Some(Line::styled(
                 format!("@{path}")
                     .chars()
                     .take(row_width)
                     .collect::<String>(),
                 style,
-            )
+            ))
         })
         .collect::<Vec<_>>();
     let area = Rect::new(

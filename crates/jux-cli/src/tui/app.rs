@@ -151,10 +151,27 @@ pub struct AppState {
     selected_slash_command: usize,
     selected_inline_skill: usize,
     indexed_files: Vec<String>,
+    file_index_revision: u64,
+    file_reference_cache: FileReferenceCache,
     selected_file_reference: usize,
     slash_commands_dismissed: bool,
     pending_escape_action: Option<PendingEscapeAction>,
     notification: Option<(String, Instant)>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct FileReferenceCache {
+    index_revision: u64,
+    query: Option<String>,
+    matches: FileReferenceMatches,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+enum FileReferenceMatches {
+    #[default]
+    Disabled,
+    AllFiles,
+    Filtered(Vec<usize>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -401,6 +418,8 @@ impl AppState {
             selected_slash_command: 0,
             selected_inline_skill: 0,
             indexed_files: Vec::new(),
+            file_index_revision: 0,
+            file_reference_cache: FileReferenceCache::default(),
             selected_file_reference: 0,
             slash_commands_dismissed: false,
             pending_escape_action: None,
@@ -838,31 +857,76 @@ impl AppState {
 
     pub(crate) fn set_file_index(&mut self, snapshot: FileIndexSnapshot) {
         self.indexed_files = snapshot.files;
+        self.file_index_revision = self.file_index_revision.wrapping_add(1);
         self.selected_file_reference = 0;
     }
 
     #[must_use]
-    pub(super) fn file_reference_suggestions(&self) -> Vec<&str> {
+    pub(super) fn file_reference_suggestion_count(&self) -> usize {
+        match &self.file_reference_cache.matches {
+            FileReferenceMatches::Disabled => 0,
+            FileReferenceMatches::AllFiles => self.indexed_files.len(),
+            FileReferenceMatches::Filtered(matches) => matches.len(),
+        }
+    }
+
+    #[must_use]
+    pub(super) fn file_reference_suggestion(&self, index: usize) -> Option<&str> {
+        let file_index = match &self.file_reference_cache.matches {
+            FileReferenceMatches::Disabled => return None,
+            // An empty `@` query uses the file index directly. Materializing
+            // every file into a second candidate list caused input latency in
+            // large workspaces.
+            FileReferenceMatches::AllFiles => index,
+            FileReferenceMatches::Filtered(matches) => *matches.get(index)?,
+        };
+        self.indexed_files.get(file_index).map(String::as_str)
+    }
+
+    fn current_file_reference_query(&self) -> Option<&str> {
         let token_start = self.input[..self.cursor]
             .rfind(char::is_whitespace)
             .map_or(0, |index| index + 1);
         let token = &self.input[token_start..self.cursor];
-        let Some(query) = token.strip_prefix('@') else {
-            return Vec::new();
-        };
+        let query = token.strip_prefix('@')?;
         if query.starts_with('{') {
-            return Vec::new();
+            return None;
         }
-        let query = query.to_lowercase();
-        self.indexed_files
-            .iter()
-            .filter(|path| fuzzy_path_match(path, &query))
-            // Keep the limit in the query itself. Collecting every match and
-            // truncating in the popup made each render allocate a workspace-
-            // sized candidate list, which noticeably delayed text input.
-            .take(8)
-            .map(String::as_str)
-            .collect()
+        Some(query)
+    }
+
+    fn refresh_file_reference_cache(&mut self) {
+        let query = self.current_file_reference_query().map(str::to_owned);
+        if self.file_reference_cache.index_revision == self.file_index_revision
+            && self.file_reference_cache.query == query
+        {
+            return;
+        }
+        let matches = match query.as_deref() {
+            None => FileReferenceMatches::Disabled,
+            Some("") => FileReferenceMatches::AllFiles,
+            Some(query) => {
+                let query = query.to_lowercase();
+                FileReferenceMatches::Filtered(
+                    self.indexed_files
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, path)| fuzzy_path_match(path, &query).then_some(index))
+                        .collect(),
+                )
+            }
+        };
+        self.file_reference_cache = FileReferenceCache {
+            index_revision: self.file_index_revision,
+            query,
+            matches,
+        };
+        let count = self.file_reference_suggestion_count();
+        self.selected_file_reference = if count == 0 {
+            0
+        } else {
+            self.selected_file_reference % count
+        };
     }
 
     #[must_use]
@@ -879,9 +943,8 @@ impl AppState {
 
     fn complete_file_reference(&mut self, finish_token: bool) {
         let Some(path) = self
-            .file_reference_suggestions()
-            .get(self.selected_file_reference)
-            .map(|path| (*path).to_owned())
+            .file_reference_suggestion(self.selected_file_reference)
+            .map(str::to_owned)
         else {
             return;
         };
@@ -1761,6 +1824,12 @@ pub enum AppCommand {
 }
 
 pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
+    let command = update_inner(state, action);
+    state.refresh_file_reference_cache();
+    command
+}
+
+fn update_inner(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
     if matches!(
         &action,
         AppAction::Key(key) if key.kind != KeyEventKind::Release && key.code != KeyCode::Esc
@@ -2068,7 +2137,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Tab, ..
-        }) if !state.file_reference_suggestions().is_empty() => {
+        }) if state.file_reference_suggestion_count() > 0 => {
             state.complete_file_reference(false);
             None
         }
@@ -2247,8 +2316,8 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         }
         AppAction::Key(KeyEvent {
             code: KeyCode::Up, ..
-        }) if !state.file_reference_suggestions().is_empty() => {
-            let count = state.file_reference_suggestions().len();
+        }) if state.file_reference_suggestion_count() > 0 => {
+            let count = state.file_reference_suggestion_count();
             state.selected_file_reference = (state.selected_file_reference % count)
                 .checked_sub(1)
                 .unwrap_or(count - 1);
@@ -2257,8 +2326,8 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         AppAction::Key(KeyEvent {
             code: KeyCode::Down,
             ..
-        }) if !state.file_reference_suggestions().is_empty() => {
-            let count = state.file_reference_suggestions().len();
+        }) if state.file_reference_suggestion_count() > 0 => {
+            let count = state.file_reference_suggestion_count();
             state.selected_file_reference = (state.selected_file_reference + 1) % count;
             None
         }
@@ -2330,7 +2399,7 @@ pub fn update(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         AppAction::Key(KeyEvent {
             code: KeyCode::Enter,
             ..
-        }) if !state.file_reference_suggestions().is_empty() => {
+        }) if state.file_reference_suggestion_count() > 0 => {
             state.complete_file_reference(true);
             None
         }
