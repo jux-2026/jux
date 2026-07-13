@@ -105,6 +105,37 @@ fn run_loop_cancellation_stops_and_persists_the_running_run() {
 }
 
 #[test]
+fn run_loop_persists_streamed_partial_output_when_canceled() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let (handle, token) = run_cancellation_pair();
+    let model = TestModel::canceling_stream(handle);
+    let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let context = RunLoopContext::new(store.clone(), model, policy).with_model_streaming(true);
+    let run_loop = RunLoop::with_context(context);
+
+    let error = futures::executor::block_on(
+        run_loop.run_cancellable("Stream then cancel".to_owned(), token),
+    )
+    .expect_err("streaming run is canceled");
+
+    assert!(matches!(error, RunLoopError::Canceled { .. }));
+    let session = store.load_active_session().expect("active session exists");
+    let run = store
+        .load_session_runs(&session.id)
+        .expect("session runs load")
+        .remove(0);
+    let steps = store.load_run_steps(&run.id).expect("run steps load");
+    assert_eq!(run.status, RunStatus::Canceled);
+    assert!(steps.iter().any(|step| {
+        step.kind == StepKind::AssistantOutputCheckpoint
+            && step.payload
+                == StepPayload::AssistantOutputCheckpoint {
+                    content: "partial".to_owned(),
+                }
+    }));
+}
+
+#[test]
 fn run_loop_sends_user_and_project_instruction_documents_to_llm() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
     let model = TestModel::fixed_text("Instruction-aware answer");
@@ -521,9 +552,12 @@ fn run_loop_executes_exec_tool_call_and_returns_structured_output() {
     let policy = RuntimePolicy::workspace_default(execution_root);
     let context = RunLoopContext::new(store.clone(), model.clone(), policy);
     let run_loop = RunLoop::with_context(context);
+    let mut events = VecAgentEventSink::default();
 
-    let output = futures::executor::block_on(run_loop.run("Use the exec tool".to_owned()))
-        .expect("run loop succeeds");
+    let output = futures::executor::block_on(
+        run_loop.run_with_events("Use the exec tool".to_owned(), &mut events),
+    )
+    .expect("run loop succeeds");
     let requests = model.recorded_requests();
     let exec_output = output.steps[2]
         .payload
@@ -540,6 +574,14 @@ fn run_loop_executes_exec_tool_call_and_returns_structured_output() {
     assert!(requests[0].contains("success"));
     assert!(requests[0].contains("exit_code"));
     assert!(requests[1].contains("hello"));
+    assert!(events.events.iter().any(|event| matches!(
+        &event.data,
+        jux_core::AgentEventData::ToolOutputChunk {
+            stream: jux_core::ToolOutputStream::Stdout,
+            content,
+            ..
+        } if content == "hello"
+    )));
 }
 
 #[test]
@@ -1105,6 +1147,7 @@ struct TestModel {
     responses: Arc<Mutex<TestResponses>>,
     recorded_requests: Arc<Mutex<Vec<String>>>,
     cancel_on_completion: Option<RunCancellationHandle>,
+    cancel_on_stream: Option<RunCancellationHandle>,
 }
 
 type TestResponses = Vec<Result<Vec<AssistantContent>, String>>;
@@ -1129,6 +1172,7 @@ impl TestModel {
             responses: Arc::new(Mutex::new(responses.into_iter().collect())),
             recorded_requests: Arc::new(Mutex::new(Vec::new())),
             cancel_on_completion: None,
+            cancel_on_stream: None,
         }
     }
 
@@ -1137,6 +1181,7 @@ impl TestModel {
             responses: Arc::new(Mutex::new(vec![Err(message.into())])),
             recorded_requests: Arc::new(Mutex::new(Vec::new())),
             cancel_on_completion: None,
+            cancel_on_stream: None,
         }
     }
 
@@ -1145,6 +1190,16 @@ impl TestModel {
             responses: Arc::new(Mutex::new(Vec::new())),
             recorded_requests: Arc::new(Mutex::new(Vec::new())),
             cancel_on_completion: Some(handle),
+            cancel_on_stream: None,
+        }
+    }
+
+    fn canceling_stream(handle: RunCancellationHandle) -> Self {
+        Self {
+            responses: Arc::new(Mutex::new(Vec::new())),
+            recorded_requests: Arc::new(Mutex::new(Vec::new())),
+            cancel_on_completion: None,
+            cancel_on_stream: Some(handle),
         }
     }
 
@@ -1215,6 +1270,22 @@ impl CompletionModel for TestModel {
             .lock()
             .expect("recorded requests lock is available")
             .push(request_json);
+        if let Some(handle) = &self.cancel_on_stream {
+            let handle = handle.clone();
+            let chunks = futures::stream::unfold(0_u8, move |state| {
+                let handle = handle.clone();
+                async move {
+                    match state {
+                        0 => Some((Ok(RawStreamingChoice::Message("partial".to_owned())), 1)),
+                        _ => {
+                            handle.cancel();
+                            futures::future::pending().await
+                        }
+                    }
+                }
+            });
+            return Ok(StreamingCompletionResponse::stream(Box::pin(chunks)));
+        }
         let response = self
             .responses
             .lock()

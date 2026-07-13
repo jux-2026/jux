@@ -816,6 +816,7 @@ fn encode_step_kind(kind: &StepKind) -> &'static str {
     match kind {
         StepKind::UserMessage => "user_message",
         StepKind::AssistantResponse => "assistant_response",
+        StepKind::AssistantOutputCheckpoint => "assistant_output_checkpoint",
         StepKind::ToolResult => "tool_result",
         StepKind::SkillExecution => "skill_execution",
         StepKind::Error => "error",
@@ -826,6 +827,7 @@ fn decode_step_kind(kind: String) -> Result<StepKind, StoreError> {
     match kind.as_str() {
         "user_message" => Ok(StepKind::UserMessage),
         "assistant_response" => Ok(StepKind::AssistantResponse),
+        "assistant_output_checkpoint" => Ok(StepKind::AssistantOutputCheckpoint),
         "tool_result" => Ok(StepKind::ToolResult),
         "skill_execution" => Ok(StepKind::SkillExecution),
         "error" => Ok(StepKind::Error),

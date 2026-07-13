@@ -93,6 +93,12 @@ pub enum AgentEventKind {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ToolOutputStream {
+    Stdout,
+    Stderr,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 /// Strongly typed event payload.
 pub enum AgentEventData {
@@ -141,6 +147,11 @@ pub enum AgentEventData {
     ToolOutput {
         name: String,
         content: serde_json::Value,
+    },
+    ToolOutputChunk {
+        name: String,
+        stream: ToolOutputStream,
+        content: String,
     },
     ToolCompleted {
         name: String,

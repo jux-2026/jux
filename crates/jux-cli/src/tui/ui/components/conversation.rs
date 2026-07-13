@@ -109,6 +109,7 @@ fn prompt_panel(
     );
     for (message_index, message) in state.messages().iter().enumerate() {
         let selected = state.selected_message() == Some(message_index);
+        let response_metadata = response_metadata_for_message(state, message);
         match message.role {
             MessageRole::User => {
                 let background = Style::default().bg(colors.input);
@@ -121,6 +122,9 @@ fn prompt_panel(
             }
             MessageRole::Assistant | MessageRole::Error => {
                 append_spacing(&mut lines);
+                if message.role == MessageRole::Error {
+                    lines.push(Line::styled("Error", Style::default().fg(Color::Red)));
+                }
                 let markdown_width = content_width.saturating_sub(6);
                 lines.extend(
                     MarkdownRenderer::new(markdown_width)
@@ -128,13 +132,6 @@ fn prompt_panel(
                         .into_iter()
                         .map(pad_assistant_line),
                 );
-                if let Some(metadata) = response_metadata_for_message(state, message) {
-                    append_spacing(&mut lines);
-                    lines.push(Line::styled(
-                        format!("\u{00a0}\u{00a0}\u{00a0}{metadata}"),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
                 append_spacing(&mut lines);
             }
         }
@@ -146,6 +143,14 @@ fn prompt_panel(
             &mut command_toggle_rows,
             &mut rendered_rows,
         );
+        if let Some(metadata) = response_metadata {
+            append_spacing(&mut lines);
+            lines.push(Line::styled(
+                format!("\u{00a0}\u{00a0}\u{00a0}{metadata}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            append_spacing(&mut lines);
+        }
     }
     if state.run_status() == TuiRunStatus::Running {
         append_spacing(&mut lines);
@@ -360,7 +365,12 @@ fn response_metadata_for_message(
         .runs()
         .iter()
         .find(|run| run.id == step.id.run_id())
-        .map(|run| run.updated_at.saturating_sub(run.created_at));
+        .map(|run| run.updated_at.saturating_sub(run.created_at))
+        .or_else(|| {
+            (state.run_id() == Some(step.id.run_id().to_string().as_str()))
+                .then(|| state.run_elapsed_millis())
+                .flatten()
+        });
     let usage = match &step.payload {
         StepPayload::AssistantResponse { usage, .. } => Some(usage),
         _ => None,

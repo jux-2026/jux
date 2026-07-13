@@ -6,7 +6,7 @@ use jux_core::{
     CodeChangeError, CodeChangeProposal, CodeChangeReview, CopyMessageShortcut, HumanInputRequest,
     PROPOSE_CODE_CHANGE_TOOL_NAME, QuitShortcut, ReviewStatus, Run, RunStatus, Session, SessionId,
     SkillCatalog, SkillDefinition, SkillOverride, SqliteWorkspaceStore, Step, StepPayload,
-    StoreError, TuiShortcutConfig, TuiTheme, latest_human_input_request,
+    StoreError, ToolOutputStream, TuiShortcutConfig, TuiTheme, latest_human_input_request,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -102,6 +102,7 @@ pub struct AppState {
     undo_input: Option<(String, usize)>,
     messages: Vec<Message>,
     streaming_assistant_message: Option<usize>,
+    last_agent_event_sequence: u64,
     selected_message: Option<usize>,
     conversation_search: Option<String>,
     conversation_scroll_from_bottom: u16,
@@ -370,6 +371,7 @@ impl AppState {
             undo_input: None,
             messages: Vec::new(),
             streaming_assistant_message: None,
+            last_agent_event_sequence: 0,
             selected_message: None,
             conversation_search: None,
             conversation_scroll_from_bottom: 0,
@@ -542,6 +544,8 @@ impl AppState {
     fn begin_token_estimate(&mut self, request: &str) {
         self.estimated_input_tokens = estimate_tokens(request);
         self.estimated_output_tokens = 0;
+        self.last_agent_event_sequence = 0;
+        self.streaming_assistant_message = None;
     }
 
     #[must_use]
@@ -1485,6 +1489,12 @@ fn messages_from_steps(steps: &[Step]) -> Vec<Message> {
                     });
                 }
             }
+            StepPayload::AssistantOutputCheckpoint { content } if !content.is_empty() => {
+                messages.push(Message {
+                    role: MessageRole::Assistant,
+                    content: content.clone(),
+                });
+            }
             StepPayload::Error { message } => messages.push(Message {
                 role: MessageRole::Error,
                 content: message.clone(),
@@ -1609,6 +1619,11 @@ fn command_timeline_from_steps(steps: &[Step]) -> Vec<TimelineItem> {
                         expanded: false,
                         command: Some(command),
                     });
+                }
+            }
+            StepPayload::AssistantOutputCheckpoint { content } => {
+                if !content.is_empty() {
+                    message_count += 1;
                 }
             }
             StepPayload::ToolResult { id, content, .. } => {
@@ -1857,6 +1872,13 @@ fn update_inner(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
             None
         }
         AppAction::AgentEvent(event) => {
+            if event.sequence > 0 && matches!(&event.data, AgentEventData::RunStarted { .. }) {
+                state.last_agent_event_sequence = 0;
+            }
+            if event.sequence > 0 && event.sequence <= state.last_agent_event_sequence {
+                return None;
+            }
+            state.last_agent_event_sequence = state.last_agent_event_sequence.max(event.sequence);
             state.runtime_logs.push(TuiRuntimeLog {
                 title: format!("Agent event: {:?}", event.kind),
                 detail: Some(event.id.to_string()),
@@ -2923,6 +2945,7 @@ fn execute_selected_slash_command(state: &mut AppState) -> SlashCommandExecution
                     .map(|message| message.content.clone())
             })
             .map_or(SlashCommandExecution::Executed(None), |request| {
+                state.begin_token_estimate(&request);
                 state.run_status = TuiRunStatus::Running;
                 state.messages.push(Message {
                     role: MessageRole::User,
@@ -2943,6 +2966,7 @@ fn execute_selected_slash_command(state: &mut AppState) -> SlashCommandExecution
                     .map(|message| message.content.clone())
             })
             .map_or(SlashCommandExecution::Executed(None), |request| {
+                state.begin_token_estimate(&request);
                 state.run_status = TuiRunStatus::Running;
                 state.messages.push(Message {
                     role: MessageRole::User,
@@ -3465,9 +3489,9 @@ fn truncate_timeline_detail_text(content: &str) -> String {
 
 fn timeline_item_from_agent_event(event: AgentEvent) -> Option<TimelineItem> {
     let (label, detail, arguments, output, command) = match event.data {
-        AgentEventData::LlmStarted
-        | AgentEventData::LlmCompleted
-        | AgentEventData::LlmFailed { .. } => return None,
+        AgentEventData::LlmStarted => ("LLM".to_owned(), None, None, None, None),
+        AgentEventData::LlmCompleted => return None,
+        AgentEventData::LlmFailed { error } => ("LLM".to_owned(), Some(error), None, None, None),
         AgentEventData::SkillsSelected { skills } => (
             "Active skills".to_owned(),
             None,
@@ -3500,6 +3524,14 @@ fn timeline_item_from_agent_event(event: AgentEvent) -> Option<TimelineItem> {
                 .then(|| command_from_output(&content))
                 .flatten();
             (tool_or_skill_label(&name), None, None, output, command)
+        }
+        AgentEventData::ToolOutputChunk {
+            name,
+            stream,
+            content,
+        } => {
+            let command = (name == "exec").then(|| command_from_output_chunk(stream, content));
+            (tool_or_skill_label(&name), None, None, None, command)
         }
         AgentEventData::ToolFailed { name, error, .. } => {
             (tool_or_skill_label(&name), Some(error), None, None, None)
@@ -3549,6 +3581,21 @@ fn command_from_output(value: &serde_json::Value) -> Option<TuiCommandExecution>
     })
 }
 
+fn command_from_output_chunk(stream: ToolOutputStream, content: String) -> TuiCommandExecution {
+    let (stdout, stderr) = match stream {
+        ToolOutputStream::Stdout => (content, String::new()),
+        ToolOutputStream::Stderr => (String::new(), content),
+    };
+    TuiCommandExecution {
+        program: String::new(),
+        args: Vec::new(),
+        success: None,
+        exit_code: None,
+        stdout,
+        stderr,
+    }
+}
+
 fn merge_command_execution(
     existing: Option<TuiCommandExecution>,
     incoming: Option<TuiCommandExecution>,
@@ -3564,6 +3611,9 @@ fn merge_command_execution(
                 existing.exit_code = incoming.exit_code;
                 existing.stdout = incoming.stdout;
                 existing.stderr = incoming.stderr;
+            } else {
+                existing.stdout.push_str(&incoming.stdout);
+                existing.stderr.push_str(&incoming.stderr);
             }
             Some(existing)
         }

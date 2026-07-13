@@ -29,7 +29,7 @@ pub use instructions::{
 pub use main_loop::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AgentEventSink, NoopAgentEventSink,
     RunCancellationHandle, RunCancellationToken, RunLoop, RunLoopContext, RunLoopError,
-    RunLoopOutput, SYSTEM_PROMPT, run_cancellation_pair,
+    RunLoopOutput, SYSTEM_PROMPT, ToolOutputStream, run_cancellation_pair,
 };
 pub use policy::{
     MatchPattern, MatchPatternKind, NativeCommandPolicy, NativeCommandRule, RuntimePolicy,

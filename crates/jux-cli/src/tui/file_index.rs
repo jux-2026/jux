@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -22,14 +22,21 @@ pub struct FileIndexSnapshot {
 
 pub struct FileIndexService {
     receiver: Receiver<FileIndexSnapshot>,
+    shutdown: mpsc::Sender<()>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl FileIndexService {
     #[must_use]
     pub fn start(root: PathBuf) -> Self {
         let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || run_index_thread(root, sender));
-        Self { receiver }
+        let (shutdown, shutdown_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || run_index_thread(root, sender, shutdown_receiver));
+        Self {
+            receiver,
+            shutdown,
+            worker: Some(worker),
+        }
     }
 
     pub fn try_recv_latest(&self) -> Option<FileIndexSnapshot> {
@@ -45,35 +52,65 @@ impl FileIndexService {
     }
 }
 
-fn run_index_thread(root: PathBuf, sender: mpsc::Sender<FileIndexSnapshot>) {
+impl Drop for FileIndexService {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_index_thread(
+    root: PathBuf,
+    sender: mpsc::Sender<FileIndexSnapshot>,
+    shutdown: Receiver<()>,
+) {
+    let mut current = build_file_index(&root);
+    if sender.send(current.clone()).is_err() {
+        return;
+    }
     let (watch_sender, watch_receiver) = mpsc::channel::<notify::Result<Event>>();
     let Ok(mut watcher) = notify::recommended_watcher(move |event| {
         let _ = watch_sender.send(event);
     }) else {
-        let _ = sender.send(build_file_index(&root));
         return;
     };
     let _ = watcher.watch(&root, RecursiveMode::Recursive);
     if let Some(git_dir) = git_directory(&root) {
         let _ = watcher.watch(&git_dir, RecursiveMode::NonRecursive);
     }
-    if sender.send(build_file_index(&root)).is_err() {
-        return;
+    let reconciled = build_file_index(&root);
+    if reconciled != current {
+        current = reconciled;
+        if sender.send(current.clone()).is_err() {
+            return;
+        }
     }
     loop {
-        match watch_receiver.recv_timeout(Duration::from_secs(1)) {
+        if shutdown.try_recv().is_ok() {
+            return;
+        }
+        match watch_receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(_) => {
                 let deadline = Instant::now() + REFRESH_DEBOUNCE;
                 while Instant::now() < deadline {
+                    if shutdown.try_recv().is_ok() {
+                        return;
+                    }
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    match watch_receiver.recv_timeout(remaining) {
+                    match watch_receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
                         Ok(_) => {}
-                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                if sender.send(build_file_index(&root)).is_err() {
-                    return;
+                let refreshed = build_file_index(&root);
+                if refreshed != current {
+                    current = refreshed;
+                    if sender.send(current.clone()).is_err() {
+                        return;
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}

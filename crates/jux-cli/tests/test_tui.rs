@@ -730,6 +730,93 @@ fn tui_appends_streamed_assistant_text_deltas() {
 }
 
 #[test]
+fn tui_restores_canceled_partial_assistant_output() {
+    let mut state = AppState::new("/workspace");
+    let run_id = RunId::from("workspace-0001-000001".to_owned());
+    let checkpoint = Step::new(
+        StepId::new(&run_id, 1),
+        StepKind::AssistantOutputCheckpoint,
+        StepPayload::AssistantOutputCheckpoint {
+            content: "partial response".to_owned(),
+        },
+    );
+
+    update(
+        &mut state,
+        AppAction::RunFinished {
+            response: RunResponse {
+                session_id: "workspace-0001".to_owned(),
+                run_id: run_id.to_string(),
+                status: CoreRunStatus::Canceled,
+                created_at: 1_000,
+                updated_at: 1_100,
+                answer: None,
+                steps: vec![checkpoint],
+            },
+        },
+    );
+
+    assert_eq!(state.messages()[0].content, "partial response");
+}
+
+#[test]
+fn tui_ignores_duplicate_sequenced_text_deltas() {
+    let mut state = AppState::new("/workspace");
+    let mut event = AgentEvent::new(
+        AgentEventId::llm(1, 1),
+        AgentEventKind::Output,
+        AgentEventData::AssistantTextDelta {
+            content: "once".to_owned(),
+        },
+    );
+    event.sequence = 2;
+
+    update(&mut state, AppAction::AgentEvent(event.clone()));
+    update(&mut state, AppAction::AgentEvent(event));
+
+    assert_eq!(state.messages()[0].content, "once");
+}
+
+#[test]
+fn tui_resets_event_sequence_for_a_new_background_run() {
+    let mut state = AppState::new("/workspace");
+    let mut first = AgentEvent::new(
+        AgentEventId::llm(1, 1),
+        AgentEventKind::Output,
+        AgentEventData::AssistantTextDelta {
+            content: "first".to_owned(),
+        },
+    );
+    first.sequence = 4;
+    update(&mut state, AppAction::AgentEvent(first));
+
+    type_text(&mut state, "next run");
+    assert!(matches!(
+        update(
+            &mut state,
+            AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ),
+        Some(AppCommand::StartRun { .. })
+    ));
+    let mut second = AgentEvent::new(
+        AgentEventId::llm(1, 1),
+        AgentEventKind::Output,
+        AgentEventData::AssistantTextDelta {
+            content: "second".to_owned(),
+        },
+    );
+    second.sequence = 1;
+    update(&mut state, AppAction::AgentEvent(second));
+
+    assert!(
+        state
+            .messages()
+            .iter()
+            .any(|message| message.content == "second")
+    );
+}
+
+#[test]
 fn tui_keeps_persisted_commands_visible_when_a_run_finishes() {
     let mut state = AppState::new("/workspace");
     type_text(&mut state, "Inspect the workspace");
@@ -1203,6 +1290,46 @@ fn tui_updates_tool_lifecycle_and_keeps_its_output() {
     assert_buffer_does_not_contain(&buffer, "╮");
     assert_buffer_fragment_has_fg_bg(&buffer, "cargo", Color::Yellow, Color::Rgb(20, 28, 36));
     assert_buffer_fragment_has_fg_bg(&buffer, "▶", Color::Green, Color::Rgb(20, 28, 36));
+}
+
+#[test]
+fn tui_appends_tool_output_chunks_before_completion() {
+    let mut state = AppState::new("/workspace");
+    let event_id = AgentEventId::tool(1, "exec", 1);
+    update(
+        &mut state,
+        AppAction::AgentEvent(AgentEvent::new(
+            event_id.clone(),
+            AgentEventKind::Started,
+            AgentEventData::ToolStarted {
+                name: "exec".to_owned(),
+                call_id: Some("call-1".to_owned()),
+                arguments: serde_json::json!({ "program": "cargo", "args": ["test"] }),
+            },
+        )),
+    );
+    for content in ["first\n", "second\n"] {
+        update(
+            &mut state,
+            AppAction::AgentEvent(AgentEvent::new(
+                event_id.clone(),
+                AgentEventKind::Output,
+                AgentEventData::ToolOutputChunk {
+                    name: "exec".to_owned(),
+                    stream: jux_core::ToolOutputStream::Stdout,
+                    content: content.to_owned(),
+                },
+            )),
+        );
+    }
+
+    assert_eq!(
+        state.timeline()[0]
+            .command
+            .as_ref()
+            .map(|command| command.stdout.as_str()),
+        Some("first\nsecond\n")
+    );
 }
 
 #[test]

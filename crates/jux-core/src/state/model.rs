@@ -210,6 +210,7 @@ impl Step {
 pub enum StepKind {
     UserMessage,
     AssistantResponse,
+    AssistantOutputCheckpoint,
     ToolResult,
     SkillExecution,
     Error,
@@ -225,6 +226,9 @@ pub enum StepPayload {
         message_id: Option<String>,
         usage: LlmUsage,
         items: Vec<AssistantResponseItem>,
+    },
+    AssistantOutputCheckpoint {
+        content: String,
     },
     ToolResult {
         id: String,

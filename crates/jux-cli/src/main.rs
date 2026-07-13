@@ -947,6 +947,11 @@ fn event_message(data: &AgentEventData) -> String {
         AgentEventData::OutputCompleted => "output".to_owned(),
         AgentEventData::ToolStarted { name, call_id, .. } => tool_message(name, call_id),
         AgentEventData::ToolOutput { name, content } => format!("tool={name:?} content={content}"),
+        AgentEventData::ToolOutputChunk {
+            name,
+            stream,
+            content,
+        } => format!("tool={name:?} stream={stream:?} content={content:?}"),
         AgentEventData::ToolCompleted { name, call_id } => tool_message(name, call_id),
         AgentEventData::ToolFailed {
             name,

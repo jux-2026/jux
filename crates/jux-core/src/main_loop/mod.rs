@@ -17,7 +17,7 @@ pub use self::cancellation::{RunCancellationHandle, RunCancellationToken, run_ca
 pub use self::context::RunLoopContext;
 pub use self::event::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AgentEventSink, NoopAgentEventSink,
-    SequencedAgentEventSink,
+    SequencedAgentEventSink, ToolOutputStream,
 };
 
 use crate::state::{
@@ -95,8 +95,9 @@ where
         events: &mut impl AgentEventSink,
         cancellation: RunCancellationToken,
     ) -> Result<RunLoopOutput, RunLoopError> {
+        let mut checkpointing_events = PartialOutputEventSink::new(events);
         match Abortable::new(
-            self.run_with_events(request, events),
+            self.run_with_events(request, &mut checkpointing_events),
             cancellation.registration,
         )
         .await
@@ -104,6 +105,17 @@ where
             Ok(result) => result,
             Err(_) => {
                 let run = self.cancel_latest_running_run()?;
+                if let Some(run) = &run
+                    && !checkpointing_events.partial_output.is_empty()
+                {
+                    self.context.store.append_step(
+                        &run.id,
+                        StepKind::AssistantOutputCheckpoint,
+                        StepPayload::AssistantOutputCheckpoint {
+                            content: checkpointing_events.partial_output.clone(),
+                        },
+                    )?;
+                }
                 Err(RunLoopError::Canceled {
                     run: run.map(Box::new),
                 })
@@ -820,6 +832,7 @@ where
         events: &mut impl AgentEventSink,
         output: serde_json::Value,
     ) -> serde_json::Value {
+        self.emit_tool_output_chunks(tool_call, &tool_id, events, &output);
         events.emit(AgentEvent::new(
             tool_id.clone(),
             AgentEventKind::Output,
@@ -837,6 +850,37 @@ where
             },
         ));
         output
+    }
+
+    fn emit_tool_output_chunks(
+        &self,
+        tool_call: &ToolCallRequest,
+        tool_id: &AgentEventId,
+        events: &mut impl AgentEventSink,
+        output: &serde_json::Value,
+    ) {
+        if tool_call.name != "exec" {
+            return;
+        }
+        for (field, stream) in [
+            ("stdout", ToolOutputStream::Stdout),
+            ("stderr", ToolOutputStream::Stderr),
+        ] {
+            let Some(content) = output.get(field).and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            for chunk in content.as_bytes().chunks(4096) {
+                events.emit(AgentEvent::new(
+                    tool_id.clone(),
+                    AgentEventKind::Output,
+                    AgentEventData::ToolOutputChunk {
+                        name: tool_call.name.clone(),
+                        stream,
+                        content: String::from_utf8_lossy(chunk).into_owned(),
+                    },
+                ));
+            }
+        }
     }
 
     fn record_tool_failure(
@@ -1078,6 +1122,32 @@ where
             AgentEventKind::Failed,
             AgentEventData::RunFailed { error },
         ));
+    }
+}
+
+struct PartialOutputEventSink<'a, S> {
+    inner: &'a mut S,
+    partial_output: String,
+}
+
+impl<'a, S> PartialOutputEventSink<'a, S> {
+    fn new(inner: &'a mut S) -> Self {
+        Self {
+            inner,
+            partial_output: String::new(),
+        }
+    }
+}
+
+impl<S> AgentEventSink for PartialOutputEventSink<'_, S>
+where
+    S: AgentEventSink,
+{
+    fn emit(&mut self, event: AgentEvent) {
+        if let AgentEventData::AssistantTextDelta { content } = &event.data {
+            self.partial_output.push_str(content);
+        }
+        self.inner.emit(event);
     }
 }
 
@@ -1418,6 +1488,7 @@ fn step_to_chat_message(step: &Step) -> Option<Message> {
             })),
         }),
         StepPayload::SkillsRequested { .. }
+        | StepPayload::AssistantOutputCheckpoint { .. }
         | StepPayload::SkillStarted { .. }
         | StepPayload::SkillAssistantResponse { .. }
         | StepPayload::SkillToolResult { .. }
