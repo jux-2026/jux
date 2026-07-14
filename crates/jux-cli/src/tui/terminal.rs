@@ -17,15 +17,22 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use jux_core::{SkillCatalog, SqliteWorkspaceStore, StoreError};
+use jux_core::{
+    DistributionMetadata, SkillCatalog, SqliteWorkspaceStore, StoreError, UpdateCache,
+    UpdateChecker, UpdateNotice, UpdateRecommendation, embedded_distribution_metadata,
+    update_cache_path,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use semver::Version;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[allow(dead_code)]
@@ -79,8 +86,39 @@ pub fn run_tui(
         Ok(()) | Err(StoreError::MissingWorkspace) => {}
         Err(error) => return Err(error.into()),
     }
+    let distribution = embedded_distribution_metadata().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to read embedded distribution metadata");
+        DistributionMetadata::unbranded()
+    });
+    let update_checker = UpdateChecker::new(update_cache_path());
+    let running_version = Version::parse(jux_core::version()).ok();
+    if let Ok(Some(cache)) = update_checker.load_cache()
+        && running_version.as_ref() == Some(&cache.current_version)
+        && cache.update_available()
+    {
+        let show_startup_message = cache.needs_startup_notification();
+        update(
+            &mut state,
+            AppAction::UpdateAvailable {
+                notice: update_notice(&cache, &distribution),
+                show_startup_message,
+            },
+        );
+        if show_startup_message
+            && let Err(error) = update_checker.mark_startup_notified(&cache.latest_version)
+        {
+            tracing::warn!(%error, "failed to persist update notification state");
+        }
+    }
+    let update_receiver = start_update_checks(distribution);
     let (mut terminal, keyboard_enhancement_enabled) = setup_terminal()?;
-    let run_result = run_app_loop(&mut terminal, &mut state, &store, Arc::new(run_handler));
+    let run_result = run_app_loop(
+        &mut terminal,
+        &mut state,
+        &store,
+        Arc::new(run_handler),
+        update_receiver,
+    );
     restore_terminal(&mut terminal, keyboard_enhancement_enabled)?;
     run_result
 }
@@ -118,6 +156,7 @@ fn run_app_loop(
     state: &mut AppState,
     store: &SqliteWorkspaceStore,
     run_handler: Arc<dyn RunHandler>,
+    update_receiver: Receiver<UpdateNotice>,
 ) -> Result<()> {
     let mut active_run: Option<BackgroundRun> = None;
     let file_index = FileIndexService::start(state.workspace_root.clone());
@@ -129,6 +168,16 @@ fn run_app_loop(
     let mut conversation_layout_dirty = true;
     let mut previous_terminal_size = None;
     while !state.should_quit {
+        if let Ok(notice) = update_receiver.try_recv() {
+            update(
+                state,
+                AppAction::UpdateAvailable {
+                    notice,
+                    show_startup_message: false,
+                },
+            );
+            next_frame = Instant::now();
+        }
         if let Some(snapshot) = file_index.try_recv_latest() {
             update(state, AppAction::FileIndexUpdated(snapshot));
             next_frame = Instant::now();
@@ -272,6 +321,42 @@ fn run_app_loop(
         }
     }
     Ok(())
+}
+
+fn start_update_checks(distribution: DistributionMetadata) -> Receiver<UpdateNotice> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let current_version = match Version::parse(jux_core::version()) {
+            Ok(version) => version,
+            Err(error) => {
+                tracing::warn!(%error, "failed to parse current Jux version");
+                return;
+            }
+        };
+        let checker = UpdateChecker::new(update_cache_path());
+        loop {
+            match checker.check_if_due(&current_version) {
+                Ok(Some(cache)) if cache.update_available() => {
+                    if sender.send(update_notice(&cache, &distribution)).is_err() {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "background update check failed"),
+            }
+            thread::sleep(Duration::from_secs(60 * 60));
+        }
+    });
+    receiver
+}
+
+fn update_notice(cache: &UpdateCache, distribution: &DistributionMetadata) -> UpdateNotice {
+    UpdateNotice {
+        current_version: cache.current_version.clone(),
+        latest_version: cache.latest_version.clone(),
+        release_url: cache.release_url.clone(),
+        recommendation: UpdateRecommendation::for_distribution(distribution),
+    }
 }
 
 fn action_changes_conversation_layout(state: &AppState, action: &AppAction) -> bool {

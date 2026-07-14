@@ -17,6 +17,7 @@ regex.workspace = true
 rig-core.workspace = true
 rusqlite.workspace = true
 reqwest.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -30,3 +31,5 @@ wasmer-types.workspace = true
 wasmer-wasix.workspace = true
 
 [dev-dependencies]
+assert_fs.workspace = true
+semver.workspace = true

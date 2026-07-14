@@ -2,13 +2,16 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use jux_cli::tui::{AgentEventSender, RunResponse, TuiRuntimeInfo, TuiSandboxSummary, run_tui};
 use jux_core::{
-    AgentEvent, AgentEventData, AgentEventKind, AgentEventSink, InstructionDocument,
-    InstructionResolver, JuxConfig, JuxConfigLoader, Run, RunCancellationToken, RunLoop,
-    RunLoopOutput, RunStatus, RuntimePolicy, Session, SessionContextItem, SessionContextPayload,
-    SessionId, SkillCatalog, SkillDefinition, SkillResolver, SqliteWorkspaceStore, Step, StepKind,
-    StepPayload, Workspace, select_explicit_skills,
+    AgentEvent, AgentEventData, AgentEventKind, AgentEventSink, DistributionChannel,
+    DistributionMetadata, InstallerKind, InstructionDocument, InstructionResolver, JuxConfig,
+    JuxConfigLoader, Run, RunCancellationToken, RunLoop, RunLoopOutput, RunStatus, RuntimePolicy,
+    Session, SessionContextItem, SessionContextPayload, SessionId, SkillCatalog, SkillDefinition,
+    SkillResolver, SqliteWorkspaceStore, Step, StepKind, StepPayload, UpdateChecker,
+    UpdateRecommendation, Workspace, embedded_distribution_metadata, inject_distribution_metadata,
+    select_explicit_skills, update_cache_path,
 };
 use rig::{client::CompletionClient, completion::CompletionModel, providers::deepseek};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
@@ -40,6 +43,64 @@ enum Command {
     Skills(SkillsCommand),
     #[command(about = "Inspect local session state.")]
     Session(SessionCommand),
+    #[command(about = "Inspect or inject executable distribution metadata.")]
+    Distribution(DistributionCommand),
+    #[command(about = "Check for a new Jux version and show the channel-specific upgrade method.")]
+    Update(UpdateArgs),
+}
+
+#[derive(Debug, Parser)]
+struct UpdateArgs {
+    #[arg(long, help = "Check for updates without modifying the system.")]
+    check: bool,
+}
+
+#[derive(Debug, Parser)]
+struct DistributionCommand {
+    #[command(subcommand)]
+    command: DistributionSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DistributionSubcommand {
+    #[command(about = "Show metadata embedded in the current executable.")]
+    Show,
+    #[command(about = "Copy an executable and inject its 1 KiB distribution metadata slot.")]
+    Inject(DistributionInjectArgs),
+}
+
+#[derive(Debug, Parser)]
+struct DistributionInjectArgs {
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long = "output-path")]
+    output_path: PathBuf,
+    #[arg(long, value_enum)]
+    channel: DistributionChannelArg,
+    #[arg(long, value_enum)]
+    installer: InstallerKindArg,
+    #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
+    version: String,
+    #[arg(long, env = "GITHUB_SHA", default_value = "")]
+    source_commit: String,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DistributionChannelArg {
+    GithubRelease,
+    Homebrew,
+    Winget,
+    Npm,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum InstallerKindArg {
+    Bash,
+    PowerShell,
+    Homebrew,
+    Winget,
+    Npm,
+    Manual,
 }
 
 #[derive(Debug, Parser)]
@@ -155,6 +216,14 @@ fn main() -> Result<()> {
                 handle_session_show(args, cli.output)
             }
         },
+        Some(Command::Distribution(command)) => {
+            init_tracing();
+            handle_distribution(command, cli.output)
+        }
+        Some(Command::Update(args)) => {
+            init_tracing();
+            handle_update(args, cli.output)
+        }
         None => {
             let workspace = env::current_dir().context("failed to determine current workspace")?;
             let skill_catalog = load_skill_catalog(&workspace)?;
@@ -189,6 +258,98 @@ fn main() -> Result<()> {
                     Ok(RunResponse::from(output))
                 },
             )
+        }
+    }
+}
+
+fn handle_update(args: UpdateArgs, output: OutputFormat) -> Result<()> {
+    let _check_only = args.check;
+    let current_version = Version::parse(jux_core::version()).context("invalid Jux version")?;
+    let cache = UpdateChecker::new(update_cache_path()).check_now(&current_version)?;
+    let metadata = embedded_distribution_metadata()?;
+    let result = UpdateCheckOutput {
+        update_available: cache.update_available(),
+        current_version: cache.current_version.to_string(),
+        latest_version: cache.latest_version.to_string(),
+        release_url: cache.release_url,
+        recommendation: UpdateRecommendation::for_distribution(&metadata),
+    };
+    match output {
+        OutputFormat::Text => {
+            println!("current_version: {}", result.current_version);
+            println!("latest_version: {}", result.latest_version);
+            println!("update_available: {}", result.update_available);
+            println!("channel: {:?}", result.recommendation.channel);
+            println!("guidance: {}", result.recommendation.guidance);
+            if let Some(command) = &result.recommendation.command {
+                println!("command: {}", command.display());
+            }
+            println!("release_url: {}", result.release_url);
+        }
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Yaml => print!("{}", serde_yaml::to_string(&result)?),
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateCheckOutput {
+    update_available: bool,
+    current_version: String,
+    latest_version: String,
+    release_url: String,
+    recommendation: UpdateRecommendation,
+}
+
+fn handle_distribution(command: DistributionCommand, output: OutputFormat) -> Result<()> {
+    let metadata = match command.command {
+        DistributionSubcommand::Show => embedded_distribution_metadata()?,
+        DistributionSubcommand::Inject(args) => {
+            let metadata = DistributionMetadata::new(
+                DistributionChannel::from(args.channel),
+                InstallerKind::from(args.installer),
+                args.version,
+                args.source_commit,
+            )?;
+            inject_distribution_metadata(&args.input, &args.output_path, &metadata)?;
+            metadata
+        }
+    };
+    match output {
+        OutputFormat::Text => {
+            println!("schema_version: {}", metadata.schema_version);
+            println!("channel: {:?}", metadata.channel);
+            println!("installer: {:?}", metadata.installer);
+            println!("application_version: {}", metadata.application_version);
+            println!("package_id: {}", metadata.package_id);
+            println!("source_commit: {}", metadata.source_commit);
+        }
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&metadata)?),
+        OutputFormat::Yaml => print!("{}", serde_yaml::to_string(&metadata)?),
+    }
+    Ok(())
+}
+
+impl From<DistributionChannelArg> for DistributionChannel {
+    fn from(value: DistributionChannelArg) -> Self {
+        match value {
+            DistributionChannelArg::GithubRelease => Self::GithubRelease,
+            DistributionChannelArg::Homebrew => Self::Homebrew,
+            DistributionChannelArg::Winget => Self::Winget,
+            DistributionChannelArg::Npm => Self::Npm,
+        }
+    }
+}
+
+impl From<InstallerKindArg> for InstallerKind {
+    fn from(value: InstallerKindArg) -> Self {
+        match value {
+            InstallerKindArg::Bash => Self::Bash,
+            InstallerKindArg::PowerShell => Self::PowerShell,
+            InstallerKindArg::Homebrew => Self::Homebrew,
+            InstallerKindArg::Winget => Self::Winget,
+            InstallerKindArg::Npm => Self::Npm,
+            InstallerKindArg::Manual => Self::Manual,
         }
     }
 }

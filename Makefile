@@ -17,5 +17,6 @@ quick-check: fmt lint
 check: quick-check test
 
 release-plan:
-	dist generate --check
 	dist plan
+	@grep -q "brand-dist-archive.sh" .github/workflows/v-release.yml
+	@grep -q "brand-dist-archive.ps1" .github/workflows/v-release.yml

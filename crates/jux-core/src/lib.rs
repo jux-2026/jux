@@ -2,12 +2,14 @@
 
 mod code_change;
 mod config;
+mod distribution;
 mod instructions;
 mod main_loop;
 mod policy;
 mod skills;
 mod state;
 mod tools;
+mod update;
 mod util;
 
 pub use code_change::{
@@ -21,6 +23,11 @@ pub use config::{
     JuxConfig, JuxConfigLoader, LoggingConfig, LoggingLevelConfig, MatchKindConfig, ModelConfig,
     NativeConfig, NetworkConfig, QuitShortcut, ResolvedConfig, RuleEffect, SandboxConfig,
     TuiConfig, TuiShortcutConfig, TuiTheme,
+};
+pub use distribution::{
+    DISTRIBUTION_METADATA_SLOT_SIZE, DistributionChannel, DistributionMetadata,
+    DistributionMetadataError, InstallerKind, embedded_distribution_metadata,
+    inject_distribution_metadata,
 };
 pub use instructions::{
     InstructionDocument, InstructionError, InstructionResolver, InstructionScope,
@@ -58,6 +65,10 @@ pub use tools::wasm::{
 pub use tools::{
     HUMAN_INPUT_TOOL_NAME, HumanInputKind, HumanInputOption, HumanInputRequest,
     PROPOSE_CODE_CHANGE_TOOL_NAME, latest_human_input_request,
+};
+pub use update::{
+    UPDATE_CHECK_INTERVAL, UpdateCache, UpdateChecker, UpdateCommand, UpdateError, UpdateNotice,
+    UpdateRecommendation, update_cache_path,
 };
 
 /// Returns the current workspace package version.

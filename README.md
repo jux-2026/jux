@@ -23,8 +23,8 @@ jux
 
 ## Install
 
-Prebuilt binaries are published through GitHub Releases for macOS, Linux, and
-Windows.
+Prebuilt binaries are published through GitHub Releases for Apple Silicon
+macOS, x86_64 Linux, and x86_64 Windows.
 
 Install on macOS or Linux with the shell installer:
 
@@ -48,11 +48,25 @@ Verify the installation with:
 jux --version
 ```
 
+Check for a newer version and display the upgrade method for the embedded
+distribution channel:
+
+```sh
+jux update --check
+```
+
+The TUI performs the same check in the background at most once every 24 hours.
+An available version is shown on the next startup and at the bottom of the
+right sidebar. Jux recommends a fixed package-manager or installer command; it
+does not execute that command automatically.
+
 ## Release Process
 
-Releases are built by the generated cargo-dist GitHub Actions workflow. A tag
-whose version matches the Cargo workspace version publishes the platform
-archives, checksums, and both installers:
+Releases use cargo-dist inside GitHub Actions. Each platform is compiled once,
+then a release step injects a fixed 1 KiB distribution metadata slot before
+the final archive, signature, and checksum are produced. A tag whose version
+matches the Cargo workspace version publishes the platform archives,
+checksums, and both installers:
 
 ```sh
 git tag v0.1.0

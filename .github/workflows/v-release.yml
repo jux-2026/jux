@@ -144,6 +144,19 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      # cargo-dist compiles and creates its initial archive in one step. These platform-native
+      # steps replace that unpublished archive with the final channel-branded archive before any
+      # upload, signing, or global checksum generation.
+      - name: Inject GitHub Bash distribution metadata
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          scripts/brand-dist-archive.sh "${{ join(matrix.targets, '') }}" "${GITHUB_REF_NAME#v}" "$GITHUB_SHA"
+      - name: Inject GitHub PowerShell distribution metadata
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          scripts/brand-dist-archive.ps1 -Target "${{ join(matrix.targets, '') }}" -Version "$($env:GITHUB_REF_NAME -replace '^v', '')" -SourceCommit "$env:GITHUB_SHA"
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up

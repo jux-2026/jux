@@ -10,15 +10,17 @@ use jux_cli::tui::{
 };
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AssistantResponseItem,
-    CodeChangePlan, CodeChangeProposal, LlmUsage, ProposedFileContent, ReviewStatus, RunId,
-    RunStatus as CoreRunStatus, SkillCatalog, SkillDefinition, SkillOverride, SkillScope,
-    SqliteWorkspaceStore, Step, StepId, StepKind, StepPayload, TuiShortcutConfig, TuiTheme,
+    CodeChangePlan, CodeChangeProposal, DistributionMetadata, LlmUsage, ProposedFileContent,
+    ReviewStatus, RunId, RunStatus as CoreRunStatus, SkillCatalog, SkillDefinition, SkillOverride,
+    SkillScope, SqliteWorkspaceStore, Step, StepId, StepKind, StepPayload, TuiShortcutConfig,
+    TuiTheme, UpdateNotice, UpdateRecommendation,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Position;
 use ratatui::style::Color;
+use semver::Version;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
@@ -3947,4 +3949,32 @@ fn tui_applies_high_contrast_theme_and_custom_shortcuts() {
         AppAction::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
     );
     assert!(state.should_quit);
+}
+
+#[test]
+fn tui_shows_update_at_startup_and_in_sidebar() {
+    let mut state = AppState::new("/workspace");
+    let metadata = DistributionMetadata::unbranded();
+    let notice = UpdateNotice {
+        current_version: Version::parse("0.1.0").expect("current version"),
+        latest_version: Version::parse("0.2.0").expect("latest version"),
+        release_url: "https://github.com/jux-2026/jux/releases/tag/v0.2.0".to_owned(),
+        recommendation: UpdateRecommendation::for_distribution(&metadata),
+    };
+
+    update(
+        &mut state,
+        AppAction::UpdateAvailable {
+            notice,
+            show_startup_message: true,
+        },
+    );
+
+    assert!(
+        state.messages()[0]
+            .content
+            .contains("Jux 0.2.0 is available")
+    );
+    let buffer = render_to_buffer(&state, 100, 30);
+    assert_buffer_contains(&buffer, "↑ 0.2.0 available");
 }

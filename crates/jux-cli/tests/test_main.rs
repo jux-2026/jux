@@ -25,7 +25,9 @@ fn cli_exposes_foundation_commands() {
         .stdout(predicate::str::contains("--output"))
         .stdout(predicate::str::contains("run"))
         .stdout(predicate::str::contains("skills"))
-        .stdout(predicate::str::contains("session"));
+        .stdout(predicate::str::contains("session"))
+        .stdout(predicate::str::contains("distribution"))
+        .stdout(predicate::str::contains("update"));
 
     Command::cargo_bin("jux")
         .expect("jux binary exists")
@@ -35,6 +37,55 @@ fn cli_exposes_foundation_commands() {
         .stdout(predicate::str::contains("--stream"))
         .stdout(predicate::str::contains("--skill"))
         .stdout(predicate::str::contains("--no-auto-skills"));
+}
+
+#[test]
+fn distribution_command_injects_and_reads_the_fixed_metadata_slot() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let output = temporary.path().join(if cfg!(windows) {
+        "jux-branded.exe"
+    } else {
+        "jux-branded"
+    });
+    let input = env!("CARGO_BIN_EXE_jux");
+
+    Command::cargo_bin("jux")
+        .expect("jux binary exists")
+        .args([
+            "distribution",
+            "inject",
+            "--input",
+            input,
+            "--output-path",
+            output.to_str().expect("output path"),
+            "--channel",
+            "github-release",
+            "--installer",
+            if cfg!(windows) { "power-shell" } else { "bash" },
+            "--version",
+            "0.1.0",
+            "--source-commit",
+            "abcdef",
+        ])
+        .assert()
+        .success();
+
+    if cfg!(target_os = "macos") {
+        let status = std::process::Command::new("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&output)
+            .status()
+            .expect("re-sign branded Mach-O");
+        assert!(status.success());
+    }
+
+    let result = std::process::Command::new(output)
+        .args(["distribution", "show"])
+        .output()
+        .expect("run branded binary");
+    assert!(result.status.success());
+    let stdout = String::from_utf8(result.stdout).expect("UTF-8 output");
+    assert!(stdout.contains("channel: GithubRelease"));
 }
 
 #[test]

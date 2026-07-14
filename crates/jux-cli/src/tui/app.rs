@@ -6,7 +6,8 @@ use jux_core::{
     CodeChangeError, CodeChangeProposal, CodeChangeReview, CopyMessageShortcut, HumanInputRequest,
     PROPOSE_CODE_CHANGE_TOOL_NAME, QuitShortcut, ReviewStatus, Run, RunStatus, Session, SessionId,
     SkillCatalog, SkillDefinition, SkillOverride, SqliteWorkspaceStore, Step, StepPayload,
-    StoreError, ToolOutputStream, TuiShortcutConfig, TuiTheme, latest_human_input_request,
+    StoreError, ToolOutputStream, TuiShortcutConfig, TuiTheme, UpdateNotice,
+    latest_human_input_request,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -159,6 +160,7 @@ pub struct AppState {
     slash_commands_dismissed: bool,
     pending_escape_action: Option<PendingEscapeAction>,
     notification: Option<(String, Instant)>,
+    update_notice: Option<UpdateNotice>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -428,6 +430,7 @@ impl AppState {
             slash_commands_dismissed: false,
             pending_escape_action: None,
             notification: None,
+            update_notice: None,
         }
     }
 
@@ -1008,6 +1011,11 @@ impl AppState {
             .as_ref()
             .filter(|(_, expires_at)| *expires_at >= Instant::now())
             .map(|(message, _)| message.as_str())
+    }
+
+    #[must_use]
+    pub fn update_notice(&self) -> Option<&UpdateNotice> {
+        self.update_notice.as_ref()
     }
 
     fn notify(&mut self, message: impl Into<String>) {
@@ -1802,6 +1810,10 @@ fn tui_run_status(status: &RunStatus) -> TuiRunStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppAction {
     FileIndexUpdated(FileIndexSnapshot),
+    UpdateAvailable {
+        notice: UpdateNotice,
+        show_startup_message: bool,
+    },
     Key(KeyEvent),
     Mouse {
         event: MouseEvent,
@@ -1855,6 +1867,26 @@ fn update_inner(state: &mut AppState, action: AppAction) -> Option<AppCommand> {
         state.pending_escape_action = None;
     }
     match action {
+        AppAction::UpdateAvailable {
+            notice,
+            show_startup_message,
+        } => {
+            if show_startup_message {
+                let mut content = format!(
+                    "Jux {} is available (current {}). {}",
+                    notice.latest_version, notice.current_version, notice.recommendation.guidance
+                );
+                if let Some(command) = &notice.recommendation.command {
+                    content.push_str(&format!("\nRun: {}", command.display()));
+                }
+                state.messages.push(Message {
+                    role: MessageRole::Assistant,
+                    content,
+                });
+            }
+            state.update_notice = Some(notice);
+            None
+        }
         AppAction::FileIndexUpdated(snapshot) => {
             state.set_file_index(snapshot);
             None
@@ -3454,7 +3486,7 @@ fn sidebar_text_lines(state: &AppState) -> Vec<String> {
         TuiRunStatus::Failed => "Failed",
         TuiRunStatus::Canceled => "Canceled",
     };
-    vec![
+    let mut lines = vec![
         "Jux".to_owned(),
         String::new(),
         format!("Session: {}", state.session_id().unwrap_or("-")),
@@ -3478,7 +3510,15 @@ fn sidebar_text_lines(state: &AppState) -> Vec<String> {
             "Workspace ID: {}",
             state.runtime_info().workspace_id.as_deref().unwrap_or("-")
         ),
-    ]
+    ];
+    if let Some(notice) = state.update_notice() {
+        lines.extend([
+            String::new(),
+            format!("Update: {} available", notice.latest_version),
+            notice.recommendation.guidance.clone(),
+        ]);
+    }
+    lines
 }
 
 fn truncate_timeline_detail_text(content: &str) -> String {

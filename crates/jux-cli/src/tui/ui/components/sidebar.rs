@@ -160,6 +160,19 @@ pub(in crate::tui::ui) fn run_panel(state: &AppState) -> Paragraph<'_> {
             "  Cmd {}",
             state.runtime_info().sandbox.native_commands
         )),
+    ]);
+    if let Some(notice) = state.update_notice() {
+        lines.extend([
+            Line::from(""),
+            section("Update"),
+            Line::styled(
+                format!("  ↑ {} available", notice.latest_version),
+                Style::default().fg(Color::Yellow),
+            ),
+            Line::from(format!("  {}", notice.recommendation.guidance)),
+        ]);
+    }
+    lines.extend([
         Line::from(""),
         Line::styled(
             format!("← focus · {} quit", state.quit_shortcut_label()),

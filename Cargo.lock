@@ -2180,6 +2180,7 @@ dependencies = [
  "pulldown-cmark 0.13.4",
  "ratatui",
  "rig-core",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2194,12 +2195,14 @@ name = "jux-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assert_fs",
  "futures",
  "mlua",
  "regex",
  "reqwest 0.12.28",
  "rig-core",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
