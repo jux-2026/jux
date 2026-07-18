@@ -8,12 +8,32 @@
 > received the security hardening required for production use. **Do not use Jux
 > in production environments.**
 
-Jux is an open-source, security-oriented programming agent. It is being built to
+Jux is an open-source, security-oriented programming agent that runs supported
+command-line tools inside a WebAssembly sandbox by default. It is being built to
 provide auditable, controllable, and extensible AI-assisted software development
 through a local runtime and multiple client interfaces.
 
-This repository contains the agent-side Rust monorepo. It currently focuses on
-the runtime foundation, command-line interface, and terminal user interface.
+## Sandboxed by Default
+
+Jux treats agent-generated commands as untrusted input. Supported command-line
+operations run inside an embedded WebAssembly sandbox instead of being executed
+directly by the host shell.
+
+The default runtime policy provides the following boundaries:
+
+- Native host command execution is disabled.
+- The workspace is exposed to sandboxed commands as read-only.
+- Host environment variables are not forwarded.
+- Network access is disabled unless explicitly allowed by policy.
+- Only packaged and approved WASM tools can be executed.
+- Shell syntax such as pipes, redirects, command substitution, and chained
+  commands is rejected.
+- Commands invoked through the restricted Lua runtime use the same WASM-backed
+  execution path.
+
+These boundaries reduce the impact of unexpected model-generated commands and
+make tool execution easier to control and audit. They do not make running
+untrusted code risk-free, and Jux is not yet recommended for production use.
 
 ## Project Status
 
@@ -33,7 +53,8 @@ repository.
 - Workspace, session, run, and step lifecycle management.
 - SQLite-backed local state stored under the workspace `.jux` directory.
 - Multi-iteration LLM execution through the DeepSeek provider.
-- Native, Lua, and WASM tools with runtime policy checks.
+- WASM-sandboxed command execution with native host commands disabled by default.
+- A restricted Lua runtime whose command operations use the same WASM sandbox.
 - Skill discovery, explicit or model-selected invocation, isolated transcripts,
   and resume support.
 - Persisted human clarification and confirmation flows.
