@@ -53,7 +53,6 @@ pub enum DistributionChannel {
     GithubRelease = 1,
     Homebrew = 2,
     Winget = 3,
-    Npm = 4,
 }
 
 impl DistributionChannel {
@@ -63,7 +62,6 @@ impl DistributionChannel {
             Self::GithubRelease => "jux-2026/jux",
             Self::Homebrew => "jux-2026/tap/jux",
             Self::Winget => "Jux.Jux",
-            Self::Npm => "@jux-2026/jux",
         }
     }
 }
@@ -77,7 +75,6 @@ impl TryFrom<u8> for DistributionChannel {
             1 => Ok(Self::GithubRelease),
             2 => Ok(Self::Homebrew),
             3 => Ok(Self::Winget),
-            4 => Ok(Self::Npm),
             _ => Err(DistributionMetadataError::InvalidChannel(value)),
         }
     }
@@ -92,7 +89,6 @@ pub enum InstallerKind {
     PowerShell = 2,
     Homebrew = 3,
     Winget = 4,
-    Npm = 5,
     Manual = 6,
 }
 
@@ -106,7 +102,6 @@ impl TryFrom<u8> for InstallerKind {
             2 => Ok(Self::PowerShell),
             3 => Ok(Self::Homebrew),
             4 => Ok(Self::Winget),
-            5 => Ok(Self::Npm),
             6 => Ok(Self::Manual),
             _ => Err(DistributionMetadataError::InvalidInstaller(value)),
         }
@@ -291,7 +286,6 @@ fn validate_pair(
             | (DistributionChannel::GithubRelease, InstallerKind::Manual)
             | (DistributionChannel::Homebrew, InstallerKind::Homebrew)
             | (DistributionChannel::Winget, InstallerKind::Winget)
-            | (DistributionChannel::Npm, InstallerKind::Npm)
     );
     if valid {
         Ok(())

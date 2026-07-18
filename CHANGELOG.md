@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- npm distribution support is no longer part of the release pipeline.
+
 ## [0.1.2] - 2026-07-18
 
 ### Fixed

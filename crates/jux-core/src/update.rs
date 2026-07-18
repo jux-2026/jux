@@ -77,10 +77,6 @@ impl UpdateRecommendation {
                 )),
                 "Upgrade with WinGet.".to_owned(),
             ),
-            DistributionChannel::Npm => (
-                Some(UpdateCommand::new("npm", ["update", "-g", "@jux-2026/jux"])),
-                "Upgrade with npm.".to_owned(),
-            ),
             DistributionChannel::GithubRelease => (
                 None,
                 match metadata.installer {

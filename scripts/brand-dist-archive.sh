@@ -4,11 +4,10 @@ set -eu
 target="$1"
 version="$2"
 source_commit="$3"
-github_archive="target/distrib/jux-${target}.tar.xz"
-npm_archive="target/distrib/jux-npm-${target}.tar.xz"
+archive="target/distrib/jux-${target}.tar.xz"
 
-if [ ! -f "$github_archive" ]; then
-    echo "release archive not found: $github_archive" >&2
+if [ ! -f "$archive" ]; then
+    echo "release archive not found: $archive" >&2
     exit 1
 fi
 
@@ -18,16 +17,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-tar -xJf "$github_archive" -C "$work_dir"
+tar -xJf "$archive" -C "$work_dir"
 binary=$(find "$work_dir" -type f -name jux -print -quit)
 root=$(find "$work_dir" -mindepth 1 -maxdepth 1 -type d -print -quit)
 if [ -z "$binary" ] || [ -z "$root" ]; then
-    echo "jux archive layout is invalid: $github_archive" >&2
+    echo "jux archive layout is invalid: $archive" >&2
     exit 1
 fi
 
-# Keep one untouched build outside the archive root. Every channel is derived from this same
-# executable, so adding a package-manager channel never triggers another Rust compilation.
+# Keep one untouched build outside the archive root while injecting release metadata.
 base_binary="$work_dir/jux.base"
 cp "$binary" "$base_binary"
 chmod +x "$base_binary"
@@ -80,5 +78,4 @@ brand_archive() {
     write_checksum "$archive"
 }
 
-brand_archive "$github_archive" github-release bash GithubRelease Bash
-brand_archive "$npm_archive" npm npm Npm Npm
+brand_archive "$archive" github-release bash GithubRelease Bash

@@ -90,7 +90,6 @@ enum DistributionChannelArg {
     GithubRelease,
     Homebrew,
     Winget,
-    Npm,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -99,7 +98,6 @@ enum InstallerKindArg {
     PowerShell,
     Homebrew,
     Winget,
-    Npm,
     Manual,
 }
 
@@ -336,7 +334,6 @@ impl From<DistributionChannelArg> for DistributionChannel {
             DistributionChannelArg::GithubRelease => Self::GithubRelease,
             DistributionChannelArg::Homebrew => Self::Homebrew,
             DistributionChannelArg::Winget => Self::Winget,
-            DistributionChannelArg::Npm => Self::Npm,
         }
     }
 }
@@ -348,7 +345,6 @@ impl From<InstallerKindArg> for InstallerKind {
             InstallerKindArg::PowerShell => Self::PowerShell,
             InstallerKindArg::Homebrew => Self::Homebrew,
             InstallerKindArg::Winget => Self::Winget,
-            InstallerKindArg::Npm => Self::Npm,
             InstallerKindArg::Manual => Self::Manual,
         }
     }

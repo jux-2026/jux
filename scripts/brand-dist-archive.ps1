@@ -5,24 +5,22 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$githubArchive = "target/distrib/jux-$Target.zip"
-$npmArchive = "target/distrib/jux-npm-$Target.zip"
-if (-not (Test-Path $githubArchive)) {
-    throw "release archive not found: $githubArchive"
+$archive = "target/distrib/jux-$Target.zip"
+if (-not (Test-Path $archive)) {
+    throw "release archive not found: $archive"
 }
 
 $workDirectory = Join-Path $env:RUNNER_TEMP "jux-brand-$Target"
 Remove-Item $workDirectory -Recurse -Force -ErrorAction SilentlyContinue
 $archiveDirectory = Join-Path $workDirectory "archive"
 New-Item -ItemType Directory -Path $archiveDirectory | Out-Null
-Expand-Archive -Path $githubArchive -DestinationPath $archiveDirectory
+Expand-Archive -Path $archive -DestinationPath $archiveDirectory
 $binary = Get-ChildItem $archiveDirectory -Filter "jux.exe" -Recurse | Select-Object -First 1
 if ($null -eq $binary) {
-    throw "jux archive layout is invalid: $githubArchive"
+    throw "jux archive layout is invalid: $archive"
 }
 
-# Preserve the unbranded build outside the archive root so all channel archives derive from one
-# Rust compilation.
+# Preserve the unbranded build outside the archive contents while injecting release metadata.
 $baseBinary = Join-Path $workDirectory "jux.base.exe"
 Copy-Item $binary.FullName $baseBinary
 
@@ -62,7 +60,6 @@ function Write-BrandedArchive {
     [IO.File]::WriteAllText("$Archive.sha256", "$digest *$name`n", (New-Object System.Text.UTF8Encoding $false))
 }
 
-Write-BrandedArchive $githubArchive "github-release" "power-shell" "GithubRelease" "PowerShell"
-Write-BrandedArchive $npmArchive "npm" "npm" "Npm" "Npm"
+Write-BrandedArchive $archive "github-release" "power-shell" "GithubRelease" "PowerShell"
 
 Remove-Item $workDirectory -Recurse -Force
