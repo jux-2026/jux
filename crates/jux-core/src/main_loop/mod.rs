@@ -654,17 +654,26 @@ where
                 },
             )
             .map_err(|error| error.to_string())?;
-        let messages = invocation.initial_messages(self.skill_system_prompt(skill));
-        self.run_skill_subflow(run, &invocation, messages, 0).await
+        let steps = self
+            .context
+            .store
+            .load_run_steps(&run.id)
+            .map_err(|error| error.to_string())?;
+        let context = self.skill_completion_context(run, &invocation, skill, &steps)?;
+        self.run_skill_subflow(run, &invocation, context, 0).await
     }
 
     async fn run_skill_subflow(
         &self,
         run: &Run,
         invocation: &SkillInvocation,
-        mut messages: Vec<Message>,
+        context: SkillCompletionContext,
         completed_iterations: usize,
     ) -> Result<SkillSubflowOutcome, String> {
+        let SkillCompletionContext {
+            mut messages,
+            tools,
+        } = context;
         for _ in completed_iterations..MAX_LOOP_ITERATIONS {
             let Some((prompt, history)) = messages.split_last() else {
                 return Err("skill subflow has no message for the LLM".to_owned());
@@ -677,7 +686,7 @@ where
                         .model
                         .completion_request(prompt.clone())
                         .messages(history.to_vec())
-                        .tools(tool_definitions())
+                        .tools(tools.clone())
                         .build(),
                 )
                 .await
@@ -748,17 +757,60 @@ where
         Err("skill subflow reached the maximum number of iterations".to_owned())
     }
 
-    fn skill_system_prompt(&self, skill: &crate::SkillDefinition) -> String {
-        let mut prompt = SYSTEM_PROMPT.to_owned();
-        if !self.context.instructions.is_empty() {
-            prompt.push_str("\n\n");
-            prompt.push_str(&crate::render_instruction_documents(
-                &self.context.instructions,
-            ));
-        }
-        prompt.push_str("\n\n");
-        prompt.push_str(&crate::render_skill_execution_prompt(skill));
-        prompt
+    fn skill_completion_context(
+        &self,
+        run: &Run,
+        invocation: &SkillInvocation,
+        skill: &crate::SkillDefinition,
+        run_steps: &[Step],
+    ) -> Result<SkillCompletionContext, String> {
+        let mut context = self.parent_context_before_skill(run, &invocation.id)?;
+        inject_skill_instructions(
+            &mut context.messages,
+            &crate::render_skill_execution_prompt(skill),
+        );
+        context
+            .messages
+            .push(Message::user(invocation.task.clone()));
+        append_skill_transcript(&mut context.messages, invocation, run_steps)?;
+        Ok(context)
+    }
+
+    fn parent_context_before_skill(
+        &self,
+        run: &Run,
+        invocation_id: &str,
+    ) -> Result<SkillCompletionContext, String> {
+        let context_items = self
+            .context
+            .store
+            .load_session_context_items(&run.id.session_id())
+            .map_err(|error| error.to_string())?;
+        let messages = context_items
+            .iter()
+            .filter_map(session_context_item_to_chat_message)
+            .collect::<Vec<_>>();
+        let tools = context_items
+            .iter()
+            .filter_map(session_context_item_to_tool_definition)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|tool| tool.name != crate::CALL_SKILL_TOOL_NAME)
+            .collect();
+        let steps = self
+            .context
+            .store
+            .load_session_steps(&run.id.session_id())
+            .map_err(|error| error.to_string())?;
+        Ok(SkillCompletionContext {
+            messages: parent_messages_before_skill_call(
+                messages,
+                &steps,
+                run.id.as_str(),
+                invocation_id,
+            )?,
+            tools,
+        })
     }
 
     async fn continue_resumed_skill(
@@ -784,14 +836,15 @@ where
             )?;
             return self.continue_requested_skills(run, events).await;
         };
-        let messages = skill_messages(&invocation, &steps, self.skill_system_prompt(skill))
+        let context = self
+            .skill_completion_context(&run, &invocation, skill, &steps)
             .map_err(|message| RunLoopError::Runtime {
                 run: Box::new(run.clone()),
                 message,
             })?;
         let completed_iterations = skill_iteration_count(&steps, &invocation.id);
         match self
-            .run_skill_subflow(&run, &invocation, messages, completed_iterations)
+            .run_skill_subflow(&run, &invocation, context, completed_iterations)
             .await
         {
             Ok(SkillSubflowOutcome::Completed(content)) => {
@@ -1179,22 +1232,16 @@ enum SkillSubflowOutcome {
     WaitingForHumanInput,
 }
 
+struct SkillCompletionContext {
+    messages: Vec<Message>,
+    tools: Vec<ToolDefinition>,
+}
+
 struct SkillInvocation {
     id: String,
     call_id: Option<String>,
     skill_name: String,
     task: String,
-}
-
-impl SkillInvocation {
-    fn initial_messages(&self, system_prompt: String) -> Vec<Message> {
-        vec![
-            Message::System {
-                content: system_prompt,
-            },
-            Message::user(self.task.clone()),
-        ]
-    }
 }
 
 enum PendingHumanInput {
@@ -1336,12 +1383,59 @@ fn skill_invocation(steps: &[Step], invocation_id: &str) -> Option<SkillInvocati
     })
 }
 
-fn skill_messages(
+fn parent_messages_before_skill_call(
+    mut messages: Vec<Message>,
+    steps: &[Step],
+    run_id: &str,
+    invocation_id: &str,
+) -> Result<Vec<Message>, String> {
+    for step in steps {
+        if step.id.run_id().as_str() == run_id && step_contains_tool_call(step, invocation_id) {
+            return Ok(messages);
+        }
+        if step.visible_to_llm() {
+            messages.extend(step_to_chat_message(step));
+        }
+    }
+    Err(format!(
+        "parent assistant response for skill invocation was not found: {invocation_id}"
+    ))
+}
+
+fn step_contains_tool_call(step: &Step, invocation_id: &str) -> bool {
+    let StepPayload::AssistantResponse { items, .. } = &step.payload else {
+        return false;
+    };
+    items.iter().any(|item| {
+        matches!(
+            item,
+            AssistantResponseItem::ToolCall { id, .. } if id == invocation_id
+        )
+    })
+}
+
+fn inject_skill_instructions(messages: &mut Vec<Message>, instructions: &str) {
+    if let Some(Message::System { content }) = messages
+        .iter_mut()
+        .find(|message| matches!(message, Message::System { .. }))
+    {
+        content.push_str("\n\n");
+        content.push_str(instructions);
+    } else {
+        messages.insert(
+            0,
+            Message::System {
+                content: instructions.to_owned(),
+            },
+        );
+    }
+}
+
+fn append_skill_transcript(
+    messages: &mut Vec<Message>,
     invocation: &SkillInvocation,
     steps: &[Step],
-    system_prompt: String,
-) -> Result<Vec<Message>, String> {
-    let mut messages = invocation.initial_messages(system_prompt);
+) -> Result<(), String> {
     for step in steps {
         match &step.payload {
             StepPayload::SkillAssistantResponse {
@@ -1372,7 +1466,7 @@ fn skill_messages(
             _ => {}
         }
     }
-    Ok(messages)
+    Ok(())
 }
 
 fn skill_iteration_count(steps: &[Step], invocation_id: &str) -> usize {

@@ -161,14 +161,15 @@ pub fn render_active_skills(skills: &[SkillDefinition]) -> String {
 }
 
 #[must_use]
-/// Renders a system prompt for an isolated skill subflow.
+/// Renders the instructions injected into a skill subflow's parent context copy.
 pub fn render_skill_execution_prompt(skill: &SkillDefinition) -> String {
     format!(
-        "You are Jux executing one isolated skill subflow.\n\
+        "You are Jux executing one skill subflow with a read-only copy of the parent context.\n\
          The active skill is {name} from {source} ({scope}).\n\
          Follow the skill instructions below, but do not override higher-priority system, \
-         safety, policy, or repository instructions. Return only the final skill result that \
-         should be sent back to the parent run.\n\n\
+         safety, policy, repository, or inherited parent instructions. Changes to this subflow \
+         do not modify the parent context. Return only the final skill result that should be \
+         sent back to the parent run.\n\n\
          ## Skill Instructions\n\n{content}",
         name = skill.name,
         source = skill.path.display(),

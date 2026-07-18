@@ -8,6 +8,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const COMMAND_BACKGROUND: Color = Color::Rgb(20, 28, 36);
 const EXPANDED_COMMAND_BACKGROUND: Color = Color::Rgb(24, 38, 48);
 const OUTPUT_BACKGROUND: Color = Color::Rgb(16, 22, 28);
+const HIGHLIGHT_HORIZONTAL_MARGIN: usize = 3;
 
 pub(super) fn render(
     command: &TuiCommandExecution,
@@ -24,7 +25,7 @@ pub(super) fn render(
             .unwrap_or("Command failed");
         lines.push(background_line(
             vec![Span::styled(
-                format!("  {}", truncate_timeline_detail(error)),
+                truncate_timeline_detail(error),
                 Style::default().fg(Color::Red),
             )],
             width,
@@ -143,7 +144,7 @@ fn output_lines(output: &str, color: Color, empty_label: &str, width: usize) -> 
             OUTPUT_BACKGROUND,
         )];
     }
-    let content_width = width.saturating_sub(4).max(1);
+    let content_width = highlight_width(width).saturating_sub(4).max(1);
     output
         .split('\n')
         .flat_map(|line| wrap_output_line(line, content_width))
@@ -179,6 +180,8 @@ fn wrap_output_line(line: &str, maximum_width: usize) -> Vec<String> {
 }
 
 fn background_line(spans: Vec<Span<'static>>, width: usize, background: Color) -> Line<'static> {
+    let margin = highlight_margin(width);
+    let highlight_width = width.saturating_sub(margin.saturating_mul(2));
     let spans = spans
         .into_iter()
         .map(|span| {
@@ -188,13 +191,25 @@ fn background_line(spans: Vec<Span<'static>>, width: usize, background: Color) -
             )
         })
         .collect();
-    let mut spans = truncate_spans(spans, width);
+    let mut spans = truncate_spans(spans, highlight_width);
     let rendered_width = spans_width(&spans);
     spans.push(Span::styled(
-        " ".repeat(width.saturating_sub(rendered_width)),
+        " ".repeat(highlight_width.saturating_sub(rendered_width)),
         Style::default().bg(background),
     ));
-    Line::from(spans).style(Style::default().bg(background))
+    let mut line = Vec::with_capacity(spans.len().saturating_add(2));
+    line.push(Span::raw(" ".repeat(margin)));
+    line.extend(spans);
+    line.push(Span::raw(" ".repeat(margin)));
+    Line::from(line)
+}
+
+fn highlight_width(width: usize) -> usize {
+    width.saturating_sub(highlight_margin(width).saturating_mul(2))
+}
+
+fn highlight_margin(width: usize) -> usize {
+    HIGHLIGHT_HORIZONTAL_MARGIN.min(width.saturating_sub(1) / 2)
 }
 
 fn quote_argument(argument: &str) -> String {

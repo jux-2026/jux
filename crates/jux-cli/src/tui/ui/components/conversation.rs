@@ -895,9 +895,13 @@ fn append_timeline_items(
             TimelineStatus::Completed => "Completed",
             TimelineStatus::Failed => "Failed",
         };
+        let indent = if item.label == "LLM" { "   " } else { "" };
+        if !indent.is_empty() {
+            content.append_dynamic_line(state, Line::default(), content_width, theme);
+        }
         content.append_dynamic_line(
             state,
-            Line::from(format!("{}  {status}", item.label)),
+            Line::from(format!("{indent}{}  {status}", item.label)),
             content_width,
             theme,
         );

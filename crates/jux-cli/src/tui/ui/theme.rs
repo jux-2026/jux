@@ -18,6 +18,9 @@ pub(super) struct ThemePalette {
     pub status: Color,
     pub input: Color,
     pub input_inactive: Color,
+    pub session_row: Color,
+    pub session_row_alternate: Color,
+    pub session_row_selected: Color,
 }
 
 pub(super) fn palette(theme: TuiTheme) -> ThemePalette {
@@ -30,6 +33,9 @@ pub(super) fn palette(theme: TuiTheme) -> ThemePalette {
             status: STATUS_BAR_BACKGROUND,
             input: Color::Rgb(20, 38, 48),
             input_inactive: Color::Rgb(16, 28, 36),
+            session_row: Color::Rgb(16, 24, 32),
+            session_row_alternate: Color::Rgb(20, 30, 40),
+            session_row_selected: Color::Rgb(40, 52, 64),
         },
         TuiTheme::HighContrast => ThemePalette {
             conversation: Color::Black,
@@ -39,6 +45,9 @@ pub(super) fn palette(theme: TuiTheme) -> ThemePalette {
             status: Color::Rgb(24, 24, 24),
             input: Color::Rgb(0, 48, 64),
             input_inactive: Color::Rgb(16, 16, 16),
+            session_row: Color::Black,
+            session_row_alternate: Color::Rgb(24, 24, 24),
+            session_row_selected: Color::Rgb(64, 64, 64),
         },
     }
 }

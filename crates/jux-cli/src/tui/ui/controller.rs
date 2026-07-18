@@ -2238,7 +2238,11 @@ fn append_timeline_text_lines(
             TimelineStatus::Completed => "Completed",
             TimelineStatus::Failed => "Failed",
         };
-        lines.push(format!("{}  {status}", item.label));
+        let indent = if item.label == "LLM" { "   " } else { "" };
+        if !indent.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(format!("{indent}{}  {status}", item.label));
         if let Some(detail) = &item.detail {
             lines.push(detail.clone());
         }

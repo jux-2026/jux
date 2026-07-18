@@ -194,7 +194,7 @@ fn run_loop_sends_available_skill_index_to_llm_without_full_skill_body() {
 }
 
 #[test]
-fn run_loop_executes_skill_as_isolated_tool_subflow() {
+fn run_loop_executes_skill_with_read_only_parent_context() {
     let store = SqliteWorkspaceStore::new(temp_workspace_root());
     let model = TestModel::responses([
         Ok(vec![AssistantContent::ToolCall(test_tool_call(
@@ -232,11 +232,85 @@ fn run_loop_executes_skill_as_isolated_tool_subflow() {
     assert_eq!(requests.len(), 3);
     assert!(!requests[0].contains("Full isolated review instructions."));
     assert!(requests[1].contains("Full isolated review instructions."));
+    assert!(requests[1].contains("Use review skill"));
+    assert!(requests[1].contains("Review current changes"));
     assert!(!requests[1].contains("\"name\":\"call_skill\""));
     assert_eq!(skill_result["success"], true);
     assert_eq!(skill_result["skill"], "review");
     assert_eq!(skill_result["summary"], "Skill found one issue");
     assert!(requests[2].contains("Skill found one issue"));
+    assert!(!requests[2].contains("Full isolated review instructions."));
+}
+
+#[test]
+fn skill_subflow_inherits_parent_history_across_runs() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::text("Earlier parent answer")]),
+        Ok(vec![AssistantContent::ToolCall(test_tool_call(
+            "skill_call",
+            "call_skill",
+            serde_json::json!({
+                "name": "review",
+                "task": "Review with the earlier decision"
+            }),
+        ))]),
+        Ok(vec![AssistantContent::text("Skill used parent history")]),
+        Ok(vec![AssistantContent::text("Parent answer")]),
+    ]);
+    let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let context = RunLoopContext::new(store, model.clone(), policy).with_skills(vec![test_skill(
+        "review",
+        "Review code changes",
+        "Use the inherited context.",
+    )]);
+    let run_loop = RunLoop::with_context(context);
+
+    futures::executor::block_on(run_loop.run("Remember parent decision".to_owned()))
+        .expect("first run succeeds");
+    futures::executor::block_on(run_loop.run("Use the review skill now".to_owned()))
+        .expect("second run succeeds");
+    let requests = model.recorded_requests();
+
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2].contains("Remember parent decision"));
+    assert!(requests[2].contains("Earlier parent answer"));
+    assert!(requests[2].contains("Use the review skill now"));
+    assert!(requests[2].contains("Review with the earlier decision"));
+    assert!(requests[2].contains("Use the inherited context."));
+    assert!(!requests[3].contains("Use the inherited context."));
+}
+
+#[test]
+fn explicit_skill_context_uses_the_current_run_when_invocation_ids_repeat() {
+    let store = SqliteWorkspaceStore::new(temp_workspace_root());
+    let model = TestModel::responses([
+        Ok(vec![AssistantContent::text("First skill result")]),
+        Ok(vec![AssistantContent::text("First parent answer")]),
+        Ok(vec![AssistantContent::text("Second skill result")]),
+        Ok(vec![AssistantContent::text("Second parent answer")]),
+    ]);
+    let policy = RuntimePolicy::workspace_default(store.root().to_path_buf());
+    let skill = test_skill(
+        "review",
+        "Review code changes",
+        "Use the inherited context.",
+    );
+    let context = RunLoopContext::new(store, model.clone(), policy)
+        .with_skills(vec![skill.clone()])
+        .with_requested_skills(vec![skill]);
+    let run_loop = RunLoop::with_context(context);
+
+    futures::executor::block_on(run_loop.run("First explicit request".to_owned()))
+        .expect("first run succeeds");
+    futures::executor::block_on(run_loop.run("Second explicit request".to_owned()))
+        .expect("second run succeeds");
+    let requests = model.recorded_requests();
+
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2].contains("First explicit request"));
+    assert!(requests[2].contains("First parent answer"));
+    assert!(requests[2].contains("Second explicit request"));
 }
 
 #[test]

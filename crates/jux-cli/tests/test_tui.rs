@@ -1353,9 +1353,18 @@ fn tui_updates_llm_lifecycle_in_the_timeline() {
             AgentEventData::LlmStarted,
         )),
     );
-    let running = render_to_buffer(&mut state, 80, 24);
+    let running = render_to_buffer(&mut state, 50, 24);
     assert_buffer_contains(&running, "LLM");
     assert_buffer_contains(&running, "Running");
+    let (row, column) =
+        find_fragment_position(&running, "LLM  Running").expect("running LLM status is rendered");
+    assert_eq!(column, 4);
+    assert!(row > 0);
+    assert!((0..running.area().width.saturating_sub(1)).all(|x| {
+        running
+            .cell((x, row - 1))
+            .is_some_and(|cell| cell.symbol().trim().is_empty())
+    }));
 
     update(
         &mut state,
@@ -1581,9 +1590,17 @@ fn tui_expands_tool_arguments_and_output() {
     assert_row_has_background(
         &expanded,
         expanded_row,
-        1,
-        divider_column.saturating_sub(1),
+        4,
+        divider_column.saturating_sub(4),
         Color::Rgb(24, 38, 48),
+    );
+    assert_row_has_background(&expanded, expanded_row, 1, 4, conversation_background());
+    assert_row_has_background(
+        &expanded,
+        expanded_row,
+        divider_column.saturating_sub(4),
+        divider_column.saturating_sub(1),
+        conversation_background(),
     );
 }
 
@@ -1685,6 +1702,17 @@ fn tui_renders_failed_command_status_and_stderr() {
     assert_buffer_does_not_contain(&collapsed, "stderr 1 line(s)");
     assert_buffer_contains(&collapsed, "cat: missing file.txt: No such file");
     assert_buffer_fragment_has_fg_bg(&collapsed, "▶", Color::Red, Color::Rgb(20, 28, 36));
+    let (error_row, error_column) =
+        find_fragment_position(&collapsed, "cat: missing file.txt: No such file")
+            .expect("collapsed error is rendered");
+    assert_eq!(error_column, 4);
+    assert_row_has_background(
+        &collapsed,
+        error_row,
+        1,
+        error_column,
+        conversation_background(),
+    );
     let (toggle_row, toggle_column) =
         find_fragment_position(&collapsed, "▶").expect("fold button is rendered");
 
@@ -2437,6 +2465,82 @@ fn tui_lists_workspace_sessions_and_marks_the_active_session() {
     assert_buffer_contains(&buffer, "Search:");
     assert_buffer_contains(&buffer, "default");
     assert_buffer_contains(&buffer, "feature-a");
+}
+
+#[test]
+fn tui_session_rows_align_metadata_and_use_accordion_backgrounds() {
+    let workspace = assert_fs::TempDir::new().expect("temp workspace exists");
+    let store = SqliteWorkspaceStore::new(workspace.path());
+    store.init_workspace().expect("workspace initializes");
+    store
+        .create_run("First run".to_owned())
+        .expect("first run is created");
+    store
+        .create_run("Second run".to_owned())
+        .expect("second run is created");
+    store
+        .create_session(Some("short".to_owned()))
+        .expect("short session is created");
+    store
+        .create_session(Some("a-much-longer-session".to_owned()))
+        .expect("long session is created");
+    let mut state = TestState::new(workspace.path());
+    state
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
+    type_text(&mut state, "/sessions");
+    update(
+        &mut state,
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+
+    let buffer = render_to_buffer(&mut state, 50, 24);
+    let names = ["default", "short", "a-much-longer-session"];
+    let rows = names
+        .iter()
+        .map(|name| {
+            find_row_with_fragments(&buffer, name, "runs")
+                .unwrap_or_else(|| panic!("session row for {name:?} is rendered"))
+        })
+        .collect::<Vec<_>>();
+    let time_columns = rows
+        .iter()
+        .map(|row| fragment_column_in_row(&buffer, *row, "just now"))
+        .collect::<Vec<_>>();
+    let run_columns = rows
+        .iter()
+        .map(|row| fragment_column_in_row(&buffer, *row, "runs"))
+        .collect::<Vec<_>>();
+
+    assert!(
+        time_columns
+            .windows(2)
+            .all(|columns| columns[0] == columns[1])
+    );
+    assert!(
+        run_columns
+            .windows(2)
+            .all(|columns| columns[0] == columns[1])
+    );
+    let name_start_columns = names
+        .iter()
+        .zip(&rows)
+        .map(|(name, row)| fragment_column_in_row(&buffer, *row, name))
+        .collect::<Vec<_>>();
+    assert!(
+        name_start_columns
+            .windows(2)
+            .all(|columns| columns[0] == columns[1]),
+        "session names do not share a left edge: {name_start_columns:?}"
+    );
+    let backgrounds = rows
+        .iter()
+        .map(|row| buffer.cell((0, *row)).expect("session row has cells").bg)
+        .collect::<Vec<_>>();
+    assert_ne!(backgrounds[0], backgrounds[1]);
+    assert_ne!(backgrounds[1], backgrounds[2]);
+    assert_ne!(backgrounds[0], backgrounds[2]);
 }
 
 #[test]
@@ -3879,6 +3983,29 @@ fn find_fragment_position(buffer: &Buffer, expected: &str) -> Option<(u16, u16)>
         }
     }
     None
+}
+
+fn fragment_column_in_row(buffer: &Buffer, row: u16, expected: &str) -> u16 {
+    let area = *buffer.area();
+    let content = (area.x..area.x + area.width)
+        .filter_map(|x| buffer.cell((x, row)))
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    let byte_index = content
+        .find(expected)
+        .unwrap_or_else(|| panic!("row {row} does not contain {expected:?}: {content}"));
+    area.x + content[..byte_index].chars().count() as u16
+}
+
+fn find_row_with_fragments(buffer: &Buffer, first: &str, second: &str) -> Option<u16> {
+    let area = *buffer.area();
+    (area.y..area.y + area.height).find(|row| {
+        let content = (area.x..area.x + area.width)
+            .filter_map(|x| buffer.cell((x, *row)))
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        content.contains(first) && content.contains(second)
+    })
 }
 
 fn assert_input_row_has_background(buffer: &Buffer, y: u16, x: u16, background: Color) {
