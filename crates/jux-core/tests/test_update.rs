@@ -40,6 +40,25 @@ fn recommendation_uses_fixed_homebrew_command() {
     );
 }
 
+#[test]
+fn recommendation_uses_fixed_npm_command() {
+    let metadata = DistributionMetadata::new(
+        DistributionChannel::Npm,
+        InstallerKind::Npm,
+        "0.1.0",
+        "abcdef",
+    )
+    .expect("metadata");
+
+    let recommendation = UpdateRecommendation::for_distribution(&metadata);
+
+    assert_eq!(recommendation.channel, DistributionChannel::Npm);
+    assert_eq!(
+        recommendation.command.expect("command").display(),
+        "npm update -g @jux-2026/jux"
+    );
+}
+
 fn cache_at(last_checked_at: u64) -> UpdateCache {
     UpdateCache {
         schema_version: 1,

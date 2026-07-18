@@ -7,12 +7,14 @@ use std::thread;
 
 #[test]
 fn cli_exposes_foundation_commands() {
+    let expected_version = format!("jux {}", env!("CARGO_PKG_VERSION"));
+
     Command::cargo_bin("jux")
         .expect("jux binary exists")
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("jux 0.1.0"));
+        .stdout(predicate::str::contains(expected_version));
 
     Command::cargo_bin("jux")
         .expect("jux binary exists")

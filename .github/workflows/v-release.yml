@@ -167,6 +167,13 @@ jobs:
           # Parse out what we just built and upload it to scratch storage
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          npm_archive=$(find target/distrib -maxdepth 1 -type f -name "jux-npm-${{ join(matrix.targets, '') }}.*" ! -name "*.sha256" -print -quit)
+          if [ -z "$npm_archive" ] || [ ! -f "${npm_archive}.sha256" ]; then
+            echo "npm channel archive or checksum is missing" >&2
+            exit 1
+          fi
+          echo "$npm_archive" >> "$GITHUB_OUTPUT"
+          echo "${npm_archive}.sha256" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
@@ -187,6 +194,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
+      PLAN: ${{ needs.plan.outputs.val }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -210,6 +218,9 @@ jobs:
         run: |
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
+
+          version=$(echo "$PLAN" | jq --raw-output '.releases[] | select(.app_name == "jux") | .app_version')
+          scripts/brand-dist-npm-package.sh "$version"
 
           # Parse out what we just built and upload it to scratch storage
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
@@ -291,10 +302,45 @@ jobs:
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
+  # Publish the cargo-dist npm launcher with short-lived GitHub OIDC credentials. The package
+  # must configure this workflow filename as its npm Trusted Publisher before the first release.
+  publish-npm:
+    needs:
+      - plan
+      - host
+    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    runs-on: "ubuntu-22.04"
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      PLAN: ${{ needs.plan.outputs.val }}
+    steps:
+      - name: Fetch npm package
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: npm/
+          merge-multiple: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Publish npm package with Trusted Publishing
+        shell: bash
+        run: |
+          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith("-npm-package.tar.gz")] | any)'); do
+            package=$(echo "$release" | jq --raw-output '.artifacts[] | select(endswith("-npm-package.tar.gz"))')
+            npm publish --access public "./npm/${package}"
+          done
+
   announce:
     needs:
       - plan
       - host
+      - publish-npm
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!

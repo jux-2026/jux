@@ -93,6 +93,18 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/jux-2026/jux/releases/latest/download/jux-installer.ps1 | iex"
 ```
 
+使用 npm 全局安装：
+
+```sh
+npm install --global @jux-2026/jux
+```
+
+不进行全局安装，直接临时运行：
+
+```sh
+npx @jux-2026/jux
+```
+
 也可以从 [GitHub Releases](https://github.com/jux-2026/jux/releases)
 直接下载发布压缩包和 SHA-256 校验文件。
 

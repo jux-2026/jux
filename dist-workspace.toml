@@ -12,7 +12,11 @@ ci = "github"
 # Only v-prefixed SemVer tags are allowed to trigger a release.
 tag-namespace = "v"
 # The installers to generate for each app
-installers = ["shell", "powershell"]
+installers = ["shell", "powershell", "npm"]
+# Publish the scoped npm installer after the GitHub Release is available.
+publish-jobs = ["npm"]
+# The public npm package is @jux-2026/jux.
+npm-scope = "@jux-2026"
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in

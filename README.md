@@ -112,6 +112,18 @@ Install on Windows with PowerShell:
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/jux-2026/jux/releases/latest/download/jux-installer.ps1 | iex"
 ```
 
+Install globally with npm:
+
+```sh
+npm install --global @jux-2026/jux
+```
+
+Run a temporary npm installation without adding it globally:
+
+```sh
+npx @jux-2026/jux
+```
+
 Release archives and SHA-256 checksums can also be downloaded from
 [GitHub Releases](https://github.com/jux-2026/jux/releases).
 
