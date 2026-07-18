@@ -4397,6 +4397,26 @@ fn tui_fills_the_markdown_content_width_with_the_code_background() {
 }
 
 #[test]
+fn tui_keeps_makefile_code_background_across_blank_and_tabbed_lines() {
+    let mut state = TestState::new("/workspace");
+    update(
+        &mut state,
+        AppMsg::AssistantMessage {
+            content: "```Makefile\n.PHONY: build\n\nbuild:\n\tcargo build\n```".to_owned(),
+        },
+    );
+
+    let buffer = render_to_buffer(&mut state, 100, 30);
+    let (phony_y, code_x) =
+        find_fragment_position(&buffer, ".PHONY: build").expect("buffer contains the first line");
+    let (recipe_y, _) =
+        find_fragment_position(&buffer, "cargo build").expect("buffer contains the recipe line");
+    let code_background = Color::Rgb(24, 28, 34);
+    assert_row_has_background(&buffer, phony_y + 1, code_x, code_x + 35, code_background);
+    assert_row_has_background(&buffer, recipe_y, code_x, code_x + 35, code_background);
+}
+
+#[test]
 fn tui_highlights_common_fenced_code_language_aliases() {
     for language in ["ts", "typescript", "tsx"] {
         let mut state = TestState::new("/workspace");

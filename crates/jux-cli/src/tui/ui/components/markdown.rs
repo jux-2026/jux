@@ -1,6 +1,7 @@
 use std::sync::LazyLock;
 use std::time::Instant;
 
+use super::super::text::expand_tabs;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -362,10 +363,12 @@ fn syntax_for_language(language: &str) -> Option<&'static SyntaxReference> {
 }
 
 fn padded_code_line(mut spans: Vec<Span<'static>>, maximum_width: usize) -> Line<'static> {
-    let width = spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum::<usize>();
+    let mut width = 0;
+    for span in &mut spans {
+        let expanded = expand_tabs(span.content.as_ref(), width);
+        width = width.saturating_add(UnicodeWidthStr::width(expanded.as_str()));
+        span.content = expanded.into();
+    }
     spans.push(Span::styled(
         " ".repeat(maximum_width.saturating_sub(width)),
         code_style(Color::White, FontStyle::empty()),
