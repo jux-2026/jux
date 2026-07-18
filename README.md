@@ -1,30 +1,82 @@
-# jux
+# Jux
 
-`jux` is the open-source agent-side monorepo for Jux.
+[English](README.md) | [简体中文](docs/zh-CN/README.md)
 
-The current scope provides a small local runtime foundation: a Rust workspace,
-a core crate, a CLI crate, SQLite-backed local state, and a minimal LLM-backed
-`jux run` command.
+> [!WARNING]
+> Jux is in an early stage of development. Many planned features are incomplete,
+> behavior and interfaces may change without notice, and the project has not yet
+> received the security hardening required for production use. **Do not use Jux
+> in production environments.**
 
-## Repository Shape
+Jux is an open-source, security-oriented programming agent. It is being built to
+provide auditable, controllable, and extensible AI-assisted software development
+through a local runtime and multiple client interfaces.
 
-`jux` is an independent open-source repository. In the private root project, it is consumed as a Git submodule.
+This repository contains the agent-side Rust monorepo. It currently focuses on
+the runtime foundation, command-line interface, and terminal user interface.
+
+## Project Status
+
+Jux is currently a work in progress rather than a finished product. The existing
+implementation is suitable for development, experimentation, and early feedback,
+but not for production workloads or sensitive repositories.
+
+The project does not yet have public product documentation. Product concepts,
+use cases, and complete user workflows will be documented in a future release.
+Until then, this README describes only the capabilities that already exist in the
+repository.
+
+## Current Capabilities
+
+- A Rust-based local agent runtime and CLI.
+- A terminal user interface built with Ratatui.
+- Workspace, session, run, and step lifecycle management.
+- SQLite-backed local state stored under the workspace `.jux` directory.
+- Multi-iteration LLM execution through the DeepSeek provider.
+- Native, Lua, and WASM tools with runtime policy checks.
+- Skill discovery, explicit or model-selected invocation, isolated transcripts,
+  and resume support.
+- Persisted human clarification and confirmation flows.
+- Session timelines, cancellation, and code-change review in the TUI.
+- Parallel task execution, context management, streaming events, and Plan mode
+  foundations that are still evolving.
+
+This list is not a stability guarantee. Some capabilities remain partial and may
+be redesigned as the runtime matures.
+
+## Documentation
+
+English is the default documentation language. Translations are organized in
+language-specific directories under `docs/`:
+
+- [简体中文文档](docs/zh-CN/README.md)
+
+Public product documentation is not available yet and will be added as the
+product definition matures.
+
+## Repository Structure
 
 ```text
 jux
 ├── crates
 │   ├── jux-core
 │   └── jux-cli
+├── docs
+│   └── zh-CN
 ├── AGENTS.md
 ├── Cargo.toml
 ├── Makefile
 └── README.md
 ```
 
-## Install
+- `crates/jux-core` contains the core domain model and runtime behavior.
+- `crates/jux-cli` contains the `jux` binary, CLI adapter, and TUI client.
 
-Prebuilt binaries are published through GitHub Releases for Apple Silicon
-macOS, x86_64 Linux, and x86_64 Windows.
+## Installation
+
+Prebuilt binaries are published through GitHub Releases for Apple Silicon macOS,
+x86_64 Linux, and x86_64 Windows. These packages are development previews and
+carry the same non-production warning as the source repository.
 
 Install on macOS or Linux with the shell installer:
 
@@ -39,49 +91,49 @@ Install on Windows with PowerShell:
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/jux-2026/jux/releases/latest/download/jux-installer.ps1 | iex"
 ```
 
-Release archives and SHA-256 checksums can also be downloaded directly from
-the [GitHub Releases](https://github.com/jux-2026/jux/releases) page.
+Release archives and SHA-256 checksums can also be downloaded from
+[GitHub Releases](https://github.com/jux-2026/jux/releases).
 
-Verify the installation with:
+Verify the installation:
 
 ```sh
 jux --version
 ```
 
-Check for a newer version and display the upgrade method for the embedded
-distribution channel:
+Check for a newer version and display the upgrade method associated with the
+embedded distribution channel:
 
 ```sh
 jux update --check
 ```
 
-The TUI performs the same check in the background at most once every 24 hours.
-An available version is shown on the next startup and at the bottom of the
-right sidebar. Jux recommends a fixed package-manager or installer command; it
-does not execute that command automatically.
+The TUI checks for updates in the background at most once every 24 hours. Jux
+only recommends the appropriate update command; it does not execute that command
+automatically.
 
-## Release Process
+## Quick Start
 
-Releases use cargo-dist inside GitHub Actions. Each platform is compiled once,
-then a release step injects a fixed 1 KiB distribution metadata slot before
-the final archive, signature, and checksum are produced. A tag whose version
-matches the Cargo workspace version publishes the platform archives,
-checksums, and both installers:
+Set a DeepSeek API key and run a request in a local workspace:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+export JUX_DEEPSEEK_API_KEY="..."
+jux run "Explain this project" --workspace /path/to/workspace
 ```
 
-Before pushing a release tag, run the full quality gate and inspect the release
-plan:
+Structured command output is available through the top-level `--output` option:
 
 ```sh
-make check
-make release-plan
+jux --output json run "Explain this project"
+jux --output yaml run "Explain this project"
 ```
 
-## Commands
+Running Jux initializes `.jux/state.db` in the selected workspace. Review the
+permissions and generated changes carefully, especially when experimenting with
+tools that can execute commands or modify files.
+
+## Development
+
+The workspace requires Rust 1.91 or later. Run commands from the repository root:
 
 ```sh
 make build
@@ -90,56 +142,17 @@ make fmt
 make lint
 make quick-check
 make check
-make release-plan
 ```
 
-The direct Cargo equivalents are:
+`make quick-check` runs formatting and lint checks. `make check` runs the full
+local quality gate: formatting, linting, and tests.
 
-```sh
-cargo build --workspace
-cargo test --workspace
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-`make quick-check` runs format and lint checks. `make check` runs the full local quality gate: format, lint, and tests.
-
-## Git Hooks
-
-Enable repository-managed Git hooks:
+Enable the repository-managed Git hooks with:
 
 ```sh
 git config core.hooksPath .githooks
 ```
 
-After that, every commit runs the fast local gate:
+## License
 
-```sh
-make quick-check
-```
-
-Every push runs the full local gate:
-
-```sh
-make check
-```
-
-## Minimal Run Command
-
-Run a request through the minimal local agent loop:
-
-```sh
-export JUX_DEEPSEEK_API_KEY="..."
-cargo run -p jux -- run "Explain this project" --workspace /path/to/workspace
-```
-
-Structured output is available from the top-level `--output` option:
-
-```sh
-cargo run -p jux -- --output json run "Explain this project"
-cargo run -p jux -- --output yaml run "Explain this project"
-```
-
-The command initializes `.jux/state.db`, creates the active Workspace and
-Session when needed, creates a Run, records the current Step timeline, calls the
-configured LLM provider, and stores the final status.
+Jux is available under the [MIT License](LICENSE).

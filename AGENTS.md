@@ -98,3 +98,6 @@ git config core.hooksPath .githooks
 - Keep `make quick-check` passing before committing.
 - Keep `make check` passing before pushing or merging.
 - Keep public documentation and messages in English.
+- Treat English documentation as the source of truth. When updating a document
+  that has translations under `docs/<language-tag>/`, update every existing
+  translation in the same change so that all language versions stay aligned.
