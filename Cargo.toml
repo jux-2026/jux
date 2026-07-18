@@ -30,6 +30,7 @@ shlex = "2.0.1"
 tokio = { version = "1.51.1", features = ["rt", "rt-multi-thread"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
 unicode-width = "0.2.0"
 uuid = { version = "=1.18.1", features = ["v4"] }
 wasmer = "7.1.0"

@@ -1,10 +1,19 @@
+use std::sync::LazyLock;
+
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use two_face::re_exports::syntect::easy::HighlightLines;
+use two_face::re_exports::syntect::highlighting::FontStyle;
+use two_face::re_exports::syntect::parsing::{SyntaxReference, SyntaxSet};
+use two_face::re_exports::syntect::util::LinesWithEndings;
+use two_face::theme::{EmbeddedLazyThemeSet, EmbeddedThemeName};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const CODE_BACKGROUND: Color = Color::Rgb(24, 28, 34);
 const INLINE_CODE_BACKGROUND: Color = Color::Rgb(38, 44, 52);
+static CODE_SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
+static CODE_THEMES: LazyLock<EmbeddedLazyThemeSet> = LazyLock::new(two_face::theme::extra);
 
 pub(super) struct MarkdownRenderer {
     maximum_width: usize,
@@ -35,7 +44,7 @@ struct RenderState {
     styles: Vec<Style>,
     lists: Vec<Option<u64>>,
     quote_depth: usize,
-    code_block: Option<String>,
+    code_block: Option<CodeBlock>,
     table: Option<TableState>,
 }
 
@@ -118,11 +127,10 @@ impl RenderState {
                     }
                     _ => "code".to_owned(),
                 };
-                self.lines.push(Line::styled(
-                    format!(" {language} "),
-                    Style::default().fg(Color::DarkGray).bg(CODE_BACKGROUND),
-                ));
-                self.code_block = Some(String::new());
+                self.code_block = Some(CodeBlock {
+                    language,
+                    source: String::new(),
+                });
             }
             Tag::List(start) => self.lists.push(start),
             Tag::Item => {
@@ -226,7 +234,7 @@ impl RenderState {
 
     fn text(&mut self, text: &str) {
         if let Some(code) = &mut self.code_block {
-            code.push_str(text);
+            code.source.push_str(text);
         } else {
             self.current
                 .push(Span::styled(text.to_owned(), self.style()));
@@ -256,13 +264,7 @@ impl RenderState {
 
     fn finish_code_block(&mut self) {
         if let Some(code) = self.code_block.take() {
-            self.lines
-                .extend(code.trim_end_matches('\n').lines().map(|line| {
-                    Line::styled(
-                        format!(" {line}"),
-                        Style::default().fg(Color::White).bg(CODE_BACKGROUND),
-                    )
-                }));
+            self.lines.extend(code.render(self.maximum_width));
         }
     }
 
@@ -280,6 +282,102 @@ impl RenderState {
         self.flush_line();
         self.lines
     }
+}
+
+struct CodeBlock {
+    language: String,
+    source: String,
+}
+
+impl CodeBlock {
+    fn render(&self, maximum_width: usize) -> Vec<Line<'static>> {
+        let Some(syntax) = syntax_for_language(&self.language) else {
+            return self.render_plain_text(maximum_width);
+        };
+        let theme = CODE_THEMES.get(EmbeddedThemeName::Nord);
+        let mut highlighter = HighlightLines::new(syntax, theme);
+        let source = self.source.trim_end_matches('\n');
+        let mut lines = Vec::new();
+        for source_line in LinesWithEndings::from(source) {
+            let Ok(regions) = highlighter.highlight_line(source_line, &CODE_SYNTAXES) else {
+                return self.render_plain_text(maximum_width);
+            };
+            let mut spans = vec![Span::styled(
+                " ",
+                code_style(Color::White, FontStyle::empty()),
+            )];
+            spans.extend(regions.into_iter().filter_map(|(style, text)| {
+                let text = text.trim_end_matches(['\r', '\n']);
+                (!text.is_empty()).then(|| {
+                    Span::styled(
+                        text.to_owned(),
+                        code_style(
+                            Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b),
+                            style.font_style,
+                        ),
+                    )
+                })
+            }));
+            lines.push(padded_code_line(spans, maximum_width));
+        }
+        lines
+    }
+
+    fn render_plain_text(&self, maximum_width: usize) -> Vec<Line<'static>> {
+        self.source
+            .trim_end_matches('\n')
+            .lines()
+            .map(|line| {
+                padded_code_line(
+                    vec![Span::styled(
+                        format!(" {line}"),
+                        code_style(Color::White, FontStyle::empty()),
+                    )],
+                    maximum_width,
+                )
+            })
+            .collect()
+    }
+}
+
+fn syntax_for_language(language: &str) -> Option<&'static SyntaxReference> {
+    let language = language.trim().to_ascii_lowercase();
+    let token = match language.as_str() {
+        "shell" | "sh" | "zsh" => "bash",
+        "jsx" => "js",
+        "csharp" => "cs",
+        other => other,
+    };
+    CODE_SYNTAXES.find_syntax_by_token(token)
+}
+
+fn padded_code_line(mut spans: Vec<Span<'static>>, maximum_width: usize) -> Line<'static> {
+    let width = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    spans.push(Span::styled(
+        " ".repeat(maximum_width.saturating_sub(width)),
+        code_style(Color::White, FontStyle::empty()),
+    ));
+    Line::from(spans)
+}
+
+fn code_style(foreground: Color, font_style: FontStyle) -> Style {
+    let mut modifiers = Modifier::empty();
+    if font_style.contains(FontStyle::BOLD) {
+        modifiers.insert(Modifier::BOLD);
+    }
+    if font_style.contains(FontStyle::ITALIC) {
+        modifiers.insert(Modifier::ITALIC);
+    }
+    if font_style.contains(FontStyle::UNDERLINE) {
+        modifiers.insert(Modifier::UNDERLINED);
+    }
+    Style::default()
+        .fg(foreground)
+        .bg(CODE_BACKGROUND)
+        .add_modifier(modifiers)
 }
 
 #[derive(Default)]

@@ -3483,6 +3483,25 @@ fn assert_buffer_fragment_has_foreground(buffer: &Buffer, expected: &str, foregr
     );
 }
 
+fn assert_buffer_fragments_have_different_foregrounds(buffer: &Buffer, first: &str, second: &str) {
+    let (first_y, first_x) = find_fragment_position(buffer, first)
+        .unwrap_or_else(|| panic!("buffer does not contain fragment {first:?}"));
+    let (second_y, second_x) = find_fragment_position(buffer, second)
+        .unwrap_or_else(|| panic!("buffer does not contain fragment {second:?}"));
+    let first_foreground = buffer
+        .cell((first_x, first_y))
+        .expect("first cell exists")
+        .fg;
+    let second_foreground = buffer
+        .cell((second_x, second_y))
+        .expect("second cell exists")
+        .fg;
+    assert_ne!(
+        first_foreground, second_foreground,
+        "fragments {first:?} and {second:?} have the same foreground"
+    );
+}
+
 fn assert_row_has_background(buffer: &Buffer, y: u16, start: u16, end: u16, background: Color) {
     assert!(
         (start..end).all(|x| buffer
@@ -3787,7 +3806,7 @@ fn tui_renders_markdown_and_code_blocks_with_terminal_styles() {
     assert_buffer_contains(&buffer, "Heading");
     assert_buffer_contains(&buffer, "• item");
     assert_buffer_contains(&buffer, "│ quote");
-    assert_buffer_contains(&buffer, "rust");
+    assert_buffer_does_not_contain(&buffer, "rust");
     assert_buffer_contains(&buffer, "┌");
     assert_buffer_contains(&buffer, "┬");
     assert_buffer_contains(&buffer, "┐");
@@ -3797,6 +3816,97 @@ fn tui_renders_markdown_and_code_blocks_with_terminal_styles() {
     assert_buffer_contains(&buffer, "cargo test");
     assert_buffer_does_not_contain(&buffer, "`cargo test`");
     assert_buffer_fragment_has_fg_bg(&buffer, "cargo test", Color::Yellow, Color::Rgb(38, 44, 52));
+}
+
+#[test]
+fn tui_highlights_fenced_code_for_a_known_language() {
+    let mut state = AppState::new("/workspace");
+    update(
+        &mut state,
+        AppAction::AssistantMessage {
+            content: "```rust\nlet syntax_probe = \"highlighted\";\n```".to_owned(),
+        },
+    );
+
+    let buffer = render_to_buffer(&state, 100, 30);
+    assert_buffer_fragments_have_different_foregrounds(&buffer, "let", "highlighted");
+    assert_buffer_fragment_has_background(&buffer, "let", Color::Rgb(24, 28, 34));
+    assert_buffer_fragment_has_background(&buffer, "highlighted", Color::Rgb(24, 28, 34));
+}
+
+#[test]
+fn tui_fills_the_markdown_content_width_with_the_code_background() {
+    let mut state = AppState::new("/workspace");
+    update(
+        &mut state,
+        AppAction::AssistantMessage {
+            content: "```rust\nlet width_probe = 1;\n\nwidth_probe\n```".to_owned(),
+        },
+    );
+
+    let buffer = render_to_buffer(&state, 100, 30);
+    let (code_y, code_x) = find_fragment_position(&buffer, "width_probe = 1")
+        .expect("buffer contains the first code line");
+    assert_row_has_background(&buffer, code_y, code_x, code_x + 35, Color::Rgb(24, 28, 34));
+    assert_row_has_background(
+        &buffer,
+        code_y + 1,
+        code_x,
+        code_x + 35,
+        Color::Rgb(24, 28, 34),
+    );
+}
+
+#[test]
+fn tui_highlights_common_fenced_code_language_aliases() {
+    for language in ["ts", "typescript", "tsx"] {
+        let mut state = AppState::new("/workspace");
+        update(
+            &mut state,
+            AppAction::AssistantMessage {
+                content: format!(
+                    "```{language}\nconst syntaxAliasProbe: string = \"highlighted\";\n```"
+                ),
+            },
+        );
+
+        let buffer = render_to_buffer(&state, 100, 30);
+        assert_buffer_fragments_have_different_foregrounds(&buffer, "const", "highlighted");
+    }
+
+    for language in ["js", "javascript", "jsx"] {
+        let mut state = AppState::new("/workspace");
+        update(
+            &mut state,
+            AppAction::AssistantMessage {
+                content: format!("```{language}\nconst syntaxAliasProbe = \"highlighted\";\n```"),
+            },
+        );
+
+        let buffer = render_to_buffer(&state, 100, 30);
+        assert_buffer_fragments_have_different_foregrounds(&buffer, "const", "highlighted");
+    }
+}
+
+#[test]
+fn tui_falls_back_to_plain_text_without_a_known_code_language() {
+    for opening_fence in ["```", "```not-a-language"] {
+        let mut state = AppState::new("/workspace");
+        update(
+            &mut state,
+            AppAction::AssistantMessage {
+                content: format!("{opening_fence}\nplain fallback content\n```"),
+            },
+        );
+
+        let buffer = render_to_buffer(&state, 100, 30);
+        assert_buffer_fragment_has_fg_bg(
+            &buffer,
+            "plain fallback content",
+            Color::White,
+            Color::Rgb(24, 28, 34),
+        );
+    }
 }
 
 #[test]
