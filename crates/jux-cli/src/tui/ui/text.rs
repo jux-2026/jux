@@ -1,8 +1,10 @@
+use super::RenderState;
 use super::theme::selection_style;
+use crate::tui::SelectionPanel;
 use crate::tui::TextSelectionPoint;
-use crate::tui::{AppState, SelectionPanel};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MAX_TIMELINE_DETAIL_CHARS: usize = 80;
@@ -57,7 +59,7 @@ pub(super) fn truncate_timeline_detail(content: &str) -> String {
 }
 
 pub(super) fn apply_text_selection<'a>(
-    state: &AppState,
+    state: &RenderState<'_>,
     panel: SelectionPanel,
     line_offset: usize,
     lines: Vec<Line<'a>>,
@@ -68,8 +70,10 @@ pub(super) fn apply_text_selection<'a>(
     if selection.panel != panel {
         return lines;
     }
+    let started = Instant::now();
+    let input_lines = lines.len();
     let (start, end) = ordered_points(selection.anchor, selection.focus);
-    lines
+    let selected_lines = lines
         .into_iter()
         .enumerate()
         .map(|(index, line)| {
@@ -90,7 +94,17 @@ pub(super) fn apply_text_selection<'a>(
             };
             selected_line(&text, start_column, end_column)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    tracing::debug!(
+        target: "jux::selection_perf",
+        ?panel,
+        input_lines,
+        selected_start_line = start.line,
+        selected_end_line = end.line,
+        elapsed_us = %started.elapsed().as_micros(),
+        "[DEBUG-selection-perf] selection style applied"
+    );
+    selected_lines
 }
 
 fn line_text(line: &Line<'_>) -> String {

@@ -1,17 +1,16 @@
-use super::ui::conversation_max_scroll;
+use super::ui::UiEvent;
 use super::{
-    AppAction, AppCommand, AppState, BackgroundRun, FileIndexService, RunHandler, RunResponse,
+    AppCommand, AppModel, AppMsg, BackgroundRun, FileIndexService, RunHandler, RunResponse, TuiApp,
     TuiRunRequest, TuiRuntimeInfo, TuiViewport, assign_default_session_title,
-    execute_code_change_command, execute_session_command, load_active_session_history,
-    materialize_pending_new_session, render_app, update,
+    load_active_session_history, update,
 };
 use super::{EventHandler, TuiEvent};
 use anyhow::Result;
 use crossterm::Command;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
-    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -78,7 +77,7 @@ pub fn run_tui(
 ) -> Result<()> {
     let store = SqliteWorkspaceStore::new(&workspace_root);
     let workspace = store.init_workspace()?;
-    let mut state = AppState::new(&workspace_root);
+    let mut state = AppModel::new(&workspace_root);
     runtime_info.workspace_id = Some(workspace.id.to_string());
     state.set_runtime_info(runtime_info);
     state.set_skill_catalog(skill_catalog);
@@ -99,7 +98,7 @@ pub fn run_tui(
         let show_startup_message = cache.needs_startup_notification();
         update(
             &mut state,
-            AppAction::UpdateAvailable {
+            AppMsg::UpdateAvailable {
                 notice: update_notice(&cache, &distribution),
                 show_startup_message,
             },
@@ -112,9 +111,11 @@ pub fn run_tui(
     }
     let update_receiver = start_update_checks(distribution);
     let (mut terminal, keyboard_enhancement_enabled) = setup_terminal()?;
+    let mut app = TuiApp::new(state);
+    app.restore_session_ui();
     let run_result = run_app_loop(
         &mut terminal,
-        &mut state,
+        &mut app,
         &store,
         Arc::new(run_handler),
         update_receiver,
@@ -153,63 +154,46 @@ fn setup_terminal() -> Result<(Terminal<CrosstermBackend<io::Stdout>>, bool)> {
 
 fn run_app_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    state: &mut AppState,
+    app: &mut TuiApp,
     store: &SqliteWorkspaceStore,
     run_handler: Arc<dyn RunHandler>,
     update_receiver: Receiver<UpdateNotice>,
 ) -> Result<()> {
     let mut active_run: Option<BackgroundRun> = None;
-    let file_index = FileIndexService::start(state.workspace_root.clone());
-    let event_handler = EventHandler::new();
+    let file_index = FileIndexService::start(app.model().workspace_root.clone());
+    let mut event_handler = EventHandler::new();
     // Temporary 10 FPS cap for comparing terminal output responsiveness.
     let target_frame = Duration::from_millis(100);
     let mut next_frame = Instant::now();
-    let mut pending_scroll_delta: i32 = 0;
-    let mut conversation_layout_dirty = true;
-    let mut previous_terminal_size = None;
-    while !state.should_quit {
+    while !app.model().should_quit {
         if let Ok(notice) = update_receiver.try_recv() {
-            update(
-                state,
-                AppAction::UpdateAvailable {
-                    notice,
-                    show_startup_message: false,
-                },
-            );
+            app.update(AppMsg::UpdateAvailable {
+                notice,
+                show_startup_message: false,
+            });
             next_frame = Instant::now();
         }
         if let Some(snapshot) = file_index.try_recv_latest() {
-            update(state, AppAction::FileIndexUpdated(snapshot));
+            app.update(AppMsg::FileIndexUpdated(snapshot));
             next_frame = Instant::now();
         }
         if Instant::now() >= next_frame {
             let size = terminal.size()?;
-            if previous_terminal_size != Some(size) {
-                conversation_layout_dirty = true;
-                previous_terminal_size = Some(size);
-            }
-            // Building the conversation layout parses the complete persisted
-            // history. Recomputing its scroll range before every input-frame
-            // used to build that history twice per keystroke. Only structural
-            // conversation or viewport changes need a new maximum.
-            if conversation_layout_dirty {
-                let conversation_width = state.conversation_panel_width(size.width);
-                let area = ratatui::layout::Rect::new(0, 0, conversation_width, size.height);
-                state.clamp_conversation_scroll_to(conversation_max_scroll(state, area));
-                conversation_layout_dirty = false;
-            }
-            if pending_scroll_delta != 0 {
-                state.apply_scroll_delta(pending_scroll_delta);
-                pending_scroll_delta = 0;
-            }
             let draw_started = Instant::now();
-            terminal.draw(|frame| render_app(frame, state))?;
+            terminal.draw(|frame| app.render(frame))?;
             let draw_elapsed = draw_started.elapsed();
+            tracing::debug!(
+                target: "jux::selection_perf",
+                elapsed_us = %draw_elapsed.as_micros(),
+                selection_active = app.text_selection().is_some(),
+                viewport_width = size.width,
+                viewport_height = size.height,
+                "[DEBUG-selection-perf] frame rendered"
+            );
             next_frame = Instant::now() + target_frame.max(draw_elapsed);
         }
         while let Some(event) = active_run.as_ref().and_then(BackgroundRun::try_recv_event) {
-            update(state, AppAction::AgentEvent(event));
-            conversation_layout_dirty = true;
+            app.update(AppMsg::AgentEvent(event));
         }
         if let Some(result) = active_run.as_ref().and_then(BackgroundRun::try_recv) {
             let was_canceled = active_run
@@ -217,11 +201,10 @@ fn run_app_loop(
                 .is_some_and(BackgroundRun::is_cancel_requested);
             active_run = None;
             if was_canceled {
-                update(state, AppAction::RunCanceled);
+                app.update(AppMsg::RunCanceled);
             } else {
-                apply_run_result(state, result);
+                apply_run_result(app.model_mut(), result);
             }
-            conversation_layout_dirty = true;
             continue;
         }
         let input_wait = next_frame
@@ -231,17 +214,20 @@ fn run_app_loop(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
             Ok(event) => {
-                let event = match event {
+                let (event, event_queue_delay) = match event {
                     TuiEvent::ScrollDelta { delta, .. } => {
-                        let starts_new_scroll = pending_scroll_delta == 0;
-                        pending_scroll_delta = pending_scroll_delta.saturating_add(delta);
-                        if starts_new_scroll && pending_scroll_delta != 0 {
-                            conversation_layout_dirty = true;
-                            next_frame = Instant::now();
-                        }
+                        let size = terminal.size()?;
+                        app.dispatch(
+                            UiEvent::Scroll(delta),
+                            TuiViewport {
+                                width: size.width,
+                                height: size.height,
+                            },
+                        );
+                        next_frame = Instant::now();
                         continue;
                     }
-                    TuiEvent::Terminal(event) => event,
+                    TuiEvent::Terminal { event, queued_at } => (event, queued_at.elapsed()),
                     TuiEvent::Closed => break,
                 };
                 // Clicks, drags, and keyboard input must be visible immediately;
@@ -253,41 +239,54 @@ fn run_app_loop(
                 )) {
                     next_frame = Instant::now();
                 }
-                let action = match event {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        Some(AppAction::Key(key))
-                    }
-                    Event::Mouse(event) => {
-                        let size = terminal.size()?;
-                        Some(AppAction::Mouse {
-                            event,
-                            viewport: TuiViewport {
-                                width: size.width,
-                                height: size.height,
-                            },
-                        })
+                let size = terminal.size()?;
+                let viewport = TuiViewport {
+                    width: size.width,
+                    height: size.height,
+                };
+                let Some(ui_event) = UiEvent::from_crossterm(event) else {
+                    continue;
+                };
+                let selection_event = match &ui_event {
+                    UiEvent::Mouse(event)
+                        if matches!(
+                            event.kind,
+                            MouseEventKind::Down(MouseButton::Left)
+                                | MouseEventKind::Drag(MouseButton::Left)
+                                | MouseEventKind::Up(MouseButton::Left)
+                        ) =>
+                    {
+                        Some(event.kind)
                     }
                     _ => None,
                 };
-                let Some(action) = action else {
-                    continue;
-                };
-                if action_changes_conversation_layout(state, &action) {
-                    conversation_layout_dirty = true;
+                let update_started = Instant::now();
+                let dispatch = app.dispatch(ui_event, viewport);
+                if let Some(kind) = selection_event {
+                    tracing::debug!(
+                        target: "jux::selection_perf",
+                        ?kind,
+                        queue_delay_us = %event_queue_delay.as_micros(),
+                        elapsed_us = %update_started.elapsed().as_micros(),
+                        "[DEBUG-selection-perf] mouse selection event updated"
+                    );
                 }
-                if let Some(command) = update(state, action) {
-                    if execute_code_change_command(state, &command)? {
+                if let Some(command) = dispatch.command {
+                    if app.execute_code_change_command(&command)? {
                         continue;
                     }
-                    if execute_session_command(state, store, &command)? {
+                    if app.execute_session_command(store, &command)? {
                         continue;
                     }
                     match command {
                         AppCommand::StartRun { request } => {
-                            materialize_pending_new_session(state, store, &request)?;
-                            assign_default_session_title(state, store, &request)?;
+                            app.materialize_pending_new_session(store, &request)?;
+                            assign_default_session_title(app.model_mut(), store, &request)?;
                             active_run = Some(BackgroundRun::start(
-                                TuiRunRequest::new(request, state.selected_skill_names().to_vec()),
+                                TuiRunRequest::new(
+                                    request,
+                                    app.model().selected_skill_names().to_vec(),
+                                ),
                                 Arc::clone(&run_handler),
                             ));
                         }
@@ -301,7 +300,10 @@ fn run_app_loop(
                                 "Revise the current code change proposal.\nFeedback: {feedback}"
                             );
                             active_run = Some(BackgroundRun::start(
-                                TuiRunRequest::new(request, state.selected_skill_names().to_vec()),
+                                TuiRunRequest::new(
+                                    request,
+                                    app.model().selected_skill_names().to_vec(),
+                                ),
                                 Arc::clone(&run_handler),
                             ));
                         }
@@ -356,23 +358,6 @@ fn update_notice(cache: &UpdateCache, distribution: &DistributionMetadata) -> Up
         latest_version: cache.latest_version.clone(),
         release_url: cache.release_url.clone(),
         recommendation: UpdateRecommendation::for_distribution(distribution),
-    }
-}
-
-fn action_changes_conversation_layout(state: &AppState, action: &AppAction) -> bool {
-    // Editing the input and moving its cursor do not change history geometry.
-    // Keep these actions out of the expensive conversation layout path.
-    match action {
-        AppAction::FileIndexUpdated(_) => false,
-        AppAction::Key(key) => match key.code {
-            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::Tab => false,
-            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => false,
-            KeyCode::Up | KeyCode::Down => state.input_text().is_empty(),
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => false,
-            _ => true,
-        },
-        AppAction::Mouse { .. } => true,
-        _ => true,
     }
 }
 
@@ -608,13 +593,13 @@ impl Command for EnableTuiMouseCapture {
     }
 }
 
-fn apply_run_result(state: &mut AppState, result: Result<RunResponse, String>) {
+fn apply_run_result(state: &mut AppModel, result: Result<RunResponse, String>) {
     match result {
         Ok(response) => {
-            update(state, AppAction::RunFinished { response });
+            update(state, AppMsg::RunFinished { response });
         }
         Err(error) => {
-            update(state, AppAction::RunFailed { error });
+            update(state, AppMsg::RunFailed { error });
         }
     }
 }

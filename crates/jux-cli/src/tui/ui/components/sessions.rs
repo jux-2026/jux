@@ -1,15 +1,19 @@
+use super::super::RenderState;
 use super::super::theme::palette;
-use crate::tui::AppState;
-use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Padding, Paragraph};
+use ratatui::widgets::{Block, Padding, Paragraph, Widget};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SELECTED_BACKGROUND: Color = Color::Rgb(40, 52, 64);
 
-pub(in crate::tui::ui) fn render(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
+pub(in crate::tui::ui) fn render(
+    buffer: &mut Buffer,
+    state: &RenderState<'_>,
+    area: Rect,
+) -> Position {
     let background = palette(state.theme()).conversation;
     let regions = Layout::default()
         .direction(Direction::Vertical)
@@ -31,7 +35,7 @@ pub(in crate::tui::ui) fn render(frame: &mut Frame<'_>, state: &AppState, area: 
     ]))
     .style(Style::default().bg(background))
     .block(Block::default().padding(Padding::vertical(1)));
-    frame.render_widget(search, regions[0]);
+    search.render(regions[0], buffer);
 
     let width = regions[1].width.saturating_sub(1) as usize;
     let sessions = state.filtered_sessions();
@@ -82,17 +86,14 @@ pub(in crate::tui::ui) fn render(frame: &mut Frame<'_>, state: &AppState, area: 
             Style::default().fg(Color::DarkGray),
         ));
     }
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(background)),
-        regions[1],
-    );
-    frame.render_widget(
-        Paragraph::new(
-            " Ctrl+N new  Ctrl+D delete  Ctrl+A archive  ↑/↓ select  Enter switch  Ctrl+L pin",
-        )
-        .style(Style::default().fg(Color::DarkGray).bg(background)),
-        regions[2],
-    );
+    Paragraph::new(lines)
+        .style(Style::default().bg(background))
+        .render(regions[1], buffer);
+    Paragraph::new(
+        " Ctrl+N new  Ctrl+D delete  Ctrl+A archive  ↑/↓ select  Enter switch  Ctrl+L pin",
+    )
+    .style(Style::default().fg(Color::DarkGray).bg(background))
+    .render(regions[2], buffer);
 
     let query_width = value.chars().count() as u16;
     let cursor_x = regions[0]
@@ -100,7 +101,7 @@ pub(in crate::tui::ui) fn render(frame: &mut Frame<'_>, state: &AppState, area: 
         .saturating_add(9)
         .saturating_add(query_width)
         .min(regions[0].right().saturating_sub(1));
-    frame.set_cursor_position(Position::new(cursor_x, regions[0].y.saturating_add(1)));
+    Position::new(cursor_x, regions[0].y.saturating_add(1))
 }
 
 fn relative_time(age_millis: u128) -> String {

@@ -8,13 +8,13 @@
 use crossterm::event::{self, Event};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Events emitted by [`EventHandler`].
 #[derive(Debug)]
 pub enum TuiEvent {
     /// A Crossterm event (key, mouse, resize, paste, ...).
-    Terminal(Event),
+    Terminal { event: Event, queued_at: Instant },
     /// A burst of wheel reports reduced to one scroll delta (five rows per report).
     ScrollDelta { delta: i32, column: u16, row: u16 },
     /// The reader stopped, usually because the application is shutting down.
@@ -24,6 +24,7 @@ pub enum TuiEvent {
 /// Dedicated Crossterm event reader backed by a channel.
 pub struct EventHandler {
     receiver: Receiver<TuiEvent>,
+    pending: Option<TuiEvent>,
     reader: Option<JoinHandle<()>>,
 }
 
@@ -56,7 +57,13 @@ impl EventHandler {
                                             return;
                                         }
                                         pending_scroll = None;
-                                        if sender.send(TuiEvent::Terminal(next)).is_err() {
+                                        if sender
+                                            .send(TuiEvent::Terminal {
+                                                event: next,
+                                                queued_at: Instant::now(),
+                                            })
+                                            .is_err()
+                                        {
                                             return;
                                         }
                                         break;
@@ -74,7 +81,13 @@ impl EventHandler {
                                         break;
                                     }
                                 }
-                            } else if sender.send(TuiEvent::Terminal(event)).is_err() {
+                            } else if sender
+                                .send(TuiEvent::Terminal {
+                                    event,
+                                    queued_at: Instant::now(),
+                                })
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -88,23 +101,48 @@ impl EventHandler {
         });
         Self {
             receiver,
+            pending: None,
             reader: Some(reader),
         }
     }
 
     /// Waits for the next event.
-    pub fn recv(&self) -> Result<TuiEvent, mpsc::RecvError> {
-        self.receiver.recv()
+    pub fn recv(&mut self) -> Result<TuiEvent, mpsc::RecvError> {
+        let event = match self.pending.take() {
+            Some(event) => event,
+            None => self.receiver.recv()?,
+        };
+        Ok(coalesce_drag_events(
+            event,
+            &self.receiver,
+            &mut self.pending,
+        ))
     }
 
     /// Waits for the next event until the application must process background work.
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<TuiEvent, RecvTimeoutError> {
-        self.receiver.recv_timeout(timeout)
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<TuiEvent, RecvTimeoutError> {
+        let event = match self.pending.take() {
+            Some(event) => event,
+            None => self.receiver.recv_timeout(timeout)?,
+        };
+        Ok(coalesce_drag_events(
+            event,
+            &self.receiver,
+            &mut self.pending,
+        ))
     }
 
     /// Returns the next event without blocking.
-    pub fn try_recv(&self) -> Result<TuiEvent, TryRecvError> {
-        self.receiver.try_recv()
+    pub fn try_recv(&mut self) -> Result<TuiEvent, TryRecvError> {
+        let event = match self.pending.take() {
+            Some(event) => event,
+            None => self.receiver.try_recv()?,
+        };
+        Ok(coalesce_drag_events(
+            event,
+            &self.receiver,
+            &mut self.pending,
+        ))
     }
 }
 
@@ -120,6 +158,39 @@ fn wheel_delta(event: &Event) -> Option<(i32, u16, u16)> {
     Some((delta, mouse.column, mouse.row))
 }
 
+fn coalesce_drag_events(
+    first: TuiEvent,
+    receiver: &Receiver<TuiEvent>,
+    pending: &mut Option<TuiEvent>,
+) -> TuiEvent {
+    if !is_left_drag(&first) {
+        return first;
+    }
+    let mut latest = first;
+    while let Ok(next) = receiver.try_recv() {
+        if is_left_drag(&next) {
+            latest = next;
+        } else {
+            *pending = Some(next);
+            break;
+        }
+    }
+    latest
+}
+
+fn is_left_drag(event: &TuiEvent) -> bool {
+    matches!(
+        event,
+        TuiEvent::Terminal {
+            event: Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                ..
+            }),
+            ..
+        }
+    )
+}
+
 impl Default for EventHandler {
     fn default() -> Self {
         Self::new()
@@ -132,5 +203,72 @@ impl Drop for EventHandler {
         // receiver is dropped, the next poll/read cycle exits cleanly; joining here could
         // otherwise wait for the poll timeout during terminal teardown.
         let _ = self.reader.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EventHandler, TuiEvent};
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn queued_left_drags_keep_only_the_latest_position_and_preserve_mouse_up() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 5))
+            .expect("first drag is queued");
+        sender
+            .send(mouse_event(MouseEventKind::Drag(MouseButton::Left), 20, 10))
+            .expect("second drag is queued");
+        sender
+            .send(mouse_event(MouseEventKind::Up(MouseButton::Left), 20, 10))
+            .expect("mouse up is queued");
+        let mut handler = EventHandler {
+            receiver,
+            pending: None,
+            reader: None,
+        };
+
+        let latest = handler
+            .recv_timeout(Duration::ZERO)
+            .expect("latest drag is received");
+
+        assert!(matches!(
+            latest,
+            TuiEvent::Terminal {
+                event: crossterm::event::Event::Mouse(MouseEvent {
+                    column: 20,
+                    row: 10,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(matches!(
+            handler
+                .recv_timeout(Duration::ZERO)
+                .expect("mouse up is preserved"),
+            TuiEvent::Terminal {
+                event: crossterm::event::Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> TuiEvent {
+        TuiEvent::Terminal {
+            event: crossterm::event::Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+            queued_at: Instant::now(),
+        }
     }
 }

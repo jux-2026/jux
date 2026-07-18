@@ -223,6 +223,7 @@ fn main() -> Result<()> {
             handle_update(args, cli.output)
         }
         None => {
+            init_tracing();
             let workspace = env::current_dir().context("failed to determine current workspace")?;
             let skill_catalog = load_skill_catalog(&workspace)?;
             let tui_configuration = load_tui_configuration(&workspace);

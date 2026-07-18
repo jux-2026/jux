@@ -1,4 +1,4 @@
-use super::AppState;
+use super::RenderState;
 use super::theme::CONVERSATION_PADDING;
 use ratatui::layout::Rect;
 
@@ -13,7 +13,7 @@ pub(crate) struct WorkspaceLayout {
 }
 
 impl WorkspaceLayout {
-    pub(crate) fn calculate(state: &AppState, area: Rect) -> Self {
+    pub(crate) fn calculate(state: &RenderState<'_>, area: Rect) -> Self {
         if area.width < NARROW_VIEWPORT_WIDTH {
             return Self {
                 conversation: area,
@@ -56,11 +56,13 @@ pub(crate) struct ConversationLayout {
 }
 
 impl ConversationLayout {
-    pub(crate) fn calculate(state: &AppState, area: Rect) -> Self {
+    pub(crate) fn calculate(input_line_count: u16, area: Rect) -> Self {
         let status_height = u16::from(area.height > 0);
         let available_height = area.height.saturating_sub(status_height);
-        let input_line_count = state.input_text().split('\n').count().max(1) as u16;
-        let input_height = input_line_count.saturating_add(2).min(available_height);
+        let input_height = input_line_count
+            .max(1)
+            .saturating_add(2)
+            .min(available_height);
         let status_y = area.y.saturating_add(available_height);
         let input_y = status_y.saturating_sub(input_height);
         let scrollbar_x = area.x.saturating_add(area.width.saturating_sub(1));

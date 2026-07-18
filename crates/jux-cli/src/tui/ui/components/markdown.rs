@@ -1,4 +1,5 @@
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
@@ -291,6 +292,7 @@ struct CodeBlock {
 
 impl CodeBlock {
     fn render(&self, maximum_width: usize) -> Vec<Line<'static>> {
+        let started = Instant::now();
         let Some(syntax) = syntax_for_language(&self.language) else {
             return self.render_plain_text(maximum_width);
         };
@@ -320,6 +322,14 @@ impl CodeBlock {
             }));
             lines.push(padded_code_line(spans, maximum_width));
         }
+        tracing::debug!(
+            target: "jux::selection_perf",
+            language = %self.language,
+            source_bytes = self.source.len(),
+            output_lines = lines.len(),
+            elapsed_us = %started.elapsed().as_micros(),
+            "[DEBUG-selection-perf] code block highlighted"
+        );
         lines
     }
 

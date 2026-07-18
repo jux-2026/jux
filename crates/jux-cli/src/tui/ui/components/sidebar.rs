@@ -1,12 +1,13 @@
+use super::super::RenderState;
 use super::super::text::apply_text_selection;
 use super::super::theme::{palette, panel_block};
-use crate::tui::{AppState, SelectionPanel, TuiRunStatus};
+use crate::tui::{SelectionPanel, TuiRunStatus};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(in crate::tui::ui) fn log_panel(state: &AppState) -> Paragraph<'_> {
+pub(in crate::tui::ui) fn log_panel<'a>(state: &'a RenderState<'a>) -> Paragraph<'a> {
     let mut lines = vec![Line::from("Runtime logs"), Line::from("")];
     if let Some(error) = &state.runtime_info().config_error {
         lines.push(Line::styled(
@@ -28,7 +29,7 @@ pub(in crate::tui::ui) fn log_panel(state: &AppState) -> Paragraph<'_> {
     sidebar_paragraph(state, lines)
 }
 
-pub(in crate::tui::ui) fn skill_panel(state: &AppState) -> Paragraph<'_> {
+pub(in crate::tui::ui) fn skill_panel<'a>(state: &'a RenderState<'a>) -> Paragraph<'a> {
     let mut lines = vec![Line::from("Skills"), Line::from("")];
     for (index, skill) in state.skills().iter().enumerate() {
         let cursor = if index == state.selected_skill() {
@@ -69,7 +70,7 @@ pub(in crate::tui::ui) fn skill_panel(state: &AppState) -> Paragraph<'_> {
     sidebar_paragraph(state, lines)
 }
 
-pub(in crate::tui::ui) fn audit_panel(state: &AppState) -> Paragraph<'_> {
+pub(in crate::tui::ui) fn audit_panel<'a>(state: &'a RenderState<'a>) -> Paragraph<'a> {
     let mut lines = vec![
         Line::from("Audit"),
         Line::from(format!("Filter: {:?} (F to change)", state.audit_filter())),
@@ -92,7 +93,7 @@ pub(in crate::tui::ui) fn audit_panel(state: &AppState) -> Paragraph<'_> {
     sidebar_paragraph(state, lines)
 }
 
-pub(in crate::tui::ui) fn run_panel(state: &AppState) -> Paragraph<'_> {
+pub(in crate::tui::ui) fn run_panel<'a>(state: &'a RenderState<'a>) -> Paragraph<'a> {
     let status = match state.run_status() {
         TuiRunStatus::Idle => "Idle",
         TuiRunStatus::Running => "Running",
@@ -196,7 +197,7 @@ fn format_duration(millis: u128) -> String {
     }
 }
 
-fn activity_indicator(state: &AppState) -> &'static str {
+fn activity_indicator(state: &RenderState<'_>) -> &'static str {
     if state.run_status() != TuiRunStatus::Running {
         return "-";
     }
@@ -207,7 +208,7 @@ fn activity_indicator(state: &AppState) -> &'static str {
     FRAMES[(frame as usize) % FRAMES.len()]
 }
 
-fn run_progress(state: &AppState) -> &'static str {
+fn run_progress(state: &RenderState<'_>) -> &'static str {
     if state.run_status() == TuiRunStatus::WaitingForHumanInput {
         return "Waiting for input";
     }
@@ -225,7 +226,7 @@ fn run_progress(state: &AppState) -> &'static str {
     })
 }
 
-pub(in crate::tui::ui) fn help_panel(state: &AppState) -> Paragraph<'static> {
+pub(in crate::tui::ui) fn help_panel(state: &RenderState<'_>) -> Paragraph<'static> {
     let contextual = if state.skill_panel_visible() {
         "Up/Down select | Space toggle | Esc close"
     } else if state.session_panel_visible() {
@@ -257,7 +258,7 @@ pub(in crate::tui::ui) fn help_panel(state: &AppState) -> Paragraph<'static> {
     )
 }
 
-fn sidebar_paragraph<'a>(state: &AppState, lines: Vec<Line<'a>>) -> Paragraph<'a> {
+fn sidebar_paragraph<'a>(state: &RenderState<'_>, lines: Vec<Line<'a>>) -> Paragraph<'a> {
     let lines = apply_text_selection(state, SelectionPanel::Sidebar, 0, lines);
     let background = palette(state.theme()).sidebar;
     Paragraph::new(lines)

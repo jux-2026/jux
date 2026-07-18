@@ -2,11 +2,10 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use jux_cli::tui::{
-    AgentEventSender, AppAction, AppCommand, AppState, BackgroundRun, FileIndexKind,
-    FileIndexService, FileIndexSnapshot, FocusedPanel, Message, MessageRole, RunResponse,
-    SelectionPanel, TerminalEventDecoder, TuiRunRequest, TuiRunStatus, TuiRuntimeInfo,
-    TuiSandboxSummary, TuiViewport, execute_code_change_command, execute_session_command,
-    load_active_session_history, materialize_pending_new_session, render_app, update,
+    AgentEventSender, AppCommand, AppModel, AppMsg, BackgroundRun, FileIndexKind, FileIndexService,
+    FileIndexSnapshot, FocusedPanel, Message, MessageRole, RunResponse, SelectionPanel,
+    TerminalEventDecoder, TuiApp, TuiRunRequest, TuiRunStatus, TuiRuntimeInfo, TuiSandboxSummary,
+    TuiViewport, UiEvent,
 };
 use jux_core::{
     AgentEvent, AgentEventData, AgentEventId, AgentEventKind, AssistantResponseItem,
@@ -22,10 +21,104 @@ use ratatui::layout::Position;
 use ratatui::style::Color;
 use semver::Version;
 use std::fs;
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
+
+enum TestInput {
+    Model(AppMsg),
+    Key(KeyEvent),
+    Mouse {
+        event: MouseEvent,
+        viewport: TuiViewport,
+    },
+}
+
+struct TestState {
+    app: TuiApp,
+}
+
+impl TestState {
+    fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            app: TuiApp::new(AppModel::new(workspace_root)),
+        }
+    }
+
+    fn input_text(&self) -> &str {
+        self.app.input_text()
+    }
+
+    fn conversation_scroll_from_bottom(&self) -> u16 {
+        self.app.conversation_scroll_from_bottom()
+    }
+
+    fn focused_panel(&self) -> FocusedPanel {
+        self.app.focused_panel()
+    }
+
+    fn text_selection(&self) -> Option<jux_cli::tui::TextSelection> {
+        self.app.text_selection()
+    }
+
+    fn sidebar_visible(&self) -> bool {
+        self.app.sidebar_visible()
+    }
+}
+
+impl Deref for TestState {
+    type Target = AppModel;
+
+    fn deref(&self) -> &Self::Target {
+        self.app.model()
+    }
+}
+
+impl DerefMut for TestState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.app.model_mut()
+    }
+}
+
+impl From<AppMsg> for TestInput {
+    fn from(message: AppMsg) -> Self {
+        Self::Model(message)
+    }
+}
+
+fn test_key(key: KeyEvent) -> TestInput {
+    TestInput::Key(key)
+}
+
+fn update(state: &mut TestState, input: impl Into<TestInput>) -> Option<AppCommand> {
+    match input.into() {
+        TestInput::Model(message) => state.app.update(message),
+        TestInput::Key(key) => dispatch_test_event(state, UiEvent::Key(key), test_viewport()),
+        TestInput::Mouse { event, viewport } => {
+            dispatch_test_event(state, UiEvent::Mouse(event), viewport)
+        }
+    }
+}
+
+fn dispatch_test_event(
+    state: &mut TestState,
+    event: UiEvent,
+    viewport: TuiViewport,
+) -> Option<AppCommand> {
+    let area = ratatui::layout::Rect::new(0, 0, viewport.width, viewport.height);
+    let mut buffer = Buffer::empty(area);
+    state.app.render_buffer(area, &mut buffer);
+    state.app.dispatch(event, viewport).command
+}
+
+fn test_viewport() -> TuiViewport {
+    TuiViewport {
+        width: 80,
+        height: 24,
+    }
+}
 
 #[test]
 fn tui_recovers_a_fragmented_sgr_mouse_report() {
@@ -124,11 +217,11 @@ fn tui_preserves_text_after_escape_when_it_is_not_a_mouse_report() {
 
 #[test]
 fn tui_accepts_q_as_text_input() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
     );
 
     assert_eq!(state.input_text(), "q");
@@ -137,11 +230,11 @@ fn tui_accepts_q_as_text_input() {
 
 #[test]
 fn tui_quits_when_ctrl_c_is_pressed() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        test_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
     );
 
     assert!(state.should_quit);
@@ -149,15 +242,15 @@ fn tui_quits_when_ctrl_c_is_pressed() {
 
 #[test]
 fn tui_accepts_multiline_text_input() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     type_text(&mut state, "Fix");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
     );
-    let newline_buffer = render_to_buffer(&state, 80, 24);
-    let newline_cursor = render_cursor_position(&state, 80, 24);
+    let newline_buffer = render_to_buffer(&mut state, 80, 24);
+    let newline_cursor = render_cursor_position(&mut state, 80, 24);
     let (first_line_row, _) =
         find_fragment_position(&newline_buffer, "Fix").expect("first input line is rendered");
     assert_row_has_background(
@@ -177,7 +270,7 @@ fn tui_accepts_multiline_text_input() {
     type_text(&mut state, "query");
 
     assert_eq!(state.input_text(), "Fix\nquery");
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "Fix");
     assert_buffer_contains(&buffer, "query");
     let (_, first_line_column) =
@@ -190,12 +283,12 @@ fn tui_accepts_multiline_text_input() {
 
 #[test]
 fn tui_ignores_shift_enter_key_release_events() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "first");
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new_with_kind(
+        test_key(KeyEvent::new_with_kind(
             KeyCode::Enter,
             KeyModifiers::SHIFT,
             KeyEventKind::Release,
@@ -207,12 +300,12 @@ fn tui_ignores_shift_enter_key_release_events() {
 
 #[test]
 fn tui_inserts_text_at_the_cursor() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     type_text(&mut state, "ac");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
     );
     type_text(&mut state, "b");
 
@@ -221,20 +314,20 @@ fn tui_inserts_text_at_the_cursor() {
 
 #[test]
 fn tui_deletes_text_around_the_cursor() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     type_text(&mut state, "ab中c");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
     );
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
     );
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
     );
 
     assert_eq!(state.input_text(), "ab");
@@ -242,30 +335,30 @@ fn tui_deletes_text_around_the_cursor() {
 
 #[test]
 fn tui_completes_file_references_and_renders_suggestions() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     update(
         &mut state,
-        AppAction::FileIndexUpdated(FileIndexSnapshot {
+        AppMsg::FileIndexUpdated(FileIndexSnapshot {
             kind: FileIndexKind::Filesystem,
             files: vec!["README.md".to_owned(), "src/main.rs".to_owned()],
         }),
     );
     type_text(&mut state, "Please inspect @mai");
 
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "@src/main.rs");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(state.input_text(), "Please inspect @src/main.rs ");
-    let completed = render_to_buffer(&state, 80, 24);
+    let completed = render_to_buffer(&mut state, 80, 24);
     assert_buffer_fragment_has_foreground(&completed, "@src/main.rs", Color::Cyan);
     assert_eq!(find_fragment_position(&completed, "@README.md"), None);
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     assert_eq!(
         command,
@@ -284,10 +377,10 @@ fn tui_completes_file_references_and_renders_suggestions() {
 
 #[test]
 fn tui_file_reference_popup_clears_the_conversation_beneath_it() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     update(
         &mut state,
-        AppAction::AssistantMessage {
+        AppMsg::AssistantMessage {
             content: (0..14)
                 .map(|index| format!("UNDERLYING CONVERSATION TEXT {index}"))
                 .collect::<Vec<_>>()
@@ -296,14 +389,14 @@ fn tui_file_reference_popup_clears_the_conversation_beneath_it() {
     );
     update(
         &mut state,
-        AppAction::FileIndexUpdated(FileIndexSnapshot {
+        AppMsg::FileIndexUpdated(FileIndexSnapshot {
             kind: FileIndexKind::Filesystem,
             files: (0..8).map(|index| format!("src/file-{index}.rs")).collect(),
         }),
     );
     type_text(&mut state, "@");
 
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
 
     assert_buffer_contains(&buffer, "@src/file-0.rs");
     let (row, column) = find_fragment_position(&buffer, "@src/file-0.rs")
@@ -319,10 +412,10 @@ fn tui_file_reference_popup_clears_the_conversation_beneath_it() {
 
 #[test]
 fn tui_file_reference_selection_scrolls_through_all_matches() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     update(
         &mut state,
-        AppAction::FileIndexUpdated(FileIndexSnapshot {
+        AppMsg::FileIndexUpdated(FileIndexSnapshot {
             kind: FileIndexKind::Filesystem,
             files: (0..12)
                 .map(|index| format!("src/file-{index:02}.rs"))
@@ -333,16 +426,16 @@ fn tui_file_reference_selection_scrolls_through_all_matches() {
     for _ in 0..8 {
         update(
             &mut state,
-            AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            test_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
         );
     }
 
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "@src/file-08.rs");
     assert_buffer_does_not_contain(&buffer, "@src/file-00.rs");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), "@src/file-08.rs ");
 }
@@ -353,43 +446,43 @@ fn tui_deletes_a_file_reference_as_one_input_unit() {
         kind: FileIndexKind::Filesystem,
         files: vec!["docs/My File.md".to_owned(), "src/main.rs".to_owned()],
     };
-    let mut backspace_state = AppState::new("/workspace");
+    let mut backspace_state = TestState::new("/workspace");
     update(
         &mut backspace_state,
-        AppAction::FileIndexUpdated(snapshot.clone()),
+        AppMsg::FileIndexUpdated(snapshot.clone()),
     );
     type_text(&mut backspace_state, "@src/main.rs");
     update(
         &mut backspace_state,
-        AppAction::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
     );
     assert_eq!(backspace_state.input_text(), "");
 
-    let mut delete_state = AppState::new("/workspace");
-    update(&mut delete_state, AppAction::FileIndexUpdated(snapshot));
+    let mut delete_state = TestState::new("/workspace");
+    update(&mut delete_state, AppMsg::FileIndexUpdated(snapshot));
     type_text(&mut delete_state, "@My");
     update(
         &mut delete_state,
-        AppAction::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
     );
     assert_eq!(delete_state.input_text(), "@{docs/My File.md}");
     update(
         &mut delete_state,
-        AppAction::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
     );
     update(
         &mut delete_state,
-        AppAction::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
     );
     assert_eq!(delete_state.input_text(), "");
 }
 
 #[test]
 fn tui_submits_braced_file_references_as_workspace_relative_paths() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     update(
         &mut state,
-        AppAction::FileIndexUpdated(FileIndexSnapshot {
+        AppMsg::FileIndexUpdated(FileIndexSnapshot {
             kind: FileIndexKind::Filesystem,
             files: vec!["docs/My File.md".to_owned()],
         }),
@@ -397,12 +490,12 @@ fn tui_submits_braced_file_references_as_workspace_relative_paths() {
     type_text(&mut state, "Read @My");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(
@@ -483,35 +576,35 @@ fn file_index_service_uses_git_tracked_files_and_gitignore_rules() {
 
 #[test]
 fn tui_moves_the_cursor_across_lines() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     type_text(&mut state, "abcd");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
     );
     type_text(&mut state, "xy");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
     );
     type_text(&mut state, "Z");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
     type_text(&mut state, "Q");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
     );
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
     );
     type_text(&mut state, "!");
 
@@ -520,30 +613,36 @@ fn tui_moves_the_cursor_across_lines() {
 
 #[test]
 fn tui_displays_the_input_cursor_at_the_editing_position() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "你");
 
-    let single_line = render_to_buffer(&state, 80, 24);
+    let single_line = render_to_buffer(&mut state, 80, 24);
     assert_eq!(find_fragment_position(&single_line, "> 你"), Some((21, 1)));
-    assert_eq!(render_cursor_position(&state, 80, 24), Position::new(5, 21));
+    assert_eq!(
+        render_cursor_position(&mut state, 80, 24),
+        Position::new(5, 21)
+    );
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
     );
     type_text(&mut state, "a");
 
-    assert_eq!(render_cursor_position(&state, 80, 24), Position::new(4, 21));
+    assert_eq!(
+        render_cursor_position(&mut state, 80, 24),
+        Position::new(4, 21)
+    );
 }
 
 #[test]
 fn tui_submits_input_as_a_new_run_request() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "Fix the failing test");
 
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(
@@ -557,12 +656,12 @@ fn tui_submits_input_as_a_new_run_request() {
 
 #[test]
 fn tui_does_not_submit_blank_input() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, " \n ");
 
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(command, None);
@@ -571,42 +670,42 @@ fn tui_does_not_submit_blank_input() {
 
 #[test]
 fn tui_displays_the_submitted_user_request() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "Explain this workspace");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
 
     assert_buffer_contains(&buffer, "> Explain this workspace");
 }
 
 #[test]
 fn tui_displays_the_agent_response() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     type_text(&mut state, "User request");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     update(
         &mut state,
-        AppAction::AssistantMessage {
+        AppMsg::AssistantMessage {
             content: "The workspace contains two crates.".to_owned(),
         },
     );
     update(
         &mut state,
-        AppAction::AssistantMessage {
+        AppMsg::AssistantMessage {
             content: "The second response is separate.".to_owned(),
         },
     );
 
-    let buffer = render_to_buffer(&state, 80, 40);
+    let buffer = render_to_buffer(&mut state, 80, 40);
     assert_buffer_contains(&buffer, "The workspace contains two crates.");
     let (user_row, _) =
         find_fragment_position(&buffer, "User request").expect("user message is rendered");
@@ -656,16 +755,16 @@ fn tui_displays_the_agent_response() {
 
 #[test]
 fn tui_keeps_commands_in_their_conversation_order() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     update(
         &mut state,
-        AppAction::AssistantMessage {
+        AppMsg::AssistantMessage {
             content: "First response".to_owned(),
         },
     );
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             AgentEventId::tool(1, "exec", 1),
             AgentEventKind::Started,
             AgentEventData::ToolStarted {
@@ -677,13 +776,13 @@ fn tui_keeps_commands_in_their_conversation_order() {
     );
     update(
         &mut state,
-        AppAction::AssistantMessage {
+        AppMsg::AssistantMessage {
             content: "Second response".to_owned(),
         },
     );
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             AgentEventId::tool(1, "exec", 2),
             AgentEventKind::Started,
             AgentEventData::ToolStarted {
@@ -694,7 +793,7 @@ fn tui_keeps_commands_in_their_conversation_order() {
         )),
     );
 
-    let buffer = render_to_buffer(&state, 100, 40);
+    let buffer = render_to_buffer(&mut state, 100, 40);
     let first_response =
         find_fragment_position(&buffer, "First response").expect("first response is rendered");
     let first_command =
@@ -712,12 +811,12 @@ fn tui_keeps_commands_in_their_conversation_order() {
 
 #[test]
 fn tui_appends_streamed_assistant_text_deltas() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     for content in ["Hello", " world"] {
         update(
             &mut state,
-            AppAction::AgentEvent(AgentEvent::new(
+            AppMsg::AgentEvent(AgentEvent::new(
                 AgentEventId::llm(1, 1),
                 AgentEventKind::Output,
                 AgentEventData::AssistantTextDelta {
@@ -729,11 +828,12 @@ fn tui_appends_streamed_assistant_text_deltas() {
 
     assert_eq!(state.messages().len(), 1);
     assert_eq!(state.messages()[0].content, "Hello world");
+    assert_eq!(state.message_revision(0), Some(1));
 }
 
 #[test]
 fn tui_restores_canceled_partial_assistant_output() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let run_id = RunId::from("workspace-0001-000001".to_owned());
     let checkpoint = Step::new(
         StepId::new(&run_id, 1),
@@ -745,7 +845,7 @@ fn tui_restores_canceled_partial_assistant_output() {
 
     update(
         &mut state,
-        AppAction::RunFinished {
+        AppMsg::RunFinished {
             response: RunResponse {
                 session_id: "workspace-0001".to_owned(),
                 run_id: run_id.to_string(),
@@ -763,7 +863,7 @@ fn tui_restores_canceled_partial_assistant_output() {
 
 #[test]
 fn tui_ignores_duplicate_sequenced_text_deltas() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let mut event = AgentEvent::new(
         AgentEventId::llm(1, 1),
         AgentEventKind::Output,
@@ -773,15 +873,15 @@ fn tui_ignores_duplicate_sequenced_text_deltas() {
     );
     event.sequence = 2;
 
-    update(&mut state, AppAction::AgentEvent(event.clone()));
-    update(&mut state, AppAction::AgentEvent(event));
+    update(&mut state, AppMsg::AgentEvent(event.clone()));
+    update(&mut state, AppMsg::AgentEvent(event));
 
     assert_eq!(state.messages()[0].content, "once");
 }
 
 #[test]
 fn tui_resets_event_sequence_for_a_new_background_run() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let mut first = AgentEvent::new(
         AgentEventId::llm(1, 1),
         AgentEventKind::Output,
@@ -790,13 +890,13 @@ fn tui_resets_event_sequence_for_a_new_background_run() {
         },
     );
     first.sequence = 4;
-    update(&mut state, AppAction::AgentEvent(first));
+    update(&mut state, AppMsg::AgentEvent(first));
 
     type_text(&mut state, "next run");
     assert!(matches!(
         update(
             &mut state,
-            AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         ),
         Some(AppCommand::StartRun { .. })
     ));
@@ -808,7 +908,7 @@ fn tui_resets_event_sequence_for_a_new_background_run() {
         },
     );
     second.sequence = 1;
-    update(&mut state, AppAction::AgentEvent(second));
+    update(&mut state, AppMsg::AgentEvent(second));
 
     assert!(
         state
@@ -820,11 +920,11 @@ fn tui_resets_event_sequence_for_a_new_background_run() {
 
 #[test]
 fn tui_keeps_persisted_commands_visible_when_a_run_finishes() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "Inspect the workspace");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     let run_id = RunId::from("workspace-0001-000001".to_owned());
     let steps = vec![
@@ -870,7 +970,7 @@ fn tui_keeps_persisted_commands_visible_when_a_run_finishes() {
 
     update(
         &mut state,
-        AppAction::RunFinished {
+        AppMsg::RunFinished {
             response: RunResponse {
                 session_id: "workspace-0001".to_owned(),
                 run_id: run_id.to_string(),
@@ -883,30 +983,30 @@ fn tui_keeps_persisted_commands_visible_when_a_run_finishes() {
         },
     );
 
-    let buffer = render_to_buffer(&state, 100, 40);
+    let buffer = render_to_buffer(&mut state, 100, 40);
     assert_buffer_contains(&buffer, "▶ $ ls");
 }
 
 #[test]
 fn tui_scrolls_through_messages_longer_than_the_viewport() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     for index in 0..12 {
         update(
             &mut state,
-            AppAction::AssistantMessage {
+            AppMsg::AssistantMessage {
                 content: format!("response-{index}"),
             },
         );
     }
 
-    let initial = render_to_buffer(&state, 80, 24);
+    let initial = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&initial, "response-11");
     assert_buffer_does_not_contain(&initial, "response-0");
     let initial_thumb_row = scrollbar_thumb_start(&initial, 47);
 
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::ScrollUp, 10, 10),
             viewport: TuiViewport {
                 width: 80,
@@ -916,7 +1016,7 @@ fn tui_scrolls_through_messages_longer_than_the_viewport() {
     );
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::ScrollUp, 10, 10),
             viewport: TuiViewport {
                 width: 80,
@@ -924,23 +1024,23 @@ fn tui_scrolls_through_messages_longer_than_the_viewport() {
             },
         },
     );
-    let scrolled = render_to_buffer(&state, 80, 24);
+    let scrolled = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&scrolled, "response-8");
     assert_buffer_does_not_contain(&scrolled, "response-11");
     assert!(scrollbar_thumb_start(&scrolled, 47) < initial_thumb_row);
     update(
         &mut state,
-        AppAction::AssistantMessage {
+        AppMsg::AssistantMessage {
             content: "response-12".to_owned(),
         },
     );
     assert_eq!(state.conversation_scroll_from_bottom(), 10);
-    assert_buffer_does_not_contain(&render_to_buffer(&state, 80, 24), "response-12");
+    assert_buffer_does_not_contain(&render_to_buffer(&mut state, 80, 24), "response-12");
 
     for _ in 0..2 {
         update(
             &mut state,
-            AppAction::Mouse {
+            TestInput::Mouse {
                 event: mouse_event(MouseEventKind::ScrollDown, 10, 10),
                 viewport: TuiViewport {
                     width: 80,
@@ -949,13 +1049,13 @@ fn tui_scrolls_through_messages_longer_than_the_viewport() {
             },
         );
     }
-    let returned_to_bottom = render_to_buffer(&state, 80, 24);
+    let returned_to_bottom = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&returned_to_bottom, "response-12");
     assert_eq!(state.conversation_scroll_from_bottom(), 0);
 
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::ScrollUp, 70, 10),
             viewport: TuiViewport {
                 width: 80,
@@ -967,7 +1067,7 @@ fn tui_scrolls_through_messages_longer_than_the_viewport() {
 
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::ScrollUp, 0, 23),
             viewport: TuiViewport {
                 width: 80,
@@ -978,7 +1078,7 @@ fn tui_scrolls_through_messages_longer_than_the_viewport() {
     assert_eq!(state.conversation_scroll_from_bottom(), 5);
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::ScrollDown, 47, 23),
             viewport: TuiViewport {
                 width: 80,
@@ -991,11 +1091,11 @@ fn tui_scrolls_through_messages_longer_than_the_viewport() {
 
 #[test]
 fn tui_keeps_input_and_status_fixed_beside_the_full_height_scrollbar() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     for index in 0..12 {
         update(
             &mut state,
-            AppAction::AssistantMessage {
+            AppMsg::AssistantMessage {
                 content: format!("response-{index}"),
             },
         );
@@ -1003,10 +1103,10 @@ fn tui_keeps_input_and_status_fixed_beside_the_full_height_scrollbar() {
     type_text(&mut state, "draft");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
     );
 
-    let initial = render_to_buffer(&state, 80, 24);
+    let initial = render_to_buffer(&mut state, 80, 24);
     let input_position =
         find_fragment_position(&initial, "> draft").expect("input is rendered above status");
     let status_position =
@@ -1028,7 +1128,7 @@ fn tui_keeps_input_and_status_fixed_beside_the_full_height_scrollbar() {
 
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::ScrollUp, 10, 10),
             viewport: TuiViewport {
                 width: 80,
@@ -1036,7 +1136,7 @@ fn tui_keeps_input_and_status_fixed_beside_the_full_height_scrollbar() {
             },
         },
     );
-    let scrolled = render_to_buffer(&state, 80, 24);
+    let scrolled = render_to_buffer(&mut state, 80, 24);
     assert_eq!(
         find_fragment_position(&scrolled, "> draft"),
         Some(input_position)
@@ -1071,7 +1171,7 @@ fn tui_run_executes_in_the_background() {
             })
         }),
     );
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     assert_eq!(run.try_recv(), None);
     type_text(&mut state, "input remains responsive");
@@ -1168,42 +1268,42 @@ fn tui_background_run_forwards_explicit_skill_selection() {
 
 #[test]
 fn tui_updates_llm_lifecycle_in_the_timeline() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let event_id = AgentEventId::llm(1, 1);
 
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id.clone(),
             AgentEventKind::Started,
             AgentEventData::LlmStarted,
         )),
     );
-    let running = render_to_buffer(&state, 80, 24);
+    let running = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&running, "LLM");
     assert_buffer_contains(&running, "Running");
 
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id,
             AgentEventKind::Completed,
             AgentEventData::LlmCompleted,
         )),
     );
     assert!(state.timeline().is_empty());
-    let completed = render_to_buffer(&state, 80, 24);
+    let completed = render_to_buffer(&mut state, 80, 24);
     assert_buffer_does_not_contain(&completed, "LLM");
     assert_buffer_does_not_contain(&completed, "Completed");
 }
 
 #[test]
 fn tui_displays_llm_failure_details_in_the_timeline() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             AgentEventId::llm(1, 1),
             AgentEventKind::Failed,
             AgentEventData::LlmFailed {
@@ -1212,7 +1312,7 @@ fn tui_displays_llm_failure_details_in_the_timeline() {
         )),
     );
 
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "LLM");
     assert_buffer_contains(&buffer, "Failed");
     assert_buffer_contains(&buffer, "model unavailable");
@@ -1220,12 +1320,12 @@ fn tui_displays_llm_failure_details_in_the_timeline() {
 
 #[test]
 fn tui_updates_tool_lifecycle_and_keeps_its_output() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let event_id = AgentEventId::tool(1, "exec", 1);
 
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id.clone(),
             AgentEventKind::Started,
             AgentEventData::ToolStarted {
@@ -1235,7 +1335,7 @@ fn tui_updates_tool_lifecycle_and_keeps_its_output() {
             },
         )),
     );
-    let running = render_to_buffer(&state, 80, 24);
+    let running = render_to_buffer(&mut state, 80, 24);
     let (running_row, running_column) =
         find_fragment_position(&running, "▶ $ cargo test").expect("running command is rendered");
     let running_color = running
@@ -1255,7 +1355,7 @@ fn tui_updates_tool_lifecycle_and_keeps_its_output() {
     );
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id.clone(),
             AgentEventKind::Output,
             AgentEventData::ToolOutput {
@@ -1271,7 +1371,7 @@ fn tui_updates_tool_lifecycle_and_keeps_its_output() {
     );
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id,
             AgentEventKind::Completed,
             AgentEventData::ToolCompleted {
@@ -1282,7 +1382,7 @@ fn tui_updates_tool_lifecycle_and_keeps_its_output() {
     );
 
     assert_eq!(state.timeline().len(), 1);
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "$ cargo test");
     assert_buffer_does_not_contain(&buffer, "Succeeded");
     assert_buffer_does_not_contain(&buffer, "exit 0");
@@ -1296,11 +1396,11 @@ fn tui_updates_tool_lifecycle_and_keeps_its_output() {
 
 #[test]
 fn tui_appends_tool_output_chunks_before_completion() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let event_id = AgentEventId::tool(1, "exec", 1);
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id.clone(),
             AgentEventKind::Started,
             AgentEventData::ToolStarted {
@@ -1313,7 +1413,7 @@ fn tui_appends_tool_output_chunks_before_completion() {
     for content in ["first\n", "second\n"] {
         update(
             &mut state,
-            AppAction::AgentEvent(AgentEvent::new(
+            AppMsg::AgentEvent(AgentEvent::new(
                 event_id.clone(),
                 AgentEventKind::Output,
                 AgentEventData::ToolOutputChunk {
@@ -1336,11 +1436,11 @@ fn tui_appends_tool_output_chunks_before_completion() {
 
 #[test]
 fn tui_expands_tool_arguments_and_output() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let event_id = AgentEventId::tool(1, "exec", 1);
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id.clone(),
             AgentEventKind::Started,
             AgentEventData::ToolStarted {
@@ -1352,7 +1452,7 @@ fn tui_expands_tool_arguments_and_output() {
     );
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id,
             AgentEventKind::Output,
             AgentEventData::ToolOutput {
@@ -1367,21 +1467,21 @@ fn tui_expands_tool_arguments_and_output() {
         )),
     );
 
-    let collapsed = render_to_buffer(&state, 80, 24);
+    let collapsed = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&collapsed, "▶ $ cargo test");
     assert_buffer_does_not_contain(&collapsed, "all tests passed");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), " ");
-    let collapsed = render_to_buffer(&state, 80, 24);
+    let collapsed = render_to_buffer(&mut state, 80, 24);
     let (toggle_row, command_column) =
         find_fragment_position(&collapsed, "cargo").expect("command is rendered");
 
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(
                 MouseEventKind::Down(MouseButton::Left),
                 command_column,
@@ -1394,7 +1494,7 @@ fn tui_expands_tool_arguments_and_output() {
         },
     );
 
-    let expanded = render_to_buffer(&state, 80, 24);
+    let expanded = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&expanded, "▼ $ cargo test");
     assert_buffer_contains(&expanded, "stdout");
     assert_buffer_contains(&expanded, "stderr");
@@ -1415,11 +1515,11 @@ fn tui_expands_tool_arguments_and_output() {
 
 #[test]
 fn tui_renders_long_tool_output_without_truncating_it() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let event_id = AgentEventId::tool(1, "exec", 1);
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id.clone(),
             AgentEventKind::Started,
             AgentEventData::ToolStarted {
@@ -1431,7 +1531,7 @@ fn tui_renders_long_tool_output_without_truncating_it() {
     );
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id,
             AgentEventKind::Output,
             AgentEventData::ToolOutput {
@@ -1445,12 +1545,12 @@ fn tui_renders_long_tool_output_without_truncating_it() {
             },
         )),
     );
-    let collapsed = render_to_buffer(&state, 120, 30);
+    let collapsed = render_to_buffer(&mut state, 120, 30);
     let (toggle_row, toggle_column) =
         find_fragment_position(&collapsed, "▶").expect("fold button is rendered");
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(
                 MouseEventKind::Down(MouseButton::Left),
                 toggle_column,
@@ -1463,18 +1563,18 @@ fn tui_renders_long_tool_output_without_truncating_it() {
         },
     );
 
-    let buffer = render_to_buffer(&state, 120, 30);
+    let buffer = render_to_buffer(&mut state, 120, 30);
     assert_buffer_contains(&buffer, "END OF OUTPUT");
     assert_buffer_does_not_contain(&buffer, "[truncated]");
 }
 
 #[test]
 fn tui_renders_failed_command_status_and_stderr() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let event_id = AgentEventId::tool(1, "exec", 1);
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id.clone(),
             AgentEventKind::Started,
             AgentEventData::ToolStarted {
@@ -1489,7 +1589,7 @@ fn tui_renders_failed_command_status_and_stderr() {
     );
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id,
             AgentEventKind::Output,
             AgentEventData::ToolOutput {
@@ -1504,7 +1604,7 @@ fn tui_renders_failed_command_status_and_stderr() {
         )),
     );
 
-    let collapsed = render_to_buffer(&state, 100, 30);
+    let collapsed = render_to_buffer(&mut state, 100, 30);
     assert_buffer_contains(&collapsed, "'missing file.txt'");
     assert_buffer_does_not_contain(&collapsed, "Failed");
     assert_buffer_does_not_contain(&collapsed, "exit 1");
@@ -1516,7 +1616,7 @@ fn tui_renders_failed_command_status_and_stderr() {
 
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(
                 MouseEventKind::Down(MouseButton::Left),
                 toggle_column,
@@ -1528,16 +1628,16 @@ fn tui_renders_failed_command_status_and_stderr() {
             },
         },
     );
-    let expanded = render_to_buffer(&state, 100, 30);
+    let expanded = render_to_buffer(&mut state, 100, 30);
     assert_buffer_contains(&expanded, "cat: missing file.txt: No such file");
 }
 
 #[test]
 fn tui_displays_active_and_running_skills() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             AgentEventId::skills(),
             AgentEventKind::Output,
             AgentEventData::SkillsSelected {
@@ -1548,7 +1648,7 @@ fn tui_displays_active_and_running_skills() {
     let event_id = AgentEventId::tool(1, "call_skill", 1);
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id.clone(),
             AgentEventKind::Started,
             AgentEventData::ToolStarted {
@@ -1563,7 +1663,7 @@ fn tui_displays_active_and_running_skills() {
     );
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             event_id,
             AgentEventKind::Completed,
             AgentEventData::ToolCompleted {
@@ -1573,7 +1673,7 @@ fn tui_displays_active_and_running_skills() {
         )),
     );
 
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "Active skills");
     assert_buffer_contains(&buffer, "review");
     assert_buffer_contains(&buffer, "Skill: review");
@@ -1588,7 +1688,7 @@ fn tui_lists_skill_details_and_project_overrides() {
         SkillScope::Project,
         "/workspace/.jux/skills/review",
     );
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     state.set_skill_catalog(SkillCatalog {
         skills: vec![project_skill.clone()],
         overrides: vec![SkillOverride {
@@ -1600,10 +1700,10 @@ fn tui_lists_skill_details_and_project_overrides() {
     type_text(&mut state, "/skills");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
-    let buffer = render_to_buffer(&state, 120, 30);
+    let buffer = render_to_buffer(&mut state, 120, 30);
     assert_buffer_contains(&buffer, "Skills");
     assert_buffer_contains(&buffer, "review");
     assert_buffer_contains(&buffer, "Project");
@@ -1614,7 +1714,7 @@ fn tui_lists_skill_details_and_project_overrides() {
 
 #[test]
 fn tui_renders_the_skill_panel_with_the_sidebar_background() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     state.set_skill_catalog(SkillCatalog {
         skills: vec![skill_definition(
             "review",
@@ -1626,17 +1726,17 @@ fn tui_renders_the_skill_panel_with_the_sidebar_background() {
     type_text(&mut state, "/skills");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
-    let buffer = render_to_buffer(&state, 120, 30);
+    let buffer = render_to_buffer(&mut state, 120, 30);
 
     assert_buffer_fragment_has_background(&buffer, "Skills", sidebar_background());
 }
 
 #[test]
 fn tui_selects_explicit_skills_for_the_next_run() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     state.set_skill_catalog(SkillCatalog {
         skills: vec![skill_definition(
             "review",
@@ -1648,21 +1748,21 @@ fn tui_selects_explicit_skills_for_the_next_run() {
     type_text(&mut state, "/skills");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
     );
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
     );
     type_text(&mut state, "Review this change");
 
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(
@@ -1676,12 +1776,12 @@ fn tui_selects_explicit_skills_for_the_next_run() {
 
 #[test]
 fn tui_quit_command_exits_without_starting_a_run() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "/quit");
 
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(command, None);
@@ -1690,10 +1790,10 @@ fn tui_quit_command_exits_without_starting_a_run() {
 
 #[test]
 fn tui_clear_command_removes_messages_without_starting_a_run() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     update(
         &mut state,
-        AppAction::AssistantMessage {
+        AppMsg::AssistantMessage {
             content: "Temporary output".to_owned(),
         },
     );
@@ -1701,7 +1801,7 @@ fn tui_clear_command_removes_messages_without_starting_a_run() {
 
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(command, None);
@@ -1711,16 +1811,16 @@ fn tui_clear_command_removes_messages_without_starting_a_run() {
 
 #[test]
 fn tui_help_command_displays_commands_and_shortcuts() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "/help");
 
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(command, None);
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "/clear");
     assert_buffer_contains(&buffer, "/quit");
     assert_buffer_contains(&buffer, "/new");
@@ -1731,10 +1831,10 @@ fn tui_help_command_displays_commands_and_shortcuts() {
 
 #[test]
 fn tui_shows_filters_and_dismisses_slash_command_suggestions() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     type_text(&mut state, "/");
-    let initial = render_to_buffer(&state, 80, 24);
+    let initial = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&initial, "/new");
     assert_buffer_contains(&initial, "Start a new session");
     assert_buffer_contains(&initial, "/version");
@@ -1752,15 +1852,15 @@ fn tui_shows_filters_and_dismisses_slash_command_suggestions() {
     );
 
     type_text(&mut state, "ver");
-    let filtered = render_to_buffer(&state, 80, 24);
+    let filtered = render_to_buffer(&mut state, 80, 24);
     assert_buffer_does_not_contain(&filtered, "Start a new session");
     assert_buffer_contains(&filtered, "Show the Jux version");
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
     );
-    let dismissed = render_to_buffer(&state, 80, 24);
+    let dismissed = render_to_buffer(&mut state, 80, 24);
     assert_buffer_does_not_contain(&dismissed, "Show the Jux version");
     assert_buffer_does_not_contain(&dismissed, "Press Esc again");
     assert_eq!(state.input_text(), "/ver");
@@ -1768,23 +1868,23 @@ fn tui_shows_filters_and_dismisses_slash_command_suggestions() {
 
 #[test]
 fn tui_selects_and_executes_the_version_slash_command() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "/");
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
-    let selected = render_to_buffer(&state, 80, 24);
+    let selected = render_to_buffer(&mut state, 80, 24);
     assert_eq!(find_fragment_position(&selected, "/version"), Some((18, 1)));
     assert_buffer_fragment_has_fg_bg(&selected, "/version", Color::Black, Color::Cyan);
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(command, None);
@@ -1806,13 +1906,16 @@ fn tui_new_slash_command_defers_creating_an_unnamed_session_until_submission() {
         .init_workspace()
         .expect("workspace initializes")
         .active_session_id;
-    let mut state = AppState::new(workspace.path());
-    load_active_session_history(&mut state, &store).expect("history loads");
+    let mut state = TestState::new(workspace.path());
+    state
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
     type_text(&mut state, "/new");
 
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     assert_eq!(command, None);
     assert!(state.pending_new_session());
@@ -1827,7 +1930,7 @@ fn tui_new_slash_command_defers_creating_an_unnamed_session_until_submission() {
     type_text(&mut state, "new request");
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     assert_eq!(
         command,
@@ -1835,7 +1938,9 @@ fn tui_new_slash_command_defers_creating_an_unnamed_session_until_submission() {
             request: "new request".to_owned()
         })
     );
-    materialize_pending_new_session(&mut state, &store, "new request")
+    state
+        .app
+        .materialize_pending_new_session(&store, "new request")
         .expect("new session materializes");
 
     let active_session = store.load_active_session().expect("active session loads");
@@ -1845,27 +1950,27 @@ fn tui_new_slash_command_defers_creating_an_unnamed_session_until_submission() {
 
 #[test]
 fn tui_keeps_the_input_visible_in_a_small_terminal() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "compact request");
 
-    let buffer = render_to_buffer(&state, 30, 8);
+    let buffer = render_to_buffer(&mut state, 30, 8);
 
     assert_buffer_contains(&buffer, "compact request");
 }
 
 #[test]
 fn tui_does_not_start_a_second_run_while_running() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "first request");
     let first = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     type_text(&mut state, "second request");
 
     let second = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(
@@ -1878,76 +1983,76 @@ fn tui_does_not_start_a_second_run_while_running() {
     assert_eq!(second, None);
     assert_eq!(state.input_text(), "second request");
     assert_eq!(state.messages().len(), 1);
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "Running");
 }
 
 #[test]
 fn tui_cancels_the_running_run_with_escape() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "long-running request");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     let first_command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
     );
     assert_eq!(first_command, None);
     assert_eq!(state.run_status(), TuiRunStatus::Running);
     assert_buffer_contains(
-        &render_to_buffer(&state, 80, 24),
+        &render_to_buffer(&mut state, 80, 24),
         "Press Esc again to interrupt the current run",
     );
 
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
     );
-    update(&mut state, AppAction::RunCanceled);
+    update(&mut state, AppMsg::RunCanceled);
 
     assert_eq!(command, Some(AppCommand::CancelRun));
     assert_eq!(state.run_status(), TuiRunStatus::Canceled);
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "Canceled");
 }
 
 #[test]
 fn tui_clears_input_with_double_escape_while_not_running() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "draft request");
 
     let first_command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
     );
 
     assert_eq!(first_command, None);
     assert_eq!(state.input_text(), "draft request");
     assert_buffer_contains(
-        &render_to_buffer(&state, 80, 24),
+        &render_to_buffer(&mut state, 80, 24),
         "Press Esc again to clear the input",
     );
 
     let second_command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
     );
 
     assert_eq!(second_command, None);
     assert_eq!(state.input_text(), "");
-    assert_buffer_does_not_contain(&render_to_buffer(&state, 80, 24), "Press Esc again");
+    assert_buffer_does_not_contain(&render_to_buffer(&mut state, 80, 24), "Press Esc again");
 }
 
 #[test]
 fn tui_displays_waiting_run_status_and_metadata() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     update(
         &mut state,
-        AppAction::RunFinished {
+        AppMsg::RunFinished {
             response: RunResponse {
                 session_id: "workspace-0001".to_owned(),
                 run_id: "workspace-0001-000001".to_owned(),
@@ -1961,13 +2066,13 @@ fn tui_displays_waiting_run_status_and_metadata() {
     );
 
     assert_eq!(state.run_status(), TuiRunStatus::WaitingForHumanInput);
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "Waiting · 250ms");
 }
 
 #[test]
 fn tui_displays_the_pending_human_input_question() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let run_id = RunId::from("workspace-0001-000001".to_owned());
     let steps = vec![Step::new(
         StepId::new(&run_id, 1),
@@ -1993,7 +2098,7 @@ fn tui_displays_the_pending_human_input_question() {
 
     update(
         &mut state,
-        AppAction::RunFinished {
+        AppMsg::RunFinished {
             response: RunResponse {
                 session_id: "workspace-0001".to_owned(),
                 run_id: run_id.to_string(),
@@ -2006,7 +2111,7 @@ fn tui_displays_the_pending_human_input_question() {
         },
     );
 
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "Which implementation should Jux use?");
     assert_buffer_contains(&buffer, "safe  Safer implementation");
     assert_buffer_contains(&buffer, "fast  Faster implementation");
@@ -2049,12 +2154,15 @@ fn tui_loads_active_session_history_from_the_workspace_store() {
     store
         .update_run_status(&run.id, CoreRunStatus::Completed)
         .expect("run is completed");
-    let mut state = AppState::new(workspace.path());
+    let mut state = TestState::new(workspace.path());
 
-    load_active_session_history(&mut state, &store).expect("history loads");
+    state
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
 
     assert_eq!(state.run_status(), TuiRunStatus::Completed);
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "Historical request");
     assert_buffer_contains(&buffer, "Historical answer");
     assert_buffer_contains(&buffer, "1 runs");
@@ -2106,8 +2214,11 @@ fn tui_restores_persisted_command_output_when_loading_a_session() {
         .update_run_status(&run.id, CoreRunStatus::Completed)
         .expect("run completes");
 
-    let mut restored = AppState::new(workspace.path());
-    load_active_session_history(&mut restored, &store).expect("history loads");
+    let mut restored = TestState::new(workspace.path());
+    restored
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
 
     let command = restored.timeline()[0]
         .command
@@ -2117,8 +2228,7 @@ fn tui_restores_persisted_command_output_when_loading_a_session() {
     assert_eq!(command.args, ["-la"]);
     assert_eq!(command.exit_code, Some(0));
     assert_eq!(command.stdout, "README.md\nsrc");
-    assert!(!restored.timeline()[0].expanded);
-    let collapsed = render_to_buffer(&restored, 100, 30);
+    let collapsed = render_to_buffer(&mut restored, 100, 30);
     assert_buffer_contains(&collapsed, "▶ $ ls -la");
     assert_buffer_does_not_contain(&collapsed, "stdout 2 line(s)");
     assert_buffer_does_not_contain(&collapsed, "README.md");
@@ -2127,7 +2237,7 @@ fn tui_restores_persisted_command_output_when_loading_a_session() {
 
     update(
         &mut restored,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(
                 MouseEventKind::Down(MouseButton::Left),
                 toggle_column,
@@ -2139,7 +2249,7 @@ fn tui_restores_persisted_command_output_when_loading_a_session() {
             },
         },
     );
-    let expanded = render_to_buffer(&restored, 100, 30);
+    let expanded = render_to_buffer(&mut restored, 100, 30);
     assert_buffer_contains(&expanded, "▼ $ ls -la");
     assert_buffer_contains(&expanded, "README.md");
 }
@@ -2163,12 +2273,15 @@ fn tui_restores_a_failed_run_and_its_error() {
     store
         .update_run_status(&run.id, CoreRunStatus::Failed)
         .expect("run is failed");
-    let mut state = AppState::new(workspace.path());
+    let mut state = TestState::new(workspace.path());
 
-    load_active_session_history(&mut state, &store).expect("history loads");
+    state
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
 
     assert_eq!(state.run_status(), TuiRunStatus::Failed);
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "Persisted failure");
 }
 
@@ -2204,12 +2317,15 @@ fn tui_restores_a_waiting_run_and_can_resume_it() {
     store
         .update_run_status(&run.id, CoreRunStatus::WaitingForHumanInput)
         .expect("run waits for input");
-    let mut state = AppState::new(workspace.path());
+    let mut state = TestState::new(workspace.path());
 
-    load_active_session_history(&mut state, &store).expect("history loads");
+    state
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(
@@ -2230,17 +2346,20 @@ fn tui_lists_workspace_sessions_and_marks_the_active_session() {
     store
         .create_session(Some("feature-a".to_owned()))
         .expect("session is created");
-    let mut state = AppState::new(workspace.path());
-    load_active_session_history(&mut state, &store).expect("history loads");
+    let mut state = TestState::new(workspace.path());
+    state
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
     type_text(&mut state, "/sessions");
 
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(command, None);
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "Search:");
     assert_buffer_contains(&buffer, "default");
     assert_buffer_contains(&buffer, "feature-a");
@@ -2254,16 +2373,24 @@ fn tui_creates_renames_and_switches_sessions() {
         .init_workspace()
         .expect("workspace initializes")
         .active_session_id;
-    let mut state = AppState::new(workspace.path());
-    load_active_session_history(&mut state, &store).expect("history loads");
+    let mut state = TestState::new(workspace.path());
+    state
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
 
     type_text(&mut state, "/session new feature-a");
     let create = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     )
     .expect("create command is emitted");
-    assert!(execute_session_command(&mut state, &store, &create).expect("session is created"));
+    assert!(
+        state
+            .app
+            .execute_session_command(&store, &create)
+            .expect("session is created")
+    );
     assert_eq!(
         store
             .load_active_session()
@@ -2276,10 +2403,15 @@ fn tui_creates_renames_and_switches_sessions() {
     type_text(&mut state, "/session rename feature-renamed");
     let rename = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     )
     .expect("rename command is emitted");
-    assert!(execute_session_command(&mut state, &store, &rename).expect("session is renamed"));
+    assert!(
+        state
+            .app
+            .execute_session_command(&store, &rename)
+            .expect("session is renamed")
+    );
     assert_eq!(
         store
             .load_active_session()
@@ -2292,10 +2424,15 @@ fn tui_creates_renames_and_switches_sessions() {
     type_text(&mut state, &format!("/session switch {default_session}"));
     let switch = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     )
     .expect("switch command is emitted");
-    assert!(execute_session_command(&mut state, &store, &switch).expect("session is switched"));
+    assert!(
+        state
+            .app
+            .execute_session_command(&store, &switch)
+            .expect("session is switched")
+    );
     assert_eq!(state.session_id(), Some(default_session.as_str()));
 }
 
@@ -2307,24 +2444,27 @@ fn tui_session_slash_command_selects_and_switches_sessions() {
     let target = store
         .create_session(Some("feature-a".to_owned()))
         .expect("session is created");
-    let mut state = AppState::new(workspace.path());
-    load_active_session_history(&mut state, &store).expect("history loads");
+    let mut state = TestState::new(workspace.path());
+    state
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
 
     type_text(&mut state, "/session");
     assert_eq!(
         update(
             &mut state,
-            AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         ),
         None
     );
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     )
     .expect("switch command is emitted");
     assert_eq!(
@@ -2333,12 +2473,17 @@ fn tui_session_slash_command_selects_and_switches_sessions() {
             session_id: target.id.clone(),
         }
     );
-    assert!(execute_session_command(&mut state, &store, &command).expect("session switches"));
+    assert!(
+        state
+            .app
+            .execute_session_command(&store, &command)
+            .expect("session switches")
+    );
     assert_eq!(
         store.load_active_session().expect("session loads").id,
         target.id
     );
-    let switched = render_to_buffer(&state, 80, 24);
+    let switched = render_to_buffer(&mut state, 80, 24);
     assert_buffer_does_not_contain(&switched, "Search:");
     assert_buffer_contains(&switched, "feature-a");
 }
@@ -2351,42 +2496,55 @@ fn tui_session_picker_searches_likes_renames_and_closes() {
     let target = store
         .create_session(Some("feature-a".to_owned()))
         .expect("session is created");
-    let mut state = AppState::new(workspace.path());
-    load_active_session_history(&mut state, &store).expect("history loads");
+    let mut state = TestState::new(workspace.path());
+    state
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
     type_text(&mut state, "/session");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     type_text(&mut state, "feature");
-    let filtered = render_to_buffer(&state, 80, 24);
+    let filtered = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&filtered, "feature-a");
 
     let like = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+        test_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
     )
     .expect("like command is emitted");
-    assert!(execute_session_command(&mut state, &store, &like).expect("like toggles"));
+    assert!(
+        state
+            .app
+            .execute_session_command(&store, &like)
+            .expect("like toggles")
+    );
     assert!(store.load_session(&target.id).expect("session loads").liked);
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        test_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
     );
     for _ in 0.."feature-a".chars().count() {
         update(
             &mut state,
-            AppAction::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            test_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
         );
     }
     type_text(&mut state, "renamed");
     let rename = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     )
     .expect("rename command is emitted");
-    assert!(execute_session_command(&mut state, &store, &rename).expect("session renames"));
+    assert!(
+        state
+            .app
+            .execute_session_command(&store, &rename)
+            .expect("session renames")
+    );
     assert_eq!(
         store
             .load_session(&target.id)
@@ -2398,9 +2556,9 @@ fn tui_session_picker_searches_likes_renames_and_closes() {
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
     );
-    let closed = render_to_buffer(&state, 80, 24);
+    let closed = render_to_buffer(&mut state, 80, 24);
     assert_buffer_does_not_contain(&closed, "Search:");
 }
 
@@ -2420,15 +2578,18 @@ fn tui_lists_run_history_under_each_session() {
     store
         .create_run("Feature session run".to_owned())
         .expect("feature run is created");
-    let mut state = AppState::new(workspace.path());
-    load_active_session_history(&mut state, &store).expect("history loads");
+    let mut state = TestState::new(workspace.path());
+    state
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
     type_text(&mut state, "/sessions");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
-    let buffer = render_to_buffer(&state, 120, 30);
+    let buffer = render_to_buffer(&mut state, 120, 30);
     assert_buffer_contains(&buffer, "default");
     assert_buffer_contains(&buffer, "feature-a");
     assert_buffer_does_not_contain(&buffer, "Default session run");
@@ -2455,11 +2616,11 @@ fn tui_displays_plan_files_and_switchable_diffs() {
         ],
     )
     .expect("proposal is prepared");
-    let mut state = AppState::new(workspace.path());
+    let mut state = TestState::new(workspace.path());
 
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             AgentEventId::tool(1, "propose_code_change", 1),
             AgentEventKind::Output,
             AgentEventData::ToolOutput {
@@ -2468,7 +2629,7 @@ fn tui_displays_plan_files_and_switchable_diffs() {
             },
         )),
     );
-    let first = render_to_buffer(&state, 120, 40);
+    let first = render_to_buffer(&mut state, 120, 40);
     assert_buffer_contains(&first, "Plan: Rename both functions");
     assert_buffer_contains(&first, "src/a.rs");
     assert_buffer_contains(&first, "src/b.rs");
@@ -2483,9 +2644,9 @@ fn tui_displays_plan_files_and_switchable_diffs() {
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
     );
-    let second = render_to_buffer(&state, 120, 40);
+    let second = render_to_buffer(&mut state, 120, 40);
     assert_buffer_fragment_has_background(
         &second,
         "Plan: Rename both functions",
@@ -2505,16 +2666,19 @@ fn tui_accepts_and_applies_a_code_change() {
         vec![ProposedFileContent::new("README.md", "new\n")],
     )
     .expect("proposal is prepared");
-    let mut state = AppState::new(workspace.path());
-    update(&mut state, AppAction::CodeChangeProposed { proposal });
+    let mut state = TestState::new(workspace.path());
+    update(&mut state, AppMsg::CodeChangeProposed { proposal });
     type_text(&mut state, "/review accept");
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     )
     .expect("accept command is emitted");
 
-    execute_code_change_command(&mut state, &command).expect("change is applied");
+    state
+        .app
+        .execute_code_change_command(&command)
+        .expect("change is applied");
 
     assert_eq!(
         state.code_change_review().expect("review exists").status,
@@ -2527,9 +2691,9 @@ fn tui_accepts_and_applies_a_code_change() {
     type_text(&mut state, "/audit");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
-    let buffer = render_to_buffer(&state, 120, 30);
+    let buffer = render_to_buffer(&mut state, 120, 30);
     assert_buffer_contains(&buffer, "Applied 1 file");
     assert_buffer_contains(&buffer, "File write: README.md");
 }
@@ -2544,16 +2708,19 @@ fn tui_rejects_a_code_change_without_writing_files() {
         vec![ProposedFileContent::new("README.md", "new\n")],
     )
     .expect("proposal is prepared");
-    let mut state = AppState::new(workspace.path());
-    update(&mut state, AppAction::CodeChangeProposed { proposal });
+    let mut state = TestState::new(workspace.path());
+    update(&mut state, AppMsg::CodeChangeProposed { proposal });
     type_text(&mut state, "/review reject");
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     )
     .expect("reject command is emitted");
 
-    execute_code_change_command(&mut state, &command).expect("change is rejected");
+    state
+        .app
+        .execute_code_change_command(&command)
+        .expect("change is rejected");
 
     assert_eq!(
         state.code_change_review().expect("review exists").status,
@@ -2574,16 +2741,19 @@ fn tui_requests_agent_adjustments_for_a_code_change() {
         vec![ProposedFileContent::new("README.md", "content\n")],
     )
     .expect("proposal is prepared");
-    let mut state = AppState::new(workspace.path());
-    update(&mut state, AppAction::CodeChangeProposed { proposal });
+    let mut state = TestState::new(workspace.path());
+    update(&mut state, AppMsg::CodeChangeProposed { proposal });
     type_text(&mut state, "/review changes Add an example");
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     )
     .expect("changes command is emitted");
 
-    let handled = execute_code_change_command(&mut state, &command).expect("changes are requested");
+    let handled = state
+        .app
+        .execute_code_change_command(&command)
+        .expect("changes are requested");
 
     assert!(!handled);
     assert_eq!(
@@ -2611,17 +2781,20 @@ fn tui_reports_patch_conflicts_without_overwriting_files() {
         vec![ProposedFileContent::new("README.md", "proposed\n")],
     )
     .expect("proposal is prepared");
-    let mut state = AppState::new(workspace.path());
-    update(&mut state, AppAction::CodeChangeProposed { proposal });
+    let mut state = TestState::new(workspace.path());
+    update(&mut state, AppMsg::CodeChangeProposed { proposal });
     std::fs::write(workspace.path().join("README.md"), "external\n").expect("source file changes");
     type_text(&mut state, "/review accept");
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     )
     .expect("accept command is emitted");
 
-    execute_code_change_command(&mut state, &command).expect("conflict is displayed");
+    state
+        .app
+        .execute_code_change_command(&command)
+        .expect("conflict is displayed");
 
     assert_eq!(
         state.code_change_review().expect("review exists").status,
@@ -2629,7 +2802,7 @@ fn tui_reports_patch_conflicts_without_overwriting_files() {
             paths: vec!["README.md".to_owned()],
         }
     );
-    let buffer = render_to_buffer(&state, 120, 30);
+    let buffer = render_to_buffer(&mut state, 120, 30);
     assert_buffer_contains(&buffer, "Conflict");
     assert_buffer_contains(&buffer, "README.md");
     assert_eq!(
@@ -2648,21 +2821,24 @@ fn tui_displays_and_enforces_sensitive_path_policy_denial() {
         vec![ProposedFileContent::new(".env", "TOKEN=new\n")],
     )
     .expect("proposal is prepared");
-    let mut state = AppState::new(workspace.path());
-    update(&mut state, AppAction::CodeChangeProposed { proposal });
-    let proposal_view = render_to_buffer(&state, 120, 30);
+    let mut state = TestState::new(workspace.path());
+    update(&mut state, AppMsg::CodeChangeProposed { proposal });
+    let proposal_view = render_to_buffer(&mut state, 120, 30);
     assert_buffer_contains(&proposal_view, "Policy: Deny");
     assert_buffer_contains(&proposal_view, "Risk [High] .env");
     type_text(&mut state, "/review accept");
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     )
     .expect("accept command is emitted");
 
-    execute_code_change_command(&mut state, &command).expect("denial is displayed");
+    state
+        .app
+        .execute_code_change_command(&command)
+        .expect("denial is displayed");
 
-    let denied = render_to_buffer(&state, 120, 30);
+    let denied = render_to_buffer(&mut state, 120, 30);
     assert_buffer_contains(&denied, "Denied by policy");
     assert_eq!(
         std::fs::read_to_string(workspace.path().join(".env")).expect("env file loads"),
@@ -2740,10 +2916,10 @@ fn tui_displays_run_tool_file_policy_and_error_audit_events() {
             },
         ),
     ];
-    let mut state = AppState::new(workspace.path());
+    let mut state = TestState::new(workspace.path());
     update(
         &mut state,
-        AppAction::RunFinished {
+        AppMsg::RunFinished {
             response: RunResponse {
                 session_id: "workspace-0001".to_owned(),
                 run_id: run_id.to_string(),
@@ -2758,10 +2934,10 @@ fn tui_displays_run_tool_file_policy_and_error_audit_events() {
     type_text(&mut state, "/audit");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
-    let buffer = render_to_buffer(&state, 120, 40);
+    let buffer = render_to_buffer(&mut state, 120, 40);
     assert_buffer_contains(&buffer, "Audit");
     assert_buffer_contains(&buffer, "User request");
     assert_buffer_contains(&buffer, "File read");
@@ -2777,11 +2953,11 @@ fn tui_submits_the_selected_human_input_option() {
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(
@@ -2800,7 +2976,7 @@ fn tui_submits_free_form_human_input_when_allowed() {
 
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(
@@ -2818,22 +2994,22 @@ fn tui_rejects_human_input_that_does_not_match_an_option() {
 
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
     assert_eq!(command, None);
     assert_eq!(state.run_status(), TuiRunStatus::WaitingForHumanInput);
     assert_eq!(state.input_text(), "invalid");
-    let buffer = render_to_buffer(&state, 120, 24);
+    let buffer = render_to_buffer(&mut state, 120, 24);
     assert_buffer_contains(&buffer, "must match one of the option ids");
     assert_buffer_contains(&buffer, "safe, fast");
 }
 
 #[test]
 fn tui_distinguishes_operation_confirmation_from_clarification() {
-    let state = waiting_human_input_state_with_kind(false, Some("confirmation"));
+    let mut state = waiting_human_input_state_with_kind(false, Some("confirmation"));
 
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
 
     assert_buffer_contains(&buffer, "Confirmation required");
     assert_buffer_does_not_contain(&buffer, "Input required");
@@ -2841,7 +3017,7 @@ fn tui_distinguishes_operation_confirmation_from_clarification() {
 
 #[test]
 fn tui_displays_the_completed_run_answer() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let run_id = RunId::from("workspace-0001-000001".to_owned());
     let response_step = Step::new(
         StepId::new(&run_id, 1),
@@ -2863,7 +3039,7 @@ fn tui_displays_the_completed_run_answer() {
 
     update(
         &mut state,
-        AppAction::RunFinished {
+        AppMsg::RunFinished {
             response: RunResponse {
                 session_id: "workspace-0001".to_owned(),
                 run_id: "workspace-0001-000001".to_owned(),
@@ -2878,7 +3054,7 @@ fn tui_displays_the_completed_run_answer() {
     let command_event_id = AgentEventId::tool(1, "exec", 1);
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             command_event_id.clone(),
             AgentEventKind::Started,
             AgentEventData::ToolStarted {
@@ -2890,7 +3066,7 @@ fn tui_displays_the_completed_run_answer() {
     );
     update(
         &mut state,
-        AppAction::AgentEvent(AgentEvent::new(
+        AppMsg::AgentEvent(AgentEvent::new(
             command_event_id,
             AgentEventKind::Output,
             AgentEventData::ToolOutput {
@@ -2906,7 +3082,7 @@ fn tui_displays_the_completed_run_answer() {
     );
 
     assert_eq!(state.run_status(), TuiRunStatus::Completed);
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "Completed · 500ms");
     assert_buffer_contains(&buffer, "The requested change is complete.");
     assert_buffer_contains(&buffer, "150 tokens (120 in / 30 out) · 500 ms");
@@ -2924,7 +3100,7 @@ fn tui_displays_the_completed_run_answer() {
 
 #[test]
 fn tui_displays_persisted_steps_in_id_order() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let run_id = RunId::from("workspace-0001-000001".to_owned());
     let steps = vec![
         Step::new(
@@ -2947,7 +3123,7 @@ fn tui_displays_persisted_steps_in_id_order() {
 
     update(
         &mut state,
-        AppAction::RunFinished {
+        AppMsg::RunFinished {
             response: RunResponse {
                 session_id: "workspace-0001".to_owned(),
                 run_id: run_id.to_string(),
@@ -2968,30 +3144,30 @@ fn tui_displays_persisted_steps_in_id_order() {
         state.steps()[1].id.to_string(),
         "workspace-0001-000001-000002"
     );
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_does_not_contain(&buffer, "Step  User message");
     assert_buffer_does_not_contain(&buffer, "Step  Tool result");
 }
 
 #[test]
 fn tui_keeps_run_errors_in_the_message_timeline() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     update(
         &mut state,
-        AppAction::RunFailed {
+        AppMsg::RunFailed {
             error: "provider timed out".to_owned(),
         },
     );
     update(
         &mut state,
-        AppAction::AssistantMessage {
+        AppMsg::AssistantMessage {
             content: "Later message".to_owned(),
         },
     );
 
     assert_eq!(state.run_status(), TuiRunStatus::Failed);
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_contains(&buffer, "Error");
     assert_buffer_contains(&buffer, "provider timed out");
     assert_buffer_contains(&buffer, "Later message");
@@ -2999,9 +3175,9 @@ fn tui_keeps_run_errors_in_the_message_timeline() {
 
 #[test]
 fn tui_shell_renders_workspace_and_idle_status() {
-    let state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
 
     assert_buffer_contains(&buffer, "Jux");
     assert_buffer_contains(&buffer, "Environment");
@@ -3019,15 +3195,15 @@ fn tui_shell_renders_workspace_and_idle_status() {
 
 #[test]
 fn tui_selects_the_status_panel_with_right_arrow() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
     );
 
     assert_eq!(state.focused_panel(), FocusedPanel::Sidebar);
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_fragment_has_background(&buffer, "Environment", sidebar_background());
     assert_input_block_does_not_have_background(
         &buffer,
@@ -3038,28 +3214,28 @@ fn tui_selects_the_status_panel_with_right_arrow() {
 
 #[test]
 fn tui_returns_focus_to_the_conversation_with_left_arrow() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
     );
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
     );
 
     assert_eq!(state.focused_panel(), FocusedPanel::Conversation);
-    let buffer = render_to_buffer(&state, 80, 24);
+    let buffer = render_to_buffer(&mut state, 80, 24);
     assert_buffer_fragment_has_background(&buffer, "Environment", sidebar_background());
     assert_input_block_has_background(&buffer, "> Start typing", input_active_background());
 }
 
 #[test]
 fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     update(
         &mut state,
-        AppAction::AssistantMessage {
+        AppMsg::AssistantMessage {
             content: "Selectable message".to_owned(),
         },
     );
@@ -3070,21 +3246,21 @@ fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
 
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 2),
             viewport,
         },
     );
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Drag(MouseButton::Left), 90, 2),
             viewport,
         },
     );
     let command = update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Up(MouseButton::Left), 90, 2),
             viewport,
         },
@@ -3101,12 +3277,12 @@ fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
         state.text_selection().map(|selection| selection.panel),
         Some(SelectionPanel::Conversation)
     );
-    let buffer = render_to_buffer(&state, 100, 24);
+    let buffer = render_to_buffer(&mut state, 100, 24);
     assert_buffer_fragment_has_fg_bg(&buffer, "Selectable message", Color::Black, Color::Yellow);
     let completed_selection = state.text_selection();
     let command = update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 3),
             viewport,
         },
@@ -3117,7 +3293,7 @@ fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
 
 #[test]
 fn tui_selects_and_copies_text_inside_the_status_panel() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let viewport = TuiViewport {
         width: 100,
         height: 24,
@@ -3125,21 +3301,21 @@ fn tui_selects_and_copies_text_inside_the_status_panel() {
 
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Down(MouseButton::Left), 63, 4),
             viewport,
         },
     );
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Drag(MouseButton::Left), 70, 4),
             viewport,
         },
     );
     let command = update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Up(MouseButton::Left), 70, 4),
             viewport,
         },
@@ -3155,13 +3331,13 @@ fn tui_selects_and_copies_text_inside_the_status_panel() {
         state.text_selection().map(|selection| selection.panel),
         Some(SelectionPanel::Sidebar)
     );
-    let buffer = render_to_buffer(&state, 100, 24);
+    let buffer = render_to_buffer(&mut state, 100, 24);
     assert_buffer_fragment_has_fg_bg(&buffer, "Session", Color::Black, Color::Yellow);
 }
 
 #[test]
 fn tui_drags_the_divider_to_resize_both_panels() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let viewport = TuiViewport {
         width: 100,
         height: 24,
@@ -3169,33 +3345,33 @@ fn tui_drags_the_divider_to_resize_both_panels() {
 
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Down(MouseButton::Left), 60, 2),
             viewport,
         },
     );
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Drag(MouseButton::Left), 70, 2),
             viewport,
         },
     );
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Up(MouseButton::Left), 70, 2),
             viewport,
         },
     );
 
-    let buffer = render_to_buffer(&state, 100, 24);
+    let buffer = render_to_buffer(&mut state, 100, 24);
     assert_eq!(find_fragment_position(&buffer, "▶"), Some((12, 70)));
 }
 
 #[test]
 fn tui_toggles_the_sidebar_with_the_divider_arrow() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let viewport = TuiViewport {
         width: 100,
         height: 24,
@@ -3203,34 +3379,34 @@ fn tui_toggles_the_sidebar_with_the_divider_arrow() {
 
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Down(MouseButton::Left), 60, 12),
             viewport,
         },
     );
 
     assert!(!state.sidebar_visible());
-    let hidden = render_to_buffer(&state, 100, 24);
+    let hidden = render_to_buffer(&mut state, 100, 24);
     assert_buffer_does_not_contain(&hidden, "Environment");
     assert_eq!(find_fragment_position(&hidden, "◀"), Some((12, 99)));
 
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Down(MouseButton::Left), 99, 12),
             viewport,
         },
     );
 
     assert!(state.sidebar_visible());
-    let visible = render_to_buffer(&state, 100, 24);
+    let visible = render_to_buffer(&mut state, 100, 24);
     assert_buffer_contains(&visible, "Environment");
     assert_eq!(find_fragment_position(&visible, "▶"), Some((12, 60)));
 }
 
 #[test]
 fn tui_click_focus_does_not_start_text_selection() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let viewport = TuiViewport {
         width: 100,
         height: 24,
@@ -3238,14 +3414,14 @@ fn tui_click_focus_does_not_start_text_selection() {
 
     update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
             viewport,
         },
     );
     let command = update(
         &mut state,
-        AppAction::Mouse {
+        TestInput::Mouse {
             event: mouse_event(MouseEventKind::Up(MouseButton::Left), 1, 1),
             viewport,
         },
@@ -3257,7 +3433,7 @@ fn tui_click_focus_does_not_start_text_selection() {
 
 #[test]
 fn tui_displays_workspace_model_sandbox_and_summary_status() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     state.set_runtime_info(TuiRuntimeInfo {
         workspace_id: Some("workspace-1234".to_owned()),
         model_provider: "deepseek".to_owned(),
@@ -3271,7 +3447,7 @@ fn tui_displays_workspace_model_sandbox_and_summary_status() {
         ..TuiRuntimeInfo::default()
     });
 
-    let buffer = render_to_buffer(&state, 120, 30);
+    let buffer = render_to_buffer(&mut state, 120, 30);
 
     assert_buffer_contains(&buffer, "deepseek/deepseek-chat");
     assert_buffer_contains(&buffer, "FS  read-only");
@@ -3284,7 +3460,7 @@ fn tui_displays_workspace_model_sandbox_and_summary_status() {
 
 #[test]
 fn tui_displays_configuration_errors_and_runtime_logs() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     state.set_runtime_info(TuiRuntimeInfo {
         workspace_id: Some("workspace-1234".to_owned()),
         model_provider: "deepseek".to_owned(),
@@ -3299,17 +3475,17 @@ fn tui_displays_configuration_errors_and_runtime_logs() {
     });
     update(
         &mut state,
-        AppAction::RunFailed {
+        AppMsg::RunFailed {
             error: "model unavailable".to_owned(),
         },
     );
     type_text(&mut state, "/logs");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
 
-    let buffer = render_to_buffer(&state, 120, 30);
+    let buffer = render_to_buffer(&mut state, 120, 30);
 
     assert_buffer_contains(&buffer, "Configuration error");
     assert_buffer_contains(&buffer, "invalid config shape: unknown field");
@@ -3317,31 +3493,31 @@ fn tui_displays_configuration_errors_and_runtime_logs() {
     assert_buffer_contains(&buffer, "model unavailable");
 }
 
-fn render_to_buffer(state: &AppState, width: u16, height: u16) -> Buffer {
+fn render_to_buffer(state: &mut TestState, width: u16, height: u16) -> Buffer {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal is created");
     terminal
-        .draw(|frame| render_app(frame, state))
+        .draw(|frame| state.app.render(frame))
         .expect("app renders");
     terminal.backend().buffer().clone()
 }
 
-fn render_cursor_position(state: &AppState, width: u16, height: u16) -> Position {
+fn render_cursor_position(state: &mut TestState, width: u16, height: u16) -> Position {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal is created");
     terminal
-        .draw(|frame| render_app(frame, state))
+        .draw(|frame| state.app.render(frame))
         .expect("app renders");
     terminal
         .get_cursor_position()
         .expect("cursor position is available")
 }
 
-fn type_text(state: &mut AppState, text: &str) {
+fn type_text(state: &mut TestState, text: &str) {
     for character in text.chars() {
         update(
             state,
-            AppAction::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+            test_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
         );
     }
 }
@@ -3377,12 +3553,12 @@ fn skill_definition(name: &str, scope: SkillScope, directory: &str) -> SkillDefi
     }
 }
 
-fn waiting_human_input_state(allow_free_text: bool) -> AppState {
+fn waiting_human_input_state(allow_free_text: bool) -> TestState {
     waiting_human_input_state_with_kind(allow_free_text, None)
 }
 
-fn waiting_human_input_state_with_kind(allow_free_text: bool, kind: Option<&str>) -> AppState {
-    let mut state = AppState::new("/workspace");
+fn waiting_human_input_state_with_kind(allow_free_text: bool, kind: Option<&str>) -> TestState {
+    let mut state = TestState::new("/workspace");
     let run_id = RunId::from("workspace-0001-000001".to_owned());
     let mut arguments = serde_json::json!({
         "prompt": "Which implementation should Jux use?",
@@ -3411,7 +3587,7 @@ fn waiting_human_input_state_with_kind(allow_free_text: bool, kind: Option<&str>
     );
     update(
         &mut state,
-        AppAction::RunFinished {
+        AppMsg::RunFinished {
             response: RunResponse {
                 session_id: "workspace-0001".to_owned(),
                 run_id: run_id.to_string(),
@@ -3656,61 +3832,61 @@ fn status_bar_background() -> Color {
 
 #[test]
 fn tui_completes_commands_and_restores_submitted_input_history() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "/ver");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), "/version");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     type_text(&mut state, "remember this");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
-    update(&mut state, AppAction::RunCanceled);
+    update(&mut state, AppMsg::RunCanceled);
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), "remember this");
 }
 
 #[test]
 fn tui_browses_input_history_and_restores_the_current_draft() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     for request in ["first request", "second request"] {
         type_text(&mut state, request);
         update(
             &mut state,
-            AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         );
-        update(&mut state, AppAction::RunCanceled);
+        update(&mut state, AppMsg::RunCanceled);
     }
     type_text(&mut state, "current draft");
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), "second request");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), "first request");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), "second request");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), "current draft");
 }
@@ -3726,44 +3902,47 @@ fn tui_browses_persisted_session_input_history() {
         .create_run("second request".to_owned())
         .expect("second run is created");
 
-    let mut state = AppState::new(workspace.path());
-    load_active_session_history(&mut state, &store).expect("history loads");
+    let mut state = TestState::new(workspace.path());
+    state
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
     type_text(&mut state, "draft");
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), "second request");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), "first request");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), "draft");
 }
 
 #[test]
 fn tui_keeps_up_and_down_for_cursor_movement_in_multiline_input() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "first");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
     );
     type_text(&mut state, "second");
 
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
     );
     type_text(&mut state, "!");
 
@@ -3772,7 +3951,7 @@ fn tui_keeps_up_and_down_for_cursor_movement_in_multiline_input() {
 
 #[test]
 fn tui_completes_inline_skill_references_for_the_next_run() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     state.set_skill_catalog(SkillCatalog {
         skills: vec![skill_definition(
             "review-code",
@@ -3782,11 +3961,11 @@ fn tui_completes_inline_skill_references_for_the_next_run() {
         overrides: Vec::new(),
     });
     type_text(&mut state, "Use $review");
-    let popup = render_to_buffer(&state, 100, 30);
+    let popup = render_to_buffer(&mut state, 100, 30);
     assert_buffer_contains(&popup, "$review-code");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
     );
     assert_eq!(state.input_text(), "Use $review-code");
     assert_eq!(state.selected_skill_names(), &["review-code"]);
@@ -3794,15 +3973,15 @@ fn tui_completes_inline_skill_references_for_the_next_run() {
 
 #[test]
 fn tui_renders_markdown_and_code_blocks_with_terminal_styles() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     update(
         &mut state,
-        AppAction::AssistantMessage {
+        AppMsg::AssistantMessage {
             content: "# Heading\n- item\n> quote\n```rust\nfn main() {}\n```\n| Command | 说明 |\n|---|---|\n| `cargo test` | 运行测试 |"
                 .to_owned(),
         },
     );
-    let buffer = render_to_buffer(&state, 100, 30);
+    let buffer = render_to_buffer(&mut state, 100, 30);
     assert_buffer_contains(&buffer, "Heading");
     assert_buffer_contains(&buffer, "• item");
     assert_buffer_contains(&buffer, "│ quote");
@@ -3820,15 +3999,15 @@ fn tui_renders_markdown_and_code_blocks_with_terminal_styles() {
 
 #[test]
 fn tui_highlights_fenced_code_for_a_known_language() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     update(
         &mut state,
-        AppAction::AssistantMessage {
+        AppMsg::AssistantMessage {
             content: "```rust\nlet syntax_probe = \"highlighted\";\n```".to_owned(),
         },
     );
 
-    let buffer = render_to_buffer(&state, 100, 30);
+    let buffer = render_to_buffer(&mut state, 100, 30);
     assert_buffer_fragments_have_different_foregrounds(&buffer, "let", "highlighted");
     assert_buffer_fragment_has_background(&buffer, "let", Color::Rgb(24, 28, 34));
     assert_buffer_fragment_has_background(&buffer, "highlighted", Color::Rgb(24, 28, 34));
@@ -3836,15 +4015,15 @@ fn tui_highlights_fenced_code_for_a_known_language() {
 
 #[test]
 fn tui_fills_the_markdown_content_width_with_the_code_background() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     update(
         &mut state,
-        AppAction::AssistantMessage {
+        AppMsg::AssistantMessage {
             content: "```rust\nlet width_probe = 1;\n\nwidth_probe\n```".to_owned(),
         },
     );
 
-    let buffer = render_to_buffer(&state, 100, 30);
+    let buffer = render_to_buffer(&mut state, 100, 30);
     let (code_y, code_x) = find_fragment_position(&buffer, "width_probe = 1")
         .expect("buffer contains the first code line");
     assert_row_has_background(&buffer, code_y, code_x, code_x + 35, Color::Rgb(24, 28, 34));
@@ -3860,30 +4039,30 @@ fn tui_fills_the_markdown_content_width_with_the_code_background() {
 #[test]
 fn tui_highlights_common_fenced_code_language_aliases() {
     for language in ["ts", "typescript", "tsx"] {
-        let mut state = AppState::new("/workspace");
+        let mut state = TestState::new("/workspace");
         update(
             &mut state,
-            AppAction::AssistantMessage {
+            AppMsg::AssistantMessage {
                 content: format!(
                     "```{language}\nconst syntaxAliasProbe: string = \"highlighted\";\n```"
                 ),
             },
         );
 
-        let buffer = render_to_buffer(&state, 100, 30);
+        let buffer = render_to_buffer(&mut state, 100, 30);
         assert_buffer_fragments_have_different_foregrounds(&buffer, "const", "highlighted");
     }
 
     for language in ["js", "javascript", "jsx"] {
-        let mut state = AppState::new("/workspace");
+        let mut state = TestState::new("/workspace");
         update(
             &mut state,
-            AppAction::AssistantMessage {
+            AppMsg::AssistantMessage {
                 content: format!("```{language}\nconst syntaxAliasProbe = \"highlighted\";\n```"),
             },
         );
 
-        let buffer = render_to_buffer(&state, 100, 30);
+        let buffer = render_to_buffer(&mut state, 100, 30);
         assert_buffer_fragments_have_different_foregrounds(&buffer, "const", "highlighted");
     }
 }
@@ -3891,15 +4070,15 @@ fn tui_highlights_common_fenced_code_language_aliases() {
 #[test]
 fn tui_falls_back_to_plain_text_without_a_known_code_language() {
     for opening_fence in ["```", "```not-a-language"] {
-        let mut state = AppState::new("/workspace");
+        let mut state = TestState::new("/workspace");
         update(
             &mut state,
-            AppAction::AssistantMessage {
+            AppMsg::AssistantMessage {
                 content: format!("{opening_fence}\nplain fallback content\n```"),
             },
         );
 
-        let buffer = render_to_buffer(&state, 100, 30);
+        let buffer = render_to_buffer(&mut state, 100, 30);
         assert_buffer_fragment_has_fg_bg(
             &buffer,
             "plain fallback content",
@@ -3911,21 +4090,21 @@ fn tui_falls_back_to_plain_text_without_a_known_code_language() {
 
 #[test]
 fn tui_selects_copies_and_loads_a_user_message_for_editing() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     type_text(&mut state, "original request");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
-    update(&mut state, AppAction::RunCanceled);
+    update(&mut state, AppMsg::RunCanceled);
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+        test_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
     );
     assert_eq!(
         update(
             &mut state,
-            AppAction::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            test_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
         ),
         Some(AppCommand::CopyText {
             content: "original request".to_owned(),
@@ -3933,7 +4112,7 @@ fn tui_selects_copies_and_loads_a_user_message_for_editing() {
     );
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+        test_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
     );
     assert_eq!(state.input_text(), "original request");
 }
@@ -3943,19 +4122,25 @@ fn tui_archives_a_session_and_preserves_a_working_active_session() {
     let workspace = assert_fs::TempDir::new().expect("temp workspace exists");
     let store = SqliteWorkspaceStore::new(workspace.path());
     let initial = store.init_workspace().expect("workspace initializes");
-    let mut state = AppState::new(workspace.path());
-    load_active_session_history(&mut state, &store).expect("history loads");
+    let mut state = TestState::new(workspace.path());
+    state
+        .app
+        .load_active_session_history(&store)
+        .expect("history loads");
     type_text(&mut state, "/session");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     let command = update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+        test_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
     )
     .expect("archive command is emitted");
-    execute_session_command(&mut state, &store, &command).expect("session archives");
+    state
+        .app
+        .execute_session_command(&store, &command)
+        .expect("session archives");
     assert!(
         store
             .load_session(&initial.active_session_id)
@@ -3973,15 +4158,15 @@ fn tui_archives_a_session_and_preserves_a_working_active_session() {
 
 #[test]
 fn tui_retries_failed_and_continues_canceled_requests() {
-    let mut failed = AppState::new("/workspace");
+    let mut failed = TestState::new("/workspace");
     type_text(&mut failed, "retry me");
     update(
         &mut failed,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     update(
         &mut failed,
-        AppAction::RunFailed {
+        AppMsg::RunFailed {
             error: "failed".to_owned(),
         },
     );
@@ -3989,25 +4174,25 @@ fn tui_retries_failed_and_continues_canceled_requests() {
     assert_eq!(
         update(
             &mut failed,
-            AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         ),
         Some(AppCommand::StartRun {
             request: "retry me".to_owned(),
         })
     );
 
-    let mut canceled = AppState::new("/workspace");
+    let mut canceled = TestState::new("/workspace");
     type_text(&mut canceled, "continue me");
     update(
         &mut canceled,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
-    update(&mut canceled, AppAction::RunCanceled);
+    update(&mut canceled, AppMsg::RunCanceled);
     type_text(&mut canceled, "/continue");
     assert_eq!(
         update(
             &mut canceled,
-            AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         ),
         Some(AppCommand::StartRun {
             request: "continue me".to_owned(),
@@ -4017,33 +4202,33 @@ fn tui_retries_failed_and_continues_canceled_requests() {
 
 #[test]
 fn tui_searches_conversation_and_cycles_matching_messages() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     for request in ["first needle", "middle", "last needle"] {
         type_text(&mut state, request);
         update(
             &mut state,
-            AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         );
-        update(&mut state, AppAction::RunCanceled);
+        update(&mut state, AppMsg::RunCanceled);
     }
     type_text(&mut state, "/search needle");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
-    let first = render_to_buffer(&state, 100, 30);
+    let first = render_to_buffer(&mut state, 100, 30);
     assert_buffer_contains(&first, "▶ first needle");
     type_text(&mut state, "/search needle");
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     assert_eq!(state.messages()[2].content, "last needle");
 }
 
 #[test]
 fn tui_applies_high_contrast_theme_and_custom_shortcuts() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     state.set_runtime_info(TuiRuntimeInfo {
         theme: TuiTheme::HighContrast,
         shortcuts: TuiShortcutConfig {
@@ -4052,18 +4237,18 @@ fn tui_applies_high_contrast_theme_and_custom_shortcuts() {
         },
         ..TuiRuntimeInfo::default()
     });
-    let buffer = render_to_buffer(&state, 100, 24);
+    let buffer = render_to_buffer(&mut state, 100, 24);
     assert_eq!(buffer[(1, 1)].bg, Color::Black);
     update(
         &mut state,
-        AppAction::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        test_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
     );
     assert!(state.should_quit);
 }
 
 #[test]
 fn tui_shows_update_at_startup_and_in_sidebar() {
-    let mut state = AppState::new("/workspace");
+    let mut state = TestState::new("/workspace");
     let metadata = DistributionMetadata::unbranded();
     let notice = UpdateNotice {
         current_version: Version::parse("0.1.0").expect("current version"),
@@ -4074,7 +4259,7 @@ fn tui_shows_update_at_startup_and_in_sidebar() {
 
     update(
         &mut state,
-        AppAction::UpdateAvailable {
+        AppMsg::UpdateAvailable {
             notice,
             show_startup_message: true,
         },
@@ -4085,6 +4270,6 @@ fn tui_shows_update_at_startup_and_in_sidebar() {
             .content
             .contains("Jux 0.2.0 is available")
     );
-    let buffer = render_to_buffer(&state, 100, 30);
+    let buffer = render_to_buffer(&mut state, 100, 30);
     assert_buffer_contains(&buffer, "↑ 0.2.0 available");
 }

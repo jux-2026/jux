@@ -1,13 +1,13 @@
 use super::super::theme::palette;
 use jux_core::TuiTheme;
-use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Widget};
 
 pub(in crate::tui::ui) fn render(
-    frame: &mut Frame<'_>,
+    buffer: &mut Buffer,
     area: Rect,
     sidebar_visible: bool,
     theme: TuiTheme,
@@ -23,8 +23,7 @@ pub(in crate::tui::ui) fn render(
             }
         })
         .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(palette(theme).divider)),
-        area,
-    );
+    Paragraph::new(lines)
+        .style(Style::default().bg(palette(theme).divider))
+        .render(area, buffer);
 }
