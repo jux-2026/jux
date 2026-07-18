@@ -5,7 +5,6 @@ use crossterm::event::{
 };
 use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
-use unicode_width::UnicodeWidthStr;
 
 const DEFAULT_CONVERSATION_WIDTH_PERCENT: u16 = 60;
 const MIN_PANEL_WIDTH: u16 = 20;
@@ -500,10 +499,6 @@ impl<'a> UiContext<'a> {
             SelectionPanel::Conversation => conversation_text_lines(self),
             SelectionPanel::Sidebar => sidebar_text_lines(self),
         }
-    }
-
-    fn conversation_text_lines(&self) -> Vec<String> {
-        conversation_text_lines(self)
     }
 
     fn filtered_audit_items(&self) -> Vec<&AuditItem> {
@@ -2002,8 +1997,22 @@ fn selection_point_for_event(
     event: MouseEvent,
     viewport: TuiViewport,
 ) -> Option<(SelectionPanel, TextSelectionPoint)> {
+    if state
+        .conversation_ui
+        .selection_snapshot
+        .contains(event.column, event.row)
+    {
+        return Some((
+            SelectionPanel::Conversation,
+            state
+                .conversation_ui
+                .selection_snapshot
+                .point(event.column, event.row),
+        ));
+    }
     let geometry = panel_geometries(state, viewport)
         .into_iter()
+        .filter(|geometry| geometry.panel != SelectionPanel::Conversation)
         .find(|geometry| geometry.contains(event.column, event.row))?;
     Some((
         geometry.panel,
@@ -2017,6 +2026,12 @@ fn selection_point_for_panel(
     viewport: TuiViewport,
     panel: SelectionPanel,
 ) -> TextSelectionPoint {
+    if panel == SelectionPanel::Conversation {
+        return state
+            .conversation_ui
+            .selection_snapshot
+            .point(event.column, event.row);
+    }
     let geometry = panel_geometries(state, viewport)
         .into_iter()
         .find(|geometry| geometry.panel == panel)
@@ -2044,14 +2059,6 @@ fn selection_point_from_geometry(
         geometry.x.saturating_add(geometry.width.saturating_sub(1)),
     );
     let mut line = usize::from(clamped_row.saturating_sub(geometry.y));
-    let scroll_started = Instant::now();
-    let scroll_offset = if geometry.panel == SelectionPanel::Conversation {
-        conversation_scroll_offset(state, geometry)
-    } else {
-        0
-    };
-    let scroll_elapsed = scroll_started.elapsed();
-    line = line.saturating_add(scroll_offset);
     line = line.min(line_count.saturating_sub(1));
     let column = usize::from(clamped_column.saturating_sub(geometry.x))
         .min(lines.get(line).map_or(0, |line| line.chars().count()));
@@ -2060,7 +2067,6 @@ fn selection_point_from_geometry(
         panel = ?geometry.panel,
         line_count,
         lines_us = %lines_elapsed.as_micros(),
-        scroll_us = %scroll_elapsed.as_micros(),
         total_us = %total_started.elapsed().as_micros(),
         "[DEBUG-selection-perf] selection point calculated"
     );
@@ -2098,19 +2104,6 @@ fn conversation_geometry(state: &UiContext<'_>, viewport: TuiViewport) -> PanelG
     content_geometry(SelectionPanel::Conversation, 0, 0, width, viewport.height)
 }
 
-fn conversation_scroll_offset(state: &UiContext<'_>, geometry: PanelGeometry) -> usize {
-    let width = usize::from(geometry.width.max(1));
-    let total_rows = state
-        .conversation_text_lines()
-        .iter()
-        .map(|line| UnicodeWidthStr::width(line.as_str()).max(1).div_ceil(width))
-        .sum::<usize>();
-    let maximum = total_rows.saturating_sub(usize::from(geometry.height));
-    maximum.saturating_sub(
-        usize::from(state.conversation_ui.conversation_scroll_from_bottom).min(maximum),
-    )
-}
-
 fn content_geometry(
     panel: SelectionPanel,
     x: u16,
@@ -2141,6 +2134,12 @@ impl PanelGeometry {
 }
 
 fn selected_text(state: &UiContext<'_>, selection: TextSelection) -> String {
+    if selection.panel == SelectionPanel::Conversation {
+        return state
+            .conversation_ui
+            .selection_snapshot
+            .selected_text(selection);
+    }
     let lines = state.panel_text_lines(selection.panel);
     let (start, end) = ordered_points(selection.anchor, selection.focus);
     lines

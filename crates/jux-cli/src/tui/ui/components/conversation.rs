@@ -1,16 +1,16 @@
 use super::super::layout::ConversationLayout;
 use super::super::text::{
-    apply_text_selection, full_width_line, padded_full_width_lines, truncate_timeline_detail,
+    expand_tabs, full_width_line, padded_full_width_lines, truncate_timeline_detail,
 };
-use super::super::theme::{CONVERSATION_PADDING, palette, panel_block};
+use super::super::theme::{CONVERSATION_PADDING, palette, panel_block, selection_style};
 use super::super::{RenderState, VirtualListState, VisibleItem};
 use super::command_output;
 use super::markdown::MarkdownRenderer;
 use crate::tui::app::MessageRenderKey;
 use crate::tui::ui::state::ConversationUiState;
 use crate::tui::{
-    Message, MessageRole, SelectionPanel, TimelineStatus, TuiCodeChangeResult, TuiRunStatus,
-    TuiViewport,
+    Message, MessageRole, SelectionPanel, TextSelectionPoint, TimelineStatus, TuiCodeChangeResult,
+    TuiRunStatus, TuiViewport,
 };
 use jux_core::{AssistantResponseItem, HumanInputKind, LlmUsage, StepPayload, TuiTheme};
 use ratatui::buffer::Buffer;
@@ -23,6 +23,7 @@ use ratatui::widgets::{
 };
 use std::collections::HashSet;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use unicode_width::UnicodeWidthStr;
 
 const MAX_FILE_REFERENCE_ROWS: usize = 8;
 
@@ -41,7 +42,6 @@ struct ConversationScroll {
 struct PreparedConversation<'a> {
     sections: &'a [Option<CachedConversationSection>],
     footer: ConversationContent,
-    logical_offsets: &'a [usize],
     scroll: ConversationScroll,
     visible_sections: Vec<VisibleItem>,
 }
@@ -51,7 +51,6 @@ pub(crate) struct ConversationPanel {
     pub(crate) ui_state: ConversationUiState,
     section_cache: ConversationSectionCache,
     virtual_list: VirtualListState,
-    logical_offsets: Vec<usize>,
     scroll_from_bottom: u16,
     maximum_scroll: u16,
     scroll_initialized: bool,
@@ -84,7 +83,6 @@ struct CachedRenderedLine {
 
 struct ConversationContent {
     lines: Vec<CachedRenderedLine>,
-    logical_lines: usize,
     last_line_has_content: Option<bool>,
 }
 
@@ -92,7 +90,6 @@ impl ConversationContent {
     fn new() -> Self {
         Self {
             lines: Vec::new(),
-            logical_lines: 0,
             last_line_has_content: None,
         }
     }
@@ -107,7 +104,6 @@ impl ConversationContent {
         let has_content = line_has_content(&line);
         let rendered = prepare_rendered_line(line, content_width);
         self.lines.push(rendered);
-        self.logical_lines = self.logical_lines.saturating_add(1);
         self.last_line_has_content = Some(has_content);
     }
 
@@ -137,23 +133,6 @@ impl ConversationContent {
     fn total_rows(&self) -> usize {
         self.lines.iter().map(|line| line.height).sum()
     }
-}
-
-fn conversation_line_is_selected(state: &RenderState<'_>, line: usize) -> bool {
-    let Some(selection) = state
-        .text_selection()
-        .filter(|selection| selection.panel == SelectionPanel::Conversation)
-    else {
-        return false;
-    };
-    let (start, end) = if (selection.anchor.line, selection.anchor.column)
-        <= (selection.focus.line, selection.focus.column)
-    {
-        (selection.anchor, selection.focus)
-    } else {
-        (selection.focus, selection.anchor)
-    };
-    line >= start.line && line <= end.line
 }
 
 impl ConversationSectionCache {
@@ -189,10 +168,15 @@ impl ConversationSectionCache {
 
 fn prepare_rendered_line(line: Line<'_>, content_width: u16) -> CachedRenderedLine {
     let style = line.style;
+    let mut column = 0usize;
     let line = Line::from(
         line.spans
             .into_iter()
-            .map(|span| Span::styled(span.content.into_owned(), span.style))
+            .map(|span| {
+                let content = expand_tabs(span.content.as_ref(), column);
+                column = column.saturating_add(UnicodeWidthStr::width(content.as_str()));
+                Span::styled(content, span.style)
+            })
             .collect::<Vec<_>>(),
     )
     .style(style);
@@ -325,14 +309,107 @@ pub(in crate::tui::ui) fn render_conversation_history(
         layout.history.width.saturating_sub(2),
         layout.history.height.saturating_sub(2),
     );
+    let scroll = prepared.scroll.clone();
     let render_started = Instant::now();
     render_prepared_conversation(buffer, state, layout.history, &prepared);
+    drop(prepared);
+    capture_selection_snapshot(panel, buffer, layout.history, scroll.offset);
+    render_conversation_selection(panel, buffer);
     tracing::debug!(
         target: "jux::selection_perf",
         elapsed_us = %render_started.elapsed().as_micros(),
         "[DEBUG-selection-perf] conversation paragraph rendered"
     );
-    render_conversation_scrollbar(buffer, state, layout.scrollbar, prepared.scroll);
+    render_conversation_scrollbar(buffer, state, layout.scrollbar, scroll);
+}
+
+fn capture_selection_snapshot(
+    panel: &mut ConversationPanel,
+    buffer: &Buffer,
+    history: Rect,
+    first_line: u16,
+) {
+    let inner = Rect::new(
+        history.x.saturating_add(CONVERSATION_PADDING),
+        history.y.saturating_add(CONVERSATION_PADDING),
+        history
+            .width
+            .saturating_sub(CONVERSATION_PADDING.saturating_mul(2)),
+        history
+            .height
+            .saturating_sub(CONVERSATION_PADDING.saturating_mul(2)),
+    );
+    let lines = (inner.y..inner.bottom())
+        .map(|row| {
+            let mut cells = (inner.x..inner.right())
+                .map(|column| {
+                    buffer
+                        .cell((column, row))
+                        .map_or_else(String::new, |cell| cell.symbol().to_owned())
+                })
+                .collect::<Vec<_>>();
+            while cells
+                .last()
+                .is_some_and(|symbol| symbol.is_empty() || symbol == " ")
+            {
+                cells.pop();
+            }
+            cells
+        })
+        .collect();
+    panel.ui_state.selection_snapshot = crate::tui::ui::state::ConversationSelectionSnapshot {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height,
+        first_line: usize::from(first_line),
+        lines,
+    };
+}
+
+fn render_conversation_selection(panel: &ConversationPanel, buffer: &mut Buffer) {
+    let Some(selection) = panel
+        .ui_state
+        .text_selection
+        .filter(|selection| selection.panel == SelectionPanel::Conversation)
+    else {
+        return;
+    };
+    let snapshot = &panel.ui_state.selection_snapshot;
+    let (start, end) = ordered_selection_points(selection.anchor, selection.focus);
+    for local_row in 0..snapshot.height {
+        let line = snapshot.first_line.saturating_add(usize::from(local_row));
+        if line < start.line || line > end.line {
+            continue;
+        }
+        let start_column = if line == start.line { start.column } else { 0 };
+        let end_column = if line == end.line {
+            end.column
+        } else {
+            usize::from(snapshot.width)
+        };
+        for column in start_column..end_column.min(usize::from(snapshot.width)) {
+            if let Some(cell) = buffer.cell_mut((
+                snapshot
+                    .x
+                    .saturating_add(u16::try_from(column).unwrap_or(u16::MAX)),
+                snapshot.y.saturating_add(local_row),
+            )) {
+                cell.set_style(selection_style());
+            }
+        }
+    }
+}
+
+fn ordered_selection_points(
+    first: TextSelectionPoint,
+    second: TextSelectionPoint,
+) -> (TextSelectionPoint, TextSelectionPoint) {
+    if (first.line, first.column) <= (second.line, second.column) {
+        (first, second)
+    } else {
+        (second, first)
+    }
 }
 
 pub(in crate::tui::ui) fn render_prompt_input(
@@ -570,14 +647,10 @@ fn prompt_panel<'a>(
         footer.append_dynamic_line(state, Line::default(), content_width, state.theme());
     }
     let assembled_elapsed = prompt_started.elapsed();
-    panel.logical_offsets.clear();
-    let mut logical_offset = 0usize;
     let mut content_row = 0usize;
     let mut command_toggle_rows = Vec::new();
     let mut section_heights = Vec::with_capacity(panel.section_cache.entries.len() + 1);
     for section in panel.section_cache.entries.iter().flatten() {
-        panel.logical_offsets.push(logical_offset);
-        logical_offset = logical_offset.saturating_add(section.content.logical_lines);
         section_heights.push(section.content.total_rows());
         command_toggle_rows.extend(section.command_toggle_rows.iter().map(|(row, index)| {
             (
@@ -587,7 +660,6 @@ fn prompt_panel<'a>(
         }));
         content_row = content_row.saturating_add(section.content.total_rows());
     }
-    panel.logical_offsets.push(logical_offset);
     section_heights.push(footer.total_rows().max(1));
     let total_rows = section_heights
         .iter()
@@ -629,7 +701,6 @@ fn prompt_panel<'a>(
     PreparedConversation {
         sections: &panel.section_cache.entries,
         footer,
-        logical_offsets: &panel.logical_offsets,
         scroll,
         visible_sections,
     }
@@ -1000,31 +1071,21 @@ fn render_prepared_conversation(
             .and_then(Option::as_ref)
             .map(|section| &section.content)
             .unwrap_or(&prepared.footer);
-        render_visible_section(
-            buffer,
-            state,
-            inner,
-            background,
-            visible,
-            content,
-            prepared.logical_offsets[visible.index],
-        );
+        render_visible_section(buffer, inner, background, visible, content);
     }
 }
 
 fn render_visible_section(
     buffer: &mut Buffer,
-    state: &RenderState<'_>,
     viewport: Rect,
     background: Color,
     visible: &VisibleItem,
     content: &ConversationContent,
-    logical_offset: usize,
 ) {
     let mut line_top = 0usize;
     let visible_bottom =
         usize::from(visible.area.y).saturating_add(usize::from(visible.area.height));
-    for (line_index, rendered) in content.lines.iter().enumerate() {
+    for rendered in &content.lines {
         let line_bottom = line_top.saturating_add(rendered.height);
         if line_bottom <= visible.skip_top {
             line_top = line_bottom;
@@ -1035,20 +1096,7 @@ fn render_visible_section(
         if viewport_y >= visible_bottom {
             break;
         }
-        let logical_line = logical_offset.saturating_add(line_index);
-        let line = if conversation_line_is_selected(state, logical_line) {
-            apply_text_selection(
-                state,
-                SelectionPanel::Conversation,
-                logical_line,
-                vec![rendered.line.clone()],
-            )
-            .into_iter()
-            .next()
-            .unwrap_or_default()
-        } else {
-            rendered.line.clone()
-        };
+        let line = rendered.line.clone();
         let skip_top = visible.skip_top.saturating_sub(line_top);
         let height = rendered
             .height

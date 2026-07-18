@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use super::super::app::{AuditFilter, TextSelection};
+use super::super::app::{AuditFilter, TextSelection, TextSelectionPoint};
 
 const DEFAULT_CONVERSATION_WIDTH_PERCENT: u16 = 60;
 
@@ -96,6 +96,67 @@ pub(crate) struct ConversationUiState {
     pub(crate) selected_timeline: Option<usize>,
     pub(crate) text_selection: Option<TextSelection>,
     pub(crate) text_selection_drag: Option<TextSelection>,
+    pub(crate) selection_snapshot: ConversationSelectionSnapshot,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ConversationSelectionSnapshot {
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) first_line: usize,
+    pub(crate) lines: Vec<Vec<String>>,
+}
+
+impl ConversationSelectionSnapshot {
+    pub(crate) fn contains(&self, column: u16, row: u16) -> bool {
+        self.width > 0
+            && self.height > 0
+            && column >= self.x
+            && column < self.x.saturating_add(self.width)
+            && row >= self.y
+            && row < self.y.saturating_add(self.height)
+    }
+
+    pub(crate) fn point(&self, column: u16, row: u16) -> TextSelectionPoint {
+        let row = row.clamp(self.y, self.y.saturating_add(self.height.saturating_sub(1)));
+        let column = column.clamp(self.x, self.x.saturating_add(self.width.saturating_sub(1)));
+        TextSelectionPoint {
+            line: self
+                .first_line
+                .saturating_add(usize::from(row.saturating_sub(self.y))),
+            column: usize::from(column.saturating_sub(self.x)),
+        }
+    }
+
+    pub(crate) fn selected_text(&self, selection: TextSelection) -> String {
+        let (start, end) = ordered_points(selection.anchor, selection.focus);
+        (start.line..=end.line)
+            .filter_map(|line| {
+                let cells = self.lines.get(line.checked_sub(self.first_line)?)?;
+                let start_column = if line == start.line { start.column } else { 0 };
+                let end_column = if line == end.line {
+                    end.column
+                } else {
+                    cells.len()
+                };
+                Some(cells[start_column.min(cells.len())..end_column.min(cells.len())].concat())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn ordered_points(
+    first: TextSelectionPoint,
+    second: TextSelectionPoint,
+) -> (TextSelectionPoint, TextSelectionPoint) {
+    if (first.line, first.column) <= (second.line, second.column) {
+        (first, second)
+    } else {
+        (second, first)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

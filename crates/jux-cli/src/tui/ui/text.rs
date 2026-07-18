@@ -8,10 +8,28 @@ use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MAX_TIMELINE_DETAIL_CHARS: usize = 80;
+const TAB_WIDTH: usize = 4;
+
+pub(super) fn expand_tabs(text: &str, initial_column: usize) -> String {
+    let mut expanded = String::with_capacity(text.len());
+    let mut column = initial_column;
+    for character in text.chars() {
+        if character == '\t' {
+            let spaces = TAB_WIDTH.saturating_sub(column % TAB_WIDTH).max(1);
+            expanded.push_str(&" ".repeat(spaces));
+            column = column.saturating_add(spaces);
+        } else {
+            expanded.push(character);
+            column = column.saturating_add(UnicodeWidthChar::width(character).unwrap_or_default());
+        }
+    }
+    expanded
+}
 
 pub(super) fn full_width_line(text: &str, width: u16, style: Style) -> Line<'static> {
+    let text = expand_tabs(text, 0);
     let width = usize::from(width);
-    let text_width = UnicodeWidthStr::width(text);
+    let text_width = UnicodeWidthStr::width(text.as_str());
     let padding = if width == 0 {
         0
     } else if text_width == 0 {
@@ -29,6 +47,7 @@ pub(super) fn padded_full_width_lines(text: &str, width: u16, style: Style) -> V
     if content_width == 0 {
         return vec![full_width_line("", width, style)];
     }
+    let text = expand_tabs(text, 1);
     let mut chunks = Vec::new();
     let mut chunk = String::new();
     let mut chunk_width = 0;

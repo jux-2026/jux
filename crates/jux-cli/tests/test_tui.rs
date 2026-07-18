@@ -1090,6 +1090,80 @@ fn tui_scrolls_through_messages_longer_than_the_viewport() {
 }
 
 #[test]
+fn tui_measures_tabs_and_expanded_spaces_with_the_same_scroll_range() {
+    let tabbed_line = format!("{}TARGET", "\t".repeat(30));
+    // The user-row prefix occupies three cells, so these four-column tab stops
+    // expand to one initial space followed by twenty-nine groups of four.
+    let expanded_line = format!("{}TARGET", " ".repeat(117));
+    let mut tabbed = TestState::new("/workspace");
+    let mut expanded = TestState::new("/workspace");
+    for (state, line) in [(&mut tabbed, tabbed_line), (&mut expanded, expanded_line)] {
+        let run_id = RunId::from("workspace-0001-000001".to_owned());
+        update(
+            state,
+            AppMsg::RunFinished {
+                response: RunResponse {
+                    session_id: "workspace-0001".to_owned(),
+                    run_id: run_id.to_string(),
+                    status: CoreRunStatus::Completed,
+                    created_at: 1_000,
+                    updated_at: 1_100,
+                    answer: None,
+                    steps: (1..=4)
+                        .map(|index| {
+                            Step::new(
+                                StepId::new(&run_id, index),
+                                StepKind::UserMessage,
+                                StepPayload::UserMessage {
+                                    content: line.clone(),
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+            },
+        );
+        render_to_buffer(state, 80, 16);
+        update(
+            state,
+            test_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+        );
+        render_to_buffer(state, 80, 16);
+    }
+
+    assert_eq!(
+        tabbed.conversation_scroll_from_bottom(),
+        expanded.conversation_scroll_from_bottom(),
+        "tabbed={}, expanded={}",
+        tabbed.conversation_scroll_from_bottom(),
+        expanded.conversation_scroll_from_bottom()
+    );
+    for state in [&mut tabbed, &mut expanded] {
+        update(
+            state,
+            test_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+        );
+    }
+    let tabbed_buffer = render_to_buffer(&mut tabbed, 80, 16);
+    let expanded_buffer = render_to_buffer(&mut expanded, 80, 16);
+    let tabbed_target =
+        find_fragment_position(&tabbed_buffer, "TARGET").expect("tabbed target is visible");
+    let expanded_target =
+        find_fragment_position(&expanded_buffer, "TARGET").expect("expanded target is visible");
+    assert_eq!(tabbed_target, expanded_target);
+    assert!(
+        (0..tabbed_buffer.area.height).all(|row| {
+            (0..tabbed_buffer.area.width).all(|column| {
+                tabbed_buffer
+                    .cell((column, row))
+                    .is_none_or(|cell| !cell.symbol().contains('\t'))
+            })
+        }),
+        "rendered buffer must not contain terminal tab control characters"
+    );
+}
+
+#[test]
 fn tui_keeps_input_and_status_fixed_beside_the_full_height_scrollbar() {
     let mut state = TestState::new("/workspace");
     for index in 0..12 {
@@ -3289,6 +3363,55 @@ fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
     );
     assert_eq!(command, None);
     assert_eq!(state.text_selection(), completed_selection);
+}
+
+#[test]
+fn tui_selects_text_at_the_mouse_position_after_wrapped_conversation_lines() {
+    let mut state = TestState::new("/workspace");
+    update(
+        &mut state,
+        AppMsg::AssistantMessage {
+            content: "wrapped ".repeat(24),
+        },
+    );
+    update(
+        &mut state,
+        AppMsg::AssistantMessage {
+            content: "TARGET".to_owned(),
+        },
+    );
+    let viewport = TuiViewport {
+        width: 100,
+        height: 24,
+    };
+    let buffer = render_to_buffer(&mut state, viewport.width, viewport.height);
+    let (row, column) = find_fragment_position(&buffer, "TARGET").expect("target text is rendered");
+
+    update(
+        &mut state,
+        TestInput::Mouse {
+            event: mouse_event(MouseEventKind::Down(MouseButton::Left), column, row),
+            viewport,
+        },
+    );
+    let command = update(
+        &mut state,
+        TestInput::Mouse {
+            event: mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                column.saturating_add(6),
+                row,
+            ),
+            viewport,
+        },
+    );
+
+    assert_eq!(
+        command,
+        Some(AppCommand::CopyText {
+            content: "TARGET".to_owned(),
+        })
+    );
 }
 
 #[test]
