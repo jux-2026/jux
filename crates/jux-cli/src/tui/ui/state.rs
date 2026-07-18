@@ -1,4 +1,5 @@
 use std::time::Instant;
+use unicode_width::UnicodeWidthStr;
 
 use super::super::app::{AuditFilter, TextSelection, TextSelectionPoint};
 
@@ -107,6 +108,7 @@ pub(crate) struct ConversationSelectionSnapshot {
     pub(crate) height: u16,
     pub(crate) first_line: usize,
     pub(crate) lines: Vec<Vec<String>>,
+    pub(crate) selectable_ranges: Vec<(usize, usize)>,
 }
 
 impl ConversationSelectionSnapshot {
@@ -122,12 +124,21 @@ impl ConversationSelectionSnapshot {
     pub(crate) fn point(&self, column: u16, row: u16) -> TextSelectionPoint {
         let row = row.clamp(self.y, self.y.saturating_add(self.height.saturating_sub(1)));
         let column = column.clamp(self.x, self.x.saturating_add(self.width.saturating_sub(1)));
+        let line = self
+            .first_line
+            .saturating_add(usize::from(row.saturating_sub(self.y)));
+        let (start, end) = self.selectable_range(line);
         TextSelectionPoint {
-            line: self
-                .first_line
-                .saturating_add(usize::from(row.saturating_sub(self.y))),
-            column: usize::from(column.saturating_sub(self.x)),
+            line,
+            column: usize::from(column.saturating_sub(self.x)).clamp(start, end),
         }
+    }
+
+    pub(crate) fn selectable_range(&self, line: usize) -> (usize, usize) {
+        line.checked_sub(self.first_line)
+            .and_then(|index| self.selectable_ranges.get(index))
+            .copied()
+            .unwrap_or_default()
     }
 
     pub(crate) fn selected_text(&self, selection: TextSelection) -> String {
@@ -135,17 +146,40 @@ impl ConversationSelectionSnapshot {
         (start.line..=end.line)
             .filter_map(|line| {
                 let cells = self.lines.get(line.checked_sub(self.first_line)?)?;
-                let start_column = if line == start.line { start.column } else { 0 };
-                let end_column = if line == end.line {
-                    end.column
+                let (selectable_start, selectable_end) = self.selectable_range(line);
+                let start_column = if line == start.line {
+                    start.column.max(selectable_start)
                 } else {
-                    cells.len()
+                    selectable_start
                 };
-                Some(cells[start_column.min(cells.len())..end_column.min(cells.len())].concat())
+                let end_column = if line == end.line {
+                    end.column.min(selectable_end)
+                } else {
+                    selectable_end
+                };
+                let start_column = start_column.min(cells.len());
+                let end_column = end_column.max(start_column).min(cells.len());
+                Some(selected_cells_text(cells, start_column, end_column))
             })
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+fn selected_cells_text(cells: &[String], start: usize, end: usize) -> String {
+    let mut hidden_cells = 0;
+    let mut text = String::new();
+    for (column, symbol) in cells.iter().enumerate() {
+        if hidden_cells > 0 {
+            hidden_cells -= 1;
+            continue;
+        }
+        hidden_cells = UnicodeWidthStr::width(symbol.as_str()).saturating_sub(1);
+        if (start..end).contains(&column) {
+            text.push_str(symbol);
+        }
+    }
+    text
 }
 
 fn ordered_points(

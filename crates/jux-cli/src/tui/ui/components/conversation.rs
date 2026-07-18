@@ -356,6 +356,10 @@ fn capture_selection_snapshot(
             }
             cells
         })
+        .collect::<Vec<_>>();
+    let selectable_ranges = lines
+        .iter()
+        .map(|cells| selectable_cell_range(cells))
         .collect();
     panel.ui_state.selection_snapshot = crate::tui::ui::state::ConversationSelectionSnapshot {
         x: inner.x,
@@ -364,7 +368,40 @@ fn capture_selection_snapshot(
         height: inner.height,
         first_line: usize::from(first_line),
         lines,
+        selectable_ranges,
     };
+}
+
+fn selectable_cell_range(cells: &[String]) -> (usize, usize) {
+    if cells.iter().all(|symbol| is_blank_cell(symbol)) {
+        return (0, 0);
+    }
+    let mut start = cells
+        .iter()
+        .position(|symbol| !is_outer_left_padding(symbol))
+        .unwrap_or_default();
+    let end = cells
+        .iter()
+        .rposition(|symbol| !is_blank_cell(symbol))
+        .map_or(start, |index| index.saturating_add(1));
+    if cells
+        .get(start)
+        .is_some_and(|symbol| symbol == ">" || symbol == "▶")
+    {
+        start = start.saturating_add(1);
+        if cells.get(start).is_some_and(|symbol| symbol == " ") {
+            start = start.saturating_add(1);
+        }
+    }
+    (start.min(end), end)
+}
+
+fn is_outer_left_padding(symbol: &str) -> bool {
+    symbol.is_empty() || symbol == "\u{00a0}"
+}
+
+fn is_blank_cell(symbol: &str) -> bool {
+    symbol.is_empty() || symbol == " " || symbol == "\u{00a0}"
 }
 
 fn render_conversation_selection(panel: &ConversationPanel, buffer: &mut Buffer) {
@@ -383,10 +420,12 @@ fn render_conversation_selection(panel: &ConversationPanel, buffer: &mut Buffer)
             continue;
         }
         let start_column = if line == start.line { start.column } else { 0 };
+        let (selectable_start, selectable_end) = snapshot.selectable_range(line);
+        let start_column = start_column.max(selectable_start);
         let end_column = if line == end.line {
-            end.column
+            end.column.min(selectable_end)
         } else {
-            usize::from(snapshot.width)
+            selectable_end
         };
         for column in start_column..end_column.min(usize::from(snapshot.width)) {
             if let Some(cell) = buffer.cell_mut((

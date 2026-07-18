@@ -3447,8 +3447,7 @@ fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
     assert_eq!(
         command,
         Some(AppCommand::CopyText {
-            content: "\u{00a0}\u{00a0}\u{00a0}Selectable message\u{00a0}\u{00a0}\u{00a0}"
-                .to_owned(),
+            content: "Selectable message".to_owned(),
         })
     );
     assert_eq!(
@@ -3457,6 +3456,25 @@ fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
     );
     let buffer = render_to_buffer(&mut state, 100, 24);
     assert_buffer_fragment_has_fg_bg(&buffer, "Selectable message", Color::Black, Color::Yellow);
+    let (message_row, message_column) =
+        find_fragment_position(&buffer, "Selectable message").expect("message is rendered");
+    assert_ne!(
+        buffer
+            .cell((message_column.saturating_sub(1), message_row))
+            .expect("left padding cell exists")
+            .bg,
+        Color::Yellow
+    );
+    assert_ne!(
+        buffer
+            .cell((
+                message_column + "Selectable message".len() as u16,
+                message_row
+            ))
+            .expect("right padding cell exists")
+            .bg,
+        Color::Yellow
+    );
     let completed_selection = state.text_selection();
     let command = update(
         &mut state,
@@ -3467,6 +3485,98 @@ fn tui_selects_and_copies_text_inside_the_conversation_panel_only() {
     );
     assert_eq!(command, None);
     assert_eq!(state.text_selection(), completed_selection);
+}
+
+#[test]
+fn tui_copies_wide_conversation_characters_without_continuation_spaces() {
+    let mut state = TestState::new("/workspace");
+    update(
+        &mut state,
+        AppMsg::AssistantMessage {
+            content: "中文 text 内容".to_owned(),
+        },
+    );
+    let viewport = TuiViewport {
+        width: 100,
+        height: 24,
+    };
+
+    update(
+        &mut state,
+        TestInput::Mouse {
+            event: mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 2),
+            viewport,
+        },
+    );
+    let command = update(
+        &mut state,
+        TestInput::Mouse {
+            event: mouse_event(MouseEventKind::Up(MouseButton::Left), 90, 2),
+            viewport,
+        },
+    );
+
+    assert_eq!(
+        command,
+        Some(AppCommand::CopyText {
+            content: "中文 text 内容".to_owned(),
+        })
+    );
+}
+
+#[test]
+fn tui_selects_only_user_input_without_marker_or_padding() {
+    let mut state = TestState::new("/workspace");
+    type_text(&mut state, "User input");
+    update(
+        &mut state,
+        test_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    let viewport = TuiViewport {
+        width: 100,
+        height: 24,
+    };
+    let buffer = render_to_buffer(&mut state, viewport.width, viewport.height);
+    let (row, content_column) =
+        find_fragment_position(&buffer, "User input").expect("user input is rendered");
+
+    update(
+        &mut state,
+        TestInput::Mouse {
+            event: mouse_event(MouseEventKind::Down(MouseButton::Left), 1, row),
+            viewport,
+        },
+    );
+    let command = update(
+        &mut state,
+        TestInput::Mouse {
+            event: mouse_event(MouseEventKind::Up(MouseButton::Left), 90, row),
+            viewport,
+        },
+    );
+
+    assert_eq!(
+        command,
+        Some(AppCommand::CopyText {
+            content: "User input".to_owned(),
+        })
+    );
+    let selected = render_to_buffer(&mut state, viewport.width, viewport.height);
+    assert_buffer_fragment_has_fg_bg(&selected, "User input", Color::Black, Color::Yellow);
+    assert_ne!(
+        selected
+            .cell((content_column.saturating_sub(2), row))
+            .expect("user marker cell exists")
+            .bg,
+        Color::Yellow
+    );
+    assert_ne!(
+        selected
+            .cell((content_column + "User input".len() as u16, row))
+            .expect("right padding cell exists")
+            .bg,
+        Color::Yellow
+    );
 }
 
 #[test]
