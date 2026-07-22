@@ -769,7 +769,7 @@ impl Component<UiEvent> for SidebarComponent {
         } else if state.audit_panel_visible() {
             audit_panel(&state).render(area, buffer);
         } else {
-            run_panel(&state).render(area, buffer);
+            run_panel(&state, area).render(area, buffer);
         }
     }
 
@@ -868,7 +868,7 @@ fn render_workspace(
         } else if view.audit_panel_visible() {
             audit_panel(&view).render(sidebar_area, buffer);
         } else {
-            run_panel(&view).render(sidebar_area, buffer);
+            run_panel(&view, sidebar_area).render(sidebar_area, buffer);
         }
     }
     app.overlay.visible = render_confirmation_overlay(buffer, &view, area);

@@ -1,5 +1,17 @@
 # Jux
 
+```
+                   __  __
+     _____  __  __ | |/ /
+    /__  / / / / / |   /
+      / / / /_/ / /   |
+     / /  \__,_/ /_/|_|
+ ___/ /
+/____/
+```
+
+**A secure agent with a WebAssembly sandbox.**
+
 [English](README.md) | [简体中文](docs/zh-CN/README.md)
 
 > [!WARNING]

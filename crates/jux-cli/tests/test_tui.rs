@@ -3372,6 +3372,33 @@ fn tui_shell_renders_workspace_and_idle_status() {
 }
 
 #[test]
+fn tui_displays_the_jux_logo_in_a_large_status_panel() {
+    let mut state = TestState::new("/workspace");
+
+    let buffer = render_to_buffer(&mut state, 100, 30);
+
+    assert_buffer_contains(&buffer, "__  __");
+    assert_buffer_contains(&buffer, "_____  __  __ | |/ /");
+    assert_buffer_contains(&buffer, "/____/");
+    assert_buffer_contains(&buffer, "Environment");
+    let (_, logo_start) = find_fragment_position(&buffer, "/____/").expect("logo base is rendered");
+    let (_, logo_top) = find_fragment_position(&buffer, "__  __").expect("logo top is rendered");
+    assert_eq!(logo_top, logo_start + 19);
+}
+
+#[test]
+fn tui_uses_the_compact_status_title_when_the_logo_would_not_fit() {
+    let mut state = TestState::new("/workspace");
+
+    let buffer = render_to_buffer(&mut state, 80, 24);
+
+    assert_buffer_contains(&buffer, "Jux");
+    assert_buffer_does_not_contain(&buffer, "_____  __  __ | |/ /");
+    assert_buffer_contains(&buffer, "Environment");
+    assert_buffer_contains(&buffer, "← focus · Ctrl+C quit");
+}
+
+#[test]
 fn tui_selects_the_status_panel_with_right_arrow() {
     let mut state = TestState::new("/workspace");
 

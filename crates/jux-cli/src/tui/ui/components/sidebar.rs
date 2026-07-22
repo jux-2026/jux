@@ -2,10 +2,23 @@ use super::super::RenderState;
 use super::super::text::apply_text_selection;
 use super::super::theme::{palette, panel_block};
 use crate::tui::{SelectionPanel, TuiRunStatus};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const JUX_LOGO: [&str; 7] = [
+    "                   __  __",
+    "     _____  __  __ | |/ /",
+    "    /__  / / / / / |   /",
+    "      / / / /_/ / /   |",
+    "     / /  \\__,_/ /_/|_|",
+    " ___/ /",
+    "/____/",
+];
+const LOGO_MIN_SIDEBAR_WIDTH: u16 = 29;
+const LOGO_MIN_SIDEBAR_HEIGHT: u16 = 26;
 
 pub(in crate::tui::ui) fn log_panel<'a>(state: &'a RenderState<'a>) -> Paragraph<'a> {
     let mut lines = vec![Line::from("Runtime logs"), Line::from("")];
@@ -93,7 +106,7 @@ pub(in crate::tui::ui) fn audit_panel<'a>(state: &'a RenderState<'a>) -> Paragra
     sidebar_paragraph(state, lines)
 }
 
-pub(in crate::tui::ui) fn run_panel<'a>(state: &'a RenderState<'a>) -> Paragraph<'a> {
+pub(in crate::tui::ui) fn run_panel<'a>(state: &'a RenderState<'a>, area: Rect) -> Paragraph<'a> {
     let status = match state.run_status() {
         TuiRunStatus::Idle => "Idle",
         TuiRunStatus::Running => "Running",
@@ -112,9 +125,17 @@ pub(in crate::tui::ui) fn run_panel<'a>(state: &'a RenderState<'a>) -> Paragraph
         })
         .and_then(|session| state.session_history(&session.id))
         .map_or(0, |history| history.runs.len());
-    let mut lines = vec![
-        Line::from("Jux"),
-        Line::from(""),
+    let mut lines =
+        if area.width >= LOGO_MIN_SIDEBAR_WIDTH && area.height >= LOGO_MIN_SIDEBAR_HEIGHT {
+            JUX_LOGO
+                .iter()
+                .map(|line| Line::from(logo_line(line)))
+                .chain(std::iter::once(Line::from("")))
+                .collect::<Vec<_>>()
+        } else {
+            vec![Line::from("Jux"), Line::from("")]
+        };
+    lines.extend([
         section("Session"),
         Line::from(format!(
             "  {}",
@@ -138,7 +159,7 @@ pub(in crate::tui::ui) fn run_panel<'a>(state: &'a RenderState<'a>) -> Paragraph
             ),
             Style::default().fg(Color::DarkGray),
         ),
-    ];
+    ]);
     if state.run_status() == TuiRunStatus::Running
         || state.run_status() == TuiRunStatus::WaitingForHumanInput
     {
@@ -181,6 +202,12 @@ pub(in crate::tui::ui) fn run_panel<'a>(state: &'a RenderState<'a>) -> Paragraph
         ),
     ]);
     sidebar_paragraph(state, lines)
+}
+
+fn logo_line(line: &str) -> String {
+    let content = line.trim_start_matches(' ');
+    let indentation = line.len().saturating_sub(content.len());
+    format!("{}{}", "\u{00a0}".repeat(indentation), content)
 }
 
 fn section(title: &str) -> Line<'static> {
